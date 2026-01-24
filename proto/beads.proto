@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package beads;
 
-option go_package = "github.com/bizarro/nostrig/gen/beads";
+option go_package = "github.com/chebizarro/nostrig/gen/beads";
 
 import "google/protobuf/timestamp.proto";
 

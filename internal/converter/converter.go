@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	beadspb "github.com/bizarro/nostrig/gen/beads"
-	nip34 "github.com/bizarro/nostrig/internal/nostr"
+	beadspb "github.com/chebizarro/nostrig/gen/beads"
+	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 

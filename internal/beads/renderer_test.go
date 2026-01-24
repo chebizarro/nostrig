@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/bizarro/nostrig/gen/beads"
+	pb "github.com/chebizarro/nostrig/gen/beads"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 

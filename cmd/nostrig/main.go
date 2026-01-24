@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/bizarro/nostrig/internal/converter"
+	"github.com/chebizarro/nostrig/internal/converter"
 	"github.com/nbd-wtf/go-nostr/nip19"
 	"github.com/spf13/cobra"
 )

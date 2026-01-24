@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	nip34 "github.com/bizarro/nostrig/internal/nostr"
+	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 )
 
 // Aggregate is the normalized, single-repository dataset fetched from Nostr.

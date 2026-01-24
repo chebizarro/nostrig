@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	beadspb "github.com/bizarro/nostrig/gen/beads"
-	nip34 "github.com/bizarro/nostrig/internal/nostr"
+	beadspb "github.com/chebizarro/nostrig/gen/beads"
+	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 )
 
 func TestConverter_StatusMappingAndLabels(t *testing.T) {

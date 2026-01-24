@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/bizarro/nostrig/internal/beads"
-	nip34 "github.com/bizarro/nostrig/internal/nostr"
+	"github.com/chebizarro/nostrig/internal/beads"
+	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 	gonostr "github.com/nbd-wtf/go-nostr"
 )
 

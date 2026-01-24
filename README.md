@@ -29,7 +29,7 @@ For a target repo (identified by its NIP-34 repository announcement `d` tag):
 ### From source (recommended during development)
 
 ```bash
-git clone https://github.com/bizarro/nostrig
+git clone https://github.com/chebizarro/nostrig
 cd nostrig
 make build
 ./bin/nostrig --help
@@ -38,7 +38,7 @@ make build
 ### Go install
 
 ```bash
-go install github.com/bizarro/nostrig/cmd/nostrig@latest
+go install github.com/chebizarro/nostrig/cmd/nostrig@latest
 nostrig --help
 ```
 

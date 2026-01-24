@@ -1,4 +1,4 @@
-module github.com/bizarro/nostrig
+module github.com/chebizarro/nostrig
 
 go 1.22.0
 
