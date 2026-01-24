@@ -63,6 +63,17 @@ nostrig fetch \
 
 If no `--relay` flags are provided, `nostrig` uses a small default set and merges them with any `relays` tags found in the repo announcement event.
 
+### Identifier options
+
+By default, `nostrig` emits **spec-compliant** beads IDs (see [IDENTIFIERS.md](./IDENTIFIERS.md)).
+
+- `--id-format legacy|spec` (default: `spec`)
+  - `spec` emits IDs in `<prefix><suffix>` form (prefix includes a trailing `-`).
+  - `legacy` preserves the older IDs for compatibility.
+- `--id-prefix <raw>` (optional; only meaningful in `spec` mode)
+  - The value is normalized (lowercased, `[a-z0-9-]` only, repeated `-` collapsed, max length 8 including trailing `-`).
+  - If omitted, a default prefix is derived from the repo `d` tag (with fallbacks).
+
 ### Output
 
 After a successful run, you should have:
@@ -72,16 +83,30 @@ After a successful run, you should have:
 
 Each JSONL file is newline-delimited JSON objects.
 
+## Identifier formats
+
+`nostrig` supports two ID modes:
+
+- `spec` (default): spec-compliant `<prefix><suffix>` IDs for epics and issues.
+- `legacy` (deprecated): preserves older IDs (epic `repo-<slug>`, issue raw Nostr event id hex) for compatibility and migration.
+
+For the exact prefix/suffix rules and reconciliation guidance, see [IDENTIFIERS.md](./IDENTIFIERS.md).
+
 ## What gets rendered
 
 ### Repo → Epic
 
 The repo announcement (kind `30617`) is converted into a single beads Epic:
-- `epic.id`: `repo-<d-tag>` (lowercased and slug-sanitized)
+- `epic.id`: in `spec` mode (default) `<prefix><suffix>` where:
+  - `<prefix>` is repo-scoped (derived from the repo `d` tag by default, or overridden via `--id-prefix`) and ends with `-`
+  - `<suffix>` is an 8-character base36 token derived from `sha256(30617:<owner>:<repo>)`
+
+  In `legacy` mode, `epic.id` is `repo-<slug>` (derived from the repo `d` tag).
 - `epic.name`: from the repo `name` tag (falls back to `d`)
 - `epic.description`: from the repo `description` tag (if present)
 - `epic.metadata.custom`: contains nostr/nip34-specific keys like:
   - `nostr.id`, `nostr.pubkey`, `nostr.kind`
+  - `nostrig.id_format`, `nostrig.beads_id`, `nostrig.legacy_id`
   - `nip34.repo_id`, `nip34.repo_addr`, `nip34.euc`
   - `nip34.web`, `nip34.clone`, `nip34.relays`, `nip34.maintainers`, `nip34.topics`
   - `nip34.state.*` keys for repo state refs (when kind `30618` is present)
@@ -95,7 +120,11 @@ Root items are converted into beads Issues:
 
 All existing `t` tags are included as labels too (deduped).
 
-Issue IDs use the raw Nostr event id hex (no prefix).
+Issue IDs:
+- In `spec` mode (default), `issue.id` is `<prefix><suffix>` where `<suffix>` is derived from `sha256(<repoAddr>:<nostr_event_id>)`.
+- In `legacy` mode, `issue.id` is the raw Nostr event id hex.
+
+In all modes, `nostr.id` contains the raw Nostr event id, and `nostrig.legacy_id` is emitted to help downstream reconciliation/migration.
 
 ## Status mapping (NIP-34 → beads)
 

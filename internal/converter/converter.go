@@ -26,14 +26,25 @@ func (c *Converter) Convert(agg *Aggregate) (*beadspb.Export, error) {
 		return nil, err
 	}
 
-	repoEpicID := nip34.RepoEpicID(agg.Repo.RepoID)
+	format := agg.IDFormat
+
+	legacyEpicID := nip34.RepoEpicID(agg.Repo.RepoID)
+
+	repoEpicID := legacyEpicID
+	if format.IsSpec() {
+		specID, err := nip34.BeadsEpicID(agg.IDPrefix, agg.Repo.PubKey, agg.Repo.RepoID)
+		if err != nil {
+			return nil, fmt.Errorf("failed generating spec epic id: %w", err)
+		}
+		repoEpicID = specID
+	}
 
 	out := &beadspb.Export{
 		Issues: make([]*beadspb.Issue, 0),
 		Epics:  make([]*beadspb.Epic, 0, 1),
 	}
 
-	out.Epics = append(out.Epics, c.convertRepoEpic(agg.Repo, agg.State, repoEpicID))
+	out.Epics = append(out.Epics, c.convertRepoEpic(agg.Repo, agg.State, repoEpicID, format, legacyEpicID))
 
 	for _, item := range agg.Items {
 		if item == nil || item.Root == nil {
@@ -45,7 +56,7 @@ func (c *Converter) Convert(agg *Aggregate) (*beadspb.Export, error) {
 			status = agg.StatusFor(item.Root.EventID)
 		}
 
-		beadsIssue, err := c.convertRootItem(item.Root, status, agg.Repo, repoEpicID)
+		beadsIssue, err := c.convertRootItem(item.Root, status, agg.Repo, repoEpicID, format, agg.IDPrefix, item.Root.EventID)
 		if err != nil {
 			return nil, fmt.Errorf("failed converting root item %s: %w", item.Root.EventID, err)
 		}
@@ -55,7 +66,7 @@ func (c *Converter) Convert(agg *Aggregate) (*beadspb.Export, error) {
 	return out, nil
 }
 
-func (c *Converter) convertRepoEpic(repo *nip34.RepoAnnouncement, state *nip34.RepoState, repoEpicID string) *beadspb.Epic {
+func (c *Converter) convertRepoEpic(repo *nip34.RepoAnnouncement, state *nip34.RepoState, repoEpicID string, format IDFormat, legacyID string) *beadspb.Epic {
 	name := strings.TrimSpace(repo.Name)
 	if name == "" {
 		name = repo.RepoID
@@ -78,6 +89,12 @@ func (c *Converter) convertRepoEpic(repo *nip34.RepoAnnouncement, state *nip34.R
 		"nip34.relays":      strings.Join(repo.Relays, ","),
 		"nip34.maintainers": strings.Join(repo.Maintainers, ","),
 		"nip34.topics":      strings.Join(repo.Topics, ","),
+		"nostrig.id_format": format.String(),
+		"nostrig.beads_id":  repoEpicID,
+	}
+
+	if format.IsSpec() {
+		custom["nostrig.legacy_id"] = legacyID
 	}
 
 	if state != nil {
@@ -108,12 +125,26 @@ func (c *Converter) convertRepoEpic(repo *nip34.RepoAnnouncement, state *nip34.R
 	return epic
 }
 
-func (c *Converter) convertRootItem(root *nip34.RootItem, status *nip34.StatusEvent, repo *nip34.RepoAnnouncement, repoEpicID string) (*beadspb.Issue, error) {
+func (c *Converter) convertRootItem(root *nip34.RootItem, status *nip34.StatusEvent, repo *nip34.RepoAnnouncement, repoEpicID string, format IDFormat, prefix string, legacyID string) (*beadspb.Issue, error) {
 	if root == nil {
 		return nil, fmt.Errorf("root item is nil")
 	}
 	if strings.TrimSpace(root.EventID) == "" {
 		return nil, fmt.Errorf("root item missing event id")
+	}
+
+	repoAddr := strings.TrimSpace(root.RepoAddr)
+	if repoAddr == "" && repo != nil {
+		repoAddr = nip34.RepoAddress(repo.PubKey, repo.RepoID)
+	}
+
+	issueID := root.EventID
+	if format.IsSpec() {
+		id, err := nip34.BeadsIssueID(prefix, repoAddr, root.EventID)
+		if err != nil {
+			return nil, fmt.Errorf("failed generating spec issue id: %w", err)
+		}
+		issueID = id
 	}
 
 	issueStatus, draft := mapBeadsStatus(status)
@@ -157,16 +188,20 @@ func (c *Converter) convertRootItem(root *nip34.RootItem, status *nip34.StatusEv
 		updatedAt = status.CreatedAt
 	}
 
-	repoAddr := strings.TrimSpace(root.RepoAddr)
-	if repoAddr == "" && repo != nil {
-		repoAddr = nip34.RepoAddress(repo.PubKey, repo.RepoID)
+	custom := map[string]string{
+		"nostr.id":          root.EventID,
+		"nostr.pubkey":      root.PubKey,
+		"nostr.kind":        strconv.Itoa(root.Kind),
+		"nip34.repo_addr":   repoAddr,
+		"nostrig.id_format": format.String(),
+		"nostrig.beads_id":  issueID,
 	}
 
-	custom := map[string]string{
-		"nostr.id":        root.EventID,
-		"nostr.pubkey":    root.PubKey,
-		"nostr.kind":      strconv.Itoa(root.Kind),
-		"nip34.repo_addr": repoAddr,
+	if format.IsSpec() {
+		custom["nostrig.legacy_id"] = legacyID
+	} else {
+		// In legacy mode beads_id == id; keep legacy_id equal to the rendered id for clarity.
+		custom["nostrig.legacy_id"] = issueID
 	}
 
 	if strings.TrimSpace(root.Subject) != "" {
@@ -204,7 +239,7 @@ func (c *Converter) convertRootItem(root *nip34.RootItem, status *nip34.StatusEv
 	}
 
 	issue := &beadspb.Issue{
-		Id:          root.EventID,
+		Id:          issueID,
 		Title:       title,
 		Description: root.Content,
 		Status:      issueStatus,

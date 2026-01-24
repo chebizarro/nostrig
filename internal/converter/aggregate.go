@@ -2,6 +2,7 @@ package converter
 
 import (
 	"fmt"
+	"strings"
 
 	nip34 "github.com/bizarro/nostrig/internal/nostr"
 )
@@ -18,6 +19,9 @@ type Aggregate struct {
 	// StatusByRoot holds resolved/latest statuses by root event ID.
 	// Converter uses "latest status wins" semantics.
 	StatusByRoot map[string]*nip34.StatusEvent
+
+	IDFormat IDFormat
+	IDPrefix string
 }
 
 // AggregateItem represents a single NIP-34 root item and its associated resolved status.
@@ -30,6 +34,26 @@ type AggregateItem struct {
 func (a *Aggregate) Validate() error {
 	if a == nil {
 		return fmt.Errorf("aggregate is nil")
+	}
+
+	format := a.IDFormat
+	if strings.TrimSpace(string(format)) == "" {
+		format = IDFormatLegacy
+	}
+	a.IDFormat = format
+
+	prefix := strings.TrimSpace(a.IDPrefix)
+	a.IDPrefix = prefix
+
+	if format.IsSpec() {
+		if prefix == "" {
+			return fmt.Errorf("aggregate id prefix is required for spec format")
+		}
+		norm := nip34.NormalizeBeadsPrefix(prefix)
+		if norm == "" {
+			return fmt.Errorf("aggregate id prefix %q is invalid", prefix)
+		}
+		a.IDPrefix = norm
 	}
 	if a.Repo == nil {
 		return fmt.Errorf("aggregate repo is nil")

@@ -33,6 +33,8 @@ func newFetchCmd() *cobra.Command {
 	var owner string
 	var relays []string
 	var outDir string
+	var idFormat string
+	var idPrefix string
 
 	fetchCmd := &cobra.Command{
 		Use:   "fetch",
@@ -45,6 +47,11 @@ func newFetchCmd() *cobra.Command {
 				return fmt.Errorf("--out is required")
 			}
 
+			format, err := converter.ParseIDFormat(idFormat)
+			if err != nil {
+				return err
+			}
+
 			// Convert npub to hex if needed
 			ownerHex, err := resolveOwner(owner)
 			if err != nil {
@@ -52,10 +59,12 @@ func newFetchCmd() *cobra.Command {
 			}
 
 			opts := converter.FetchOptions{
-				RepoID: repoID,
-				Owner:  ownerHex,
-				Relays: relays,
-				OutDir: outDir,
+				RepoID:   repoID,
+				Owner:    ownerHex,
+				Relays:   relays,
+				OutDir:   outDir,
+				IDFormat: format,
+				IDPrefix: idPrefix,
 			}
 
 			p := converter.NewPipeline()
@@ -67,6 +76,8 @@ func newFetchCmd() *cobra.Command {
 	fetchCmd.Flags().StringVar(&owner, "owner", "", "Repository owner pubkey (hex or npub). Recommended to disambiguate.")
 	fetchCmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to use (repeatable)")
 	fetchCmd.Flags().StringVar(&outDir, "out", ".", "Output directory (writes <out>/.beads/*.jsonl)")
+	fetchCmd.Flags().StringVar(&idFormat, "id-format", "spec", "ID format for beads ids: legacy|spec")
+	fetchCmd.Flags().StringVar(&idPrefix, "id-prefix", "", "Identifier prefix override for spec format (optional)")
 
 	return fetchCmd
 }

@@ -17,6 +17,9 @@ type FetchOptions struct {
 	Owner  string   // optional hex pubkey (filters 30617/30618 authors when provided)
 	Relays []string // seed relays to query; merged with repo announcement relays
 	OutDir string   // output directory where .beads/ will be written
+
+	IDFormat IDFormat // legacy|spec
+	IDPrefix string   // used for spec format; normalized in pipeline/aggregate
 }
 
 // Pipeline orchestrates fetch → aggregate → convert → render.
@@ -61,6 +64,26 @@ func (p *Pipeline) Run(ctx context.Context, opts FetchOptions) error {
 		owner = strings.TrimSpace(opts.Owner)
 	}
 
+	format := opts.IDFormat
+	if strings.TrimSpace(string(format)) == "" {
+		format = IDFormatSpec
+	}
+
+	prefix := strings.TrimSpace(opts.IDPrefix)
+	if format.IsSpec() {
+		if prefix == "" {
+			prefix = nip34.DefaultBeadsPrefix(repo.RepoID, owner)
+		}
+		norm := nip34.NormalizeBeadsPrefix(prefix)
+		if norm == "" {
+			return fmt.Errorf("invalid id prefix %q", prefix)
+		}
+		prefix = norm
+	} else {
+		// Leave legacy behavior unchanged; prefix is not used.
+		prefix = ""
+	}
+
 	// Merge relays (CLI relays + announcement relays)
 	relays := dedupeStrings(append(seedRelays, repo.Relays...))
 	if len(relays) == 0 {
@@ -87,6 +110,8 @@ func (p *Pipeline) Run(ctx context.Context, opts FetchOptions) error {
 		State:        state,
 		Items:        make([]*AggregateItem, 0, len(roots)),
 		StatusByRoot: statusByRoot,
+		IDFormat:     format,
+		IDPrefix:     prefix,
 	}
 
 	for _, root := range roots {
