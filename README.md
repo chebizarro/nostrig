@@ -160,8 +160,10 @@ If you do regenerate code, keep `protoc-gen-go` and `google.golang.org/protobuf`
 Then run:
 
 ```bash
-make proto
+go generate ./...
 ```
+
+`go generate` runs the checked-in `//go:generate` directive in `gen/beads/generate.go`.
 
 ### Build
 
