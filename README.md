@@ -42,6 +42,14 @@ go install github.com/chebizarro/nostrig/cmd/nostrig@latest
 nostrig --help
 ```
 
+Note: `go install` installs binaries to `$(go env GOPATH)/bin` (or `$GOBIN` if set). Ensure that directory is on your `PATH`.
+
+For local development from the repo root:
+
+```bash
+go install ./cmd/nostrig
+```
+
 ## Usage
 
 Fetch a repo by `d` tag (repo-id). You can optionally specify the repo owner pubkey to disambiguate:
@@ -144,6 +152,10 @@ NIP-34 status events are mapped as:
 You need:
 - `protoc` installed
 - `protoc-gen-go` installed (`go install google.golang.org/protobuf/cmd/protoc-gen-go@latest`)
+
+Generated protobuf code is checked in under `gen/beads/`. Most users do not need to regenerate it.
+
+If you do regenerate code, keep `protoc-gen-go` and `google.golang.org/protobuf` aligned; running `go mod tidy` will pin the module version.
 
 Then run:
 
