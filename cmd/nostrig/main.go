@@ -29,7 +29,7 @@ func newRootCmd() *cobra.Command {
 		Short: "Relay-backed NIP-34 to beads task-fabric bridge",
 	}
 
-	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newClaimCmd())
+	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newClaimCmd(), newUpdateCmd())
 	return cmd
 }
 
@@ -70,8 +70,7 @@ func newPublishCmd() *cobra.Command {
 	var relays []string
 	var idFormat string
 	var idPrefix string
-	var privateKey string
-	var dryRun bool
+	var signing signingOptions
 
 	publishCmd := &cobra.Command{
 		Use:   "publish",
@@ -95,11 +94,11 @@ func newPublishCmd() *cobra.Command {
 				return fmt.Errorf("no canonical events generated")
 			}
 
-			signer, _, err := signerFromFlags(ctx, privateKey, !dryRun)
+			signer, _, err := signerFromOptions(ctx, signing, !signing.dryRun)
 			if err != nil {
 				return err
 			}
-			if dryRun {
+			if signing.dryRun {
 				if signer != nil {
 					if err := signEvents(ctx, signer, events); err != nil {
 						return err
@@ -117,7 +116,7 @@ func newPublishCmd() *cobra.Command {
 	}
 
 	addFetchFlags(publishCmd, &repoID, &owner, &relays, &idFormat, &idPrefix)
-	addSigningFlags(publishCmd, &privateKey, &dryRun)
+	addSigningFlags(publishCmd, &signing)
 	return publishCmd
 }
 
@@ -129,11 +128,13 @@ func newSyncCmd() *cobra.Command {
 	var authors []string
 	var taskIDs []string
 	var outDir string
+	var cachePath string
 	var limit int
+	var failOnConflict bool
 
 	syncCmd := &cobra.Command{
 		Use:   "sync",
-		Short: "Pull canonical task-state events from relays and render .beads JSONL",
+		Short: "Pull canonical task-state events into the durable task cache and render .beads JSONL",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ownerHex, err := resolveOwner(owner)
 			if err != nil {
@@ -144,11 +145,11 @@ func newSyncCmd() *cobra.Command {
 				addr = nip34.RepoAddress(ownerHex, repoID)
 			}
 			relays = relaysWithEnv(relays)
-			result, err := taskfabric.Sync(cmd.Context(), nip34.NewClient(), taskfabric.SyncOptions{Relays: relays, RepoAddr: addr, TaskIDs: taskIDs, Authors: authors, OutDir: outDir, Limit: limit})
+			result, err := taskfabric.Sync(cmd.Context(), nip34.NewClient(), taskfabric.SyncOptions{Relays: relays, RepoAddr: addr, TaskIDs: taskIDs, Authors: authors, OutDir: outDir, CachePath: cachePath, Limit: limit, FailOnConflict: failOnConflict})
 			if err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "synced %d task(s) from %d event(s) into %s/.beads\n", len(result.Export.Issues), result.EventCount, strings.TrimRight(outDir, "/"))
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "synced %d task(s) from %d event(s) into %s/.beads via cache %s (%d conflict(s))\n", len(result.Export.Issues), result.EventCount, strings.TrimRight(outDir, "/"), result.CachePath, result.ConflictCount)
 			return err
 		},
 	}
@@ -160,6 +161,8 @@ func newSyncCmd() *cobra.Command {
 	syncCmd.Flags().StringSliceVar(&authors, "author", nil, "Optional canonical task-state event author pubkey filter (repeatable)")
 	syncCmd.Flags().StringSliceVar(&taskIDs, "task-id", nil, "Task id(s) to sync by exact d tag (repeatable)")
 	syncCmd.Flags().StringVar(&outDir, "out", ".", "Output directory (writes <out>/.beads/issues.jsonl)")
+	syncCmd.Flags().StringVar(&cachePath, "cache", "", "Durable nostrig task cache path (default: <out>/.nostrig/task-cache.jsonl)")
+	syncCmd.Flags().BoolVar(&failOnConflict, "fail-on-conflict", false, "Exit non-zero when local and relay changes conflict")
 	syncCmd.Flags().IntVar(&limit, "limit", 500, "Maximum task-state events to request")
 	return syncCmd
 }
@@ -169,8 +172,8 @@ func newClaimCmd() *cobra.Command {
 	var claimer string
 	var recipient string
 	var relays []string
-	var privateKey string
-	var dryRun bool
+	var signing signingOptions
+	var response responseOptions
 
 	claimCmd := &cobra.Command{
 		Use:   "claim",
@@ -183,19 +186,18 @@ func newClaimCmd() *cobra.Command {
 			if strings.TrimSpace(recipient) == "" {
 				return fmt.Errorf("--recipient is required")
 			}
-
-			key, err := resolvePrivateKey(privateKey)
+			signer, _, err := signerFromOptions(ctx, signing, !signing.dryRun)
 			if err != nil {
 				return err
 			}
-			if strings.TrimSpace(claimer) == "" && key != "" {
-				claimer, err = gonostr.GetPublicKey(key)
+			if strings.TrimSpace(claimer) == "" && signer != nil {
+				claimer, err = publicKeyFromSigner(ctx, signer)
 				if err != nil {
-					return fmt.Errorf("derive claimer pubkey: %w", err)
+					return err
 				}
 			}
 			if strings.TrimSpace(claimer) == "" {
-				return fmt.Errorf("--claimer is required when no private key is available to derive it")
+				return fmt.Errorf("--claimer is required when no signer public key is available")
 			}
 
 			event, err := nip34.BuildClaimDispatch(taskID, claimer, recipient, time.Now().UTC())
@@ -203,11 +205,7 @@ func newClaimCmd() *cobra.Command {
 				return err
 			}
 			events := []*gonostr.Event{event}
-			signer, _, err := signerFromResolvedKey(ctx, key, !dryRun)
-			if err != nil {
-				return err
-			}
-			if dryRun {
+			if signing.dryRun {
 				if signer != nil {
 					if err := signEvents(ctx, signer, events); err != nil {
 						return err
@@ -223,17 +221,101 @@ func newClaimCmd() *cobra.Command {
 			if err := nip34.NewPublisher().Publish(ctx, relays, signer, events); err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "published claim for %s to %d relay(s)\n", taskID, len(relays))
-			return err
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "published claim for %s to %d relay(s)\n", taskID, len(relays)); err != nil {
+				return err
+			}
+			return maybeWaitForResponse(cmd, relays, event, response)
 		},
 	}
 
 	claimCmd.Flags().StringVar(&taskID, "task-id", "", "Task id to claim (required)")
-	claimCmd.Flags().StringVar(&claimer, "claimer", "", "Claiming agent/worker pubkey or stable id; defaults to signer pubkey when --private-key is available")
+	claimCmd.Flags().StringVar(&claimer, "claimer", "", "Claiming agent/worker pubkey or stable id; defaults to signer pubkey when available")
 	claimCmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
 	claimCmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
-	addSigningFlags(claimCmd, &privateKey, &dryRun)
+	addSigningFlags(claimCmd, &signing)
+	addResponseFlags(claimCmd, &response)
 	return claimCmd
+}
+
+func newUpdateCmd() *cobra.Command {
+	var taskID string
+	var recipient string
+	var status string
+	var assignee string
+	var title string
+	var description string
+	var relays []string
+	var signing signingOptions
+	var response responseOptions
+
+	updateCmd := &cobra.Command{
+		Use:   "update",
+		Short: "Publish a ContextVM task/update command",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if strings.TrimSpace(taskID) == "" {
+				return fmt.Errorf("--task-id is required")
+			}
+			if strings.TrimSpace(recipient) == "" {
+				return fmt.Errorf("--recipient is required")
+			}
+			params := map[string]any{"task_id": taskID}
+			if strings.TrimSpace(status) != "" {
+				params["status"] = strings.TrimSpace(status)
+			}
+			if strings.TrimSpace(assignee) != "" {
+				params["assignee"] = strings.TrimSpace(assignee)
+			}
+			if strings.TrimSpace(title) != "" {
+				params["title"] = strings.TrimSpace(title)
+			}
+			if strings.TrimSpace(description) != "" {
+				params["description"] = strings.TrimSpace(description)
+			}
+			if len(params) == 1 {
+				return fmt.Errorf("provide at least one update field: --status, --assignee, --title, or --description")
+			}
+			signer, _, err := signerFromOptions(ctx, signing, !signing.dryRun)
+			if err != nil {
+				return err
+			}
+			event, err := nip34.BuildContextVMCommand("task/update", recipient, params, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			events := []*gonostr.Event{event}
+			if signing.dryRun {
+				if signer != nil {
+					if err := signEvents(ctx, signer, events); err != nil {
+						return err
+					}
+				}
+				return writeEvents(cmd, events)
+			}
+			relays = relaysWithEnv(relays)
+			if len(relays) == 0 {
+				return fmt.Errorf("at least one --relay or NOSTR_RELAY is required")
+			}
+			if err := nip34.NewPublisher().Publish(ctx, relays, signer, events); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "published update for %s to %d relay(s)\n", taskID, len(relays)); err != nil {
+				return err
+			}
+			return maybeWaitForResponse(cmd, relays, event, response)
+		},
+	}
+
+	updateCmd.Flags().StringVar(&taskID, "task-id", "", "Task id to update (required)")
+	updateCmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
+	updateCmd.Flags().StringVar(&status, "status", "", "New task status")
+	updateCmd.Flags().StringVar(&assignee, "assignee", "", "New task assignee")
+	updateCmd.Flags().StringVar(&title, "title", "", "New task title")
+	updateCmd.Flags().StringVar(&description, "description", "", "New task description")
+	updateCmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	addSigningFlags(updateCmd, &signing)
+	addResponseFlags(updateCmd, &response)
+	return updateCmd
 }
 
 func addFetchFlags(cmd *cobra.Command, repoID *string, owner *string, relays *[]string, idFormat *string, idPrefix *string) {
@@ -244,9 +326,28 @@ func addFetchFlags(cmd *cobra.Command, repoID *string, owner *string, relays *[]
 	cmd.Flags().StringVar(idPrefix, "id-prefix", "", "Identifier prefix override for spec format (optional)")
 }
 
-func addSigningFlags(cmd *cobra.Command, privateKey *string, dryRun *bool) {
-	cmd.Flags().StringVar(privateKey, "private-key", "", "Local-dev Nostr private key (hex or nsec); defaults to NOSTR_PRIVATE_KEY")
-	cmd.Flags().BoolVar(dryRun, "dry-run", false, "Print generated events as JSONL instead of publishing")
+type signingOptions struct {
+	privateKey      string
+	bunkerURL       string
+	clientSecretKey string
+	dryRun          bool
+}
+
+type responseOptions struct {
+	wait    bool
+	timeout time.Duration
+}
+
+func addSigningFlags(cmd *cobra.Command, opts *signingOptions) {
+	cmd.Flags().StringVar(&opts.bunkerURL, "signer-bunker-url", "", "Signet/NIP-46 bunker URL; defaults to NOSTRIG_SIGNER_BUNKER_URL")
+	cmd.Flags().StringVar(&opts.clientSecretKey, "signer-client-secret-key", "", "NIP-46 client secret key (hex or nsec); defaults to NOSTRIG_SIGNER_CLIENT_SECRET_KEY and may be ephemeral if omitted")
+	cmd.Flags().StringVar(&opts.privateKey, "private-key", "", "Local-dev Nostr private key (hex or nsec); defaults to NOSTR_PRIVATE_KEY and is forbidden when NOSTRIG_ENV=production")
+	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "Print generated events as JSONL instead of publishing")
+}
+
+func addResponseFlags(cmd *cobra.Command, opts *responseOptions) {
+	cmd.Flags().BoolVar(&opts.wait, "wait-response", false, "Wait for a correlated ContextVM JSON-RPC response after publishing")
+	cmd.Flags().DurationVar(&opts.timeout, "response-timeout", 30*time.Second, "Maximum time to wait for --wait-response")
 }
 
 func parseFetchInputs(repoID, owner, idFormat string) (converter.IDFormat, string, error) {
@@ -271,7 +372,6 @@ func resolveOwner(owner string) (string, error) {
 		return "", nil
 	}
 
-	// If it starts with npub, decode it
 	if strings.HasPrefix(owner, "npub1") {
 		prefix, value, err := nip19.Decode(owner)
 		if err != nil {
@@ -287,7 +387,6 @@ func resolveOwner(owner string) (string, error) {
 		return hex, nil
 	}
 
-	// Assume it's already hex
 	return owner, nil
 }
 
@@ -296,6 +395,22 @@ func resolvePrivateKey(privateKey string) (string, error) {
 	if key == "" {
 		key = strings.TrimSpace(os.Getenv("NOSTR_PRIVATE_KEY"))
 	}
+	return normalizeSecretKey(key)
+}
+
+func resolveClientSecretKey(clientSecretKey string) (string, error) {
+	key := strings.TrimSpace(clientSecretKey)
+	if key == "" {
+		key = strings.TrimSpace(os.Getenv("NOSTRIG_SIGNER_CLIENT_SECRET_KEY"))
+	}
+	if key == "" {
+		key = strings.TrimSpace(os.Getenv("NOSTRIG_SIGNER_SECRET_KEY"))
+	}
+	return normalizeSecretKey(key)
+}
+
+func normalizeSecretKey(key string) (string, error) {
+	key = strings.TrimSpace(key)
 	if key == "" {
 		return "", nil
 	}
@@ -316,26 +431,67 @@ func resolvePrivateKey(privateKey string) (string, error) {
 	return key, nil
 }
 
-func signerFromFlags(ctx context.Context, privateKey string, required bool) (nip34.Signer, bool, error) {
-	key, err := resolvePrivateKey(privateKey)
+func signerFromOptions(ctx context.Context, opts signingOptions, required bool) (nip34.Signer, bool, error) {
+	bunkerURL := strings.TrimSpace(opts.bunkerURL)
+	if bunkerURL == "" {
+		bunkerURL = strings.TrimSpace(os.Getenv("NOSTRIG_SIGNER_BUNKER_URL"))
+	}
+	key, err := resolvePrivateKey(opts.privateKey)
 	if err != nil {
 		return nil, false, err
 	}
-	return signerFromResolvedKey(ctx, key, required)
+	production := isProductionEnv()
+	if bunkerURL != "" && key != "" {
+		return nil, false, fmt.Errorf("configure either Signet/NIP-46 (--signer-bunker-url) or local-dev --private-key, not both")
+	}
+	if key != "" {
+		if production {
+			return nil, false, fmt.Errorf("raw --private-key/NOSTR_PRIVATE_KEY is forbidden when NOSTRIG_ENV=production; use --signer-bunker-url")
+		}
+		signer, err := nip34.NewPrivateKeySigner(key)
+		if err != nil {
+			return nil, false, err
+		}
+		return signer, true, ctx.Err()
+	}
+	if bunkerURL != "" {
+		clientSecretKey, err := resolveClientSecretKey(opts.clientSecretKey)
+		if err != nil {
+			return nil, false, err
+		}
+		signer, err := nip34.ConnectNIP46Signer(ctx, bunkerURL, clientSecretKey)
+		if err != nil {
+			return nil, false, err
+		}
+		return signer, true, ctx.Err()
+	}
+	if required {
+		if production {
+			return nil, false, fmt.Errorf("production signing requires --signer-bunker-url or NOSTRIG_SIGNER_BUNKER_URL")
+		}
+		return nil, false, fmt.Errorf("signing requires --signer-bunker-url/NOSTRIG_SIGNER_BUNKER_URL or local-dev --private-key/NOSTR_PRIVATE_KEY")
+	}
+	return nil, false, nil
 }
 
-func signerFromResolvedKey(ctx context.Context, key string, required bool) (nip34.Signer, bool, error) {
-	if strings.TrimSpace(key) == "" {
-		if required {
-			return nil, false, fmt.Errorf("signing requires --private-key or NOSTR_PRIVATE_KEY for this MVP; production deployments should use Signet/NIP-46")
-		}
-		return nil, false, nil
+func isProductionEnv() bool {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NOSTRIG_ENV")))
+	return env == "production" || env == "prod"
+}
+
+func publicKeyFromSigner(ctx context.Context, signer nip34.Signer) (string, error) {
+	provider, ok := signer.(nip34.PublicKeyProvider)
+	if !ok {
+		return "", fmt.Errorf("signer cannot provide a public key; set --claimer explicitly")
 	}
-	signer, err := nip34.NewPrivateKeySigner(key)
+	pub, err := provider.PublicKey(ctx)
 	if err != nil {
-		return nil, false, err
+		return "", err
 	}
-	return signer, true, ctx.Err()
+	if strings.TrimSpace(pub) == "" {
+		return "", fmt.Errorf("signer returned empty public key")
+	}
+	return pub, nil
 }
 
 func signEvents(ctx context.Context, signer nip34.Signer, events []*gonostr.Event) error {
@@ -361,6 +517,17 @@ func writeEvents(cmd *cobra.Command, events []*gonostr.Event) error {
 		}
 	}
 	return nil
+}
+
+func maybeWaitForResponse(cmd *cobra.Command, relays []string, event *gonostr.Event, opts responseOptions) error {
+	if !opts.wait {
+		return nil
+	}
+	resp, err := taskfabric.WaitForContextVMResponse(cmd.Context(), relays, event, opts.timeout)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(cmd.OutOrStdout()).Encode(resp)
 }
 
 func relaysWithEnv(relays []string) []string {
