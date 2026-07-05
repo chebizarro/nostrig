@@ -10,6 +10,11 @@ const (
 	// KindNIP51Set is the NIP-51 general-purpose set used for queues and epics.
 	KindNIP51Set = 30000
 
+	// Aliases used by the task fabric publisher.
+	KindCanonicalState  = KindTaskState
+	KindContextVMIntent = KindIntent
+	KindNamedList       = KindNIP51Set
+
 	KindRepositoryAnnouncement = 30617
 	KindRepositoryState        = 30618
 
