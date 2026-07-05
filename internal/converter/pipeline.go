@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	"github.com/chebizarro/nostrig/internal/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 	gonostr "github.com/nbd-wtf/go-nostr"
@@ -20,6 +21,13 @@ type FetchOptions struct {
 
 	IDFormat IDFormat // legacy|spec
 	IDPrefix string   // used for spec format; normalized in pipeline/aggregate
+}
+
+// FetchResult is the reusable in-memory result from fetching and converting a repository.
+type FetchResult struct {
+	Export *beadspb.Export
+	Relays []string
+	Repo   *nip34.RepoAnnouncement
 }
 
 // Pipeline orchestrates fetch → aggregate → convert → render.
@@ -38,14 +46,30 @@ func NewPipeline() *Pipeline {
 
 // Run executes the full pipeline and writes JSONL output.
 func (p *Pipeline) Run(ctx context.Context, opts FetchOptions) error {
-	if ctx == nil {
-		return fmt.Errorf("context is nil")
-	}
-	if strings.TrimSpace(opts.RepoID) == "" {
-		return fmt.Errorf("repo id is required")
-	}
 	if strings.TrimSpace(opts.OutDir) == "" {
 		return fmt.Errorf("out dir is required")
+	}
+
+	result, err := p.Export(ctx, opts)
+	if err != nil {
+		return err
+	}
+
+	renderer := beads.NewRenderer(opts.OutDir)
+	if err := renderer.RenderExport(result.Export); err != nil {
+		return fmt.Errorf("render failed: %w", err)
+	}
+
+	return nil
+}
+
+// Export executes fetch → aggregate → convert and returns an in-memory beads export.
+func (p *Pipeline) Export(ctx context.Context, opts FetchOptions) (*FetchResult, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("context is nil")
+	}
+	if strings.TrimSpace(opts.RepoID) == "" {
+		return nil, fmt.Errorf("repo id is required")
 	}
 
 	seedRelays := dedupeStrings(opts.Relays)
@@ -56,7 +80,7 @@ func (p *Pipeline) Run(ctx context.Context, opts FetchOptions) error {
 	// Phase A: find repo announcement (30617) by d tag (and optional owner)
 	repo, err := p.findRepoAnnouncement(ctx, seedRelays, opts.RepoID, opts.Owner)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	owner := repo.PubKey
@@ -76,7 +100,7 @@ func (p *Pipeline) Run(ctx context.Context, opts FetchOptions) error {
 		}
 		norm := nip34.NormalizeBeadsPrefix(prefix)
 		if norm == "" {
-			return fmt.Errorf("invalid id prefix %q", prefix)
+			return nil, fmt.Errorf("invalid id prefix %q", prefix)
 		}
 		prefix = norm
 	} else {
@@ -87,7 +111,7 @@ func (p *Pipeline) Run(ctx context.Context, opts FetchOptions) error {
 	// Merge relays (CLI relays + announcement relays)
 	relays := dedupeStrings(append(seedRelays, repo.Relays...))
 	if len(relays) == 0 {
-		return fmt.Errorf("no relays available (provide --relay or ensure repo announcement has relays tags)")
+		return nil, fmt.Errorf("no relays available (provide --relay or ensure repo announcement has relays tags)")
 	}
 
 	repoAddr := nip34.RepoAddress(owner, repo.RepoID)
@@ -95,13 +119,13 @@ func (p *Pipeline) Run(ctx context.Context, opts FetchOptions) error {
 	// Phase B: fetch items and repo state
 	state, roots, err := p.fetchRepoData(ctx, relays, repo.RepoID, owner, repoAddr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Phase C: fetch statuses targeting the root IDs
 	statusByRoot, err := p.fetchStatuses(ctx, relays, roots)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Phase D: build aggregate
@@ -127,16 +151,10 @@ func (p *Pipeline) Run(ctx context.Context, opts FetchOptions) error {
 	// Convert to beads proto
 	export, err := p.converter.Convert(agg)
 	if err != nil {
-		return fmt.Errorf("convert failed: %w", err)
+		return nil, fmt.Errorf("convert failed: %w", err)
 	}
 
-	// Render JSONL
-	renderer := beads.NewRenderer(opts.OutDir)
-	if err := renderer.RenderExport(export); err != nil {
-		return fmt.Errorf("render failed: %w", err)
-	}
-
-	return nil
+	return &FetchResult{Export: export, Relays: relays, Repo: repo}, nil
 }
 
 func (p *Pipeline) findRepoAnnouncement(ctx context.Context, relays []string, repoID string, owner string) (*nip34.RepoAnnouncement, error) {
