@@ -16,20 +16,26 @@ import (
 
 // SyncOptions configure relay-backed canonical task-state synchronization.
 type SyncOptions struct {
-	Relays   []string
-	RepoAddr string
-	TaskIDs  []string
-	Authors  []string
-	OutDir   string
-	Limit    int
+	Relays         []string
+	RepoAddr       string
+	TaskIDs        []string
+	Authors        []string
+	OutDir         string
+	CachePath      string
+	Limit          int
+	FailOnConflict bool
 }
 
 type SyncResult struct {
-	Export     *beadspb.Export
-	EventCount int
+	Export        *beadspb.Export
+	EventCount    int
+	CachePath     string
+	ConflictCount int
 }
 
-// Sync fetches canonical task-state events and renders them as beads JSONL.
+// Sync fetches canonical task-state events, merges them with the durable local
+// cache and current local beads projection, then renders the resolved view back
+// to .beads JSONL.
 func Sync(ctx context.Context, client *nip34.Client, opts SyncOptions) (*SyncResult, error) {
 	if strings.TrimSpace(opts.OutDir) == "" {
 		return nil, fmt.Errorf("out dir is required")
@@ -38,14 +44,36 @@ func Sync(ctx context.Context, client *nip34.Client, opts SyncOptions) (*SyncRes
 	if err != nil {
 		return nil, err
 	}
-	export, err := ExportFromTaskStateEvents(events)
+	relayExport, err := ExportFromTaskStateEvents(events)
 	if err != nil {
 		return nil, err
 	}
-	if err := beads.NewRenderer(opts.OutDir).RenderExport(export); err != nil {
+	cachePath := strings.TrimSpace(opts.CachePath)
+	if cachePath == "" {
+		cachePath = DefaultCachePath(opts.OutDir)
+	}
+	previous, err := LoadCache(cachePath)
+	if err != nil {
+		return nil, fmt.Errorf("load cache: %w", err)
+	}
+	local, err := LoadLocalIssues(opts.OutDir)
+	if err != nil {
+		return nil, fmt.Errorf("load local beads issues: %w", err)
+	}
+	merged, err := MergeTaskState(relayExport, local, previous)
+	if err != nil {
+		return nil, err
+	}
+	if err := WriteCache(cachePath, merged.Records); err != nil {
+		return nil, fmt.Errorf("write cache: %w", err)
+	}
+	if err := beads.NewRenderer(opts.OutDir).RenderExport(merged.Export); err != nil {
 		return nil, fmt.Errorf("render failed: %w", err)
 	}
-	return &SyncResult{Export: export, EventCount: len(events)}, nil
+	if opts.FailOnConflict && len(merged.Conflicts) > 0 {
+		return nil, fmt.Errorf("sync detected %d task conflict(s); inspect %s", len(merged.Conflicts), cachePath)
+	}
+	return &SyncResult{Export: merged.Export, EventCount: len(events), CachePath: cachePath, ConflictCount: len(merged.Conflicts)}, nil
 }
 
 // FetchTaskStateEvents queries relays for bounded canonical 30900 task states.

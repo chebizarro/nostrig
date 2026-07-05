@@ -28,7 +28,7 @@ For a target repo (identified by its NIP-34 repository announcement `d` tag):
    - `30000` epic collections
    - optional NIP-34 issue-link events when source metadata is present
 8. Pulls canonical `30900` task-state events back into `.beads/issues.jsonl`
-9. Publishes `25910` ContextVM `task/claim` commands for relay-backed worker dispatch
+9. Publishes `25910` ContextVM `task/claim` and `task/update` commands for relay-backed worker dispatch, with optional correlated response waiting
 
 ## Installation
 
@@ -79,17 +79,19 @@ If no `--relay` flags are provided, `nostrig` uses a small default set and merge
 
 ### Publish canonical task fabric events
 
-`publish` reuses the fetch/conversion pipeline, then publishes canonical task-fabric events to the relays selected from `--relay` and the repository announcement:
+`publish` reuses the fetch/conversion pipeline, then publishes canonical task-fabric events to the relays selected from `--relay` and the repository announcement. Production deployments should use Signet/NIP-46 signing:
 
 ```bash
-nostrig publish \
+NOSTRIG_ENV=production nostrig publish \
   --repo-id my-repo \
   --owner <hexpubkey> \
   --relay wss://relay.example \
-  --private-key <hex-or-nsec>
+  --signer-bunker-url 'bunker://<signer-pubkey>?relay=wss://relay.example&secret=<optional-secret>'
 ```
 
-Use `--dry-run` to print generated events as JSONL instead of sending them to relays. If a private key is supplied during dry-run, events are signed before printing:
+The NIP-46 client secret key can be supplied with `--signer-client-secret-key` or `NOSTRIG_SIGNER_CLIENT_SECRET_KEY`; if omitted, nostrig generates an ephemeral client key for the session. Raw `--private-key`/`NOSTR_PRIVATE_KEY` remains available only as an explicit local-development fallback and is rejected when `NOSTRIG_ENV=production`.
+
+Use `--dry-run` to print generated events as JSONL instead of sending them to relays. If a signer is supplied during dry-run, events are signed before printing:
 
 ```bash
 nostrig publish --repo-id my-repo --owner <hexpubkey> --dry-run
@@ -97,7 +99,7 @@ nostrig publish --repo-id my-repo --owner <hexpubkey> --dry-run
 
 ### Sync canonical task state back to beads
 
-`sync` pulls canonical `30900` task-state events and renders them into `.beads/issues.jsonl`:
+`sync` pulls canonical `30900` task-state events into a durable nostrig cache, merges them with the current local `.beads/issues.jsonl` projection, and then renders the resolved view back to `.beads/issues.jsonl`:
 
 ```bash
 nostrig sync \
@@ -106,7 +108,9 @@ nostrig sync \
   --out .
 ```
 
-You can also derive the repo address from `--repo-id` and `--owner`, or sync exact tasks with repeated `--task-id`. To avoid broad relay scans, `sync` requires either `--repo-addr` (or `--repo-id` + `--owner`) or at least one `--task-id`. `--relay` falls back to `NOSTR_RELAY`/`NOSTR_RELAYS` for `sync` and `claim`.
+By default, the durable source-of-truth cache is written to `./.nostrig/task-cache.jsonl` (override with `--cache`). The resolver tracks local revisions and relay event IDs per task. Relay-only changes update the local projection, local-only changes are preserved in the cache for later publishing, compatible timestamp-ordered status/assignee changes use latest-wins semantics, and material local+relay divergence is recorded as conflict metadata without discarding either side. Use `--fail-on-conflict` when automation should stop on conflicts.
+
+You can also derive the repo address from `--repo-id` and `--owner`, or sync exact tasks with repeated `--task-id`. To avoid broad relay scans, `sync` requires either `--repo-addr` (or `--repo-id` + `--owner`) or at least one `--task-id`. `--relay` falls back to `NOSTR_RELAY`/`NOSTR_RELAYS` for `sync`, `claim`, and `update`.
 
 ### Claim a task
 
@@ -115,17 +119,30 @@ You can also derive the repo address from `--repo-id` and `--owner`, or sync exa
 ```bash
 nostrig claim \
   --task-id repo-abc12345 \
-  --claimer <agent-or-worker-pubkey> \
   --recipient <contextvm-recipient-pubkey> \
   --relay wss://relay.example \
-  --private-key <hex-or-nsec>
+  --signer-bunker-url 'bunker://<signer-pubkey>?relay=wss://relay.example'
 ```
 
-If `--claimer` is omitted and a private key is available, the claimer defaults to the signer pubkey. Use `--dry-run` to inspect the command event without publishing.
+If `--claimer` is omitted and the configured signer can provide a public key, the claimer defaults to that signer pubkey. Use `--dry-run` to inspect the command event without publishing. Add `--wait-response --response-timeout 30s` to subscribe for a scoped ContextVM JSON-RPC response correlated by the signed command event ID or JSON-RPC request ID.
+
+### Update a task through ContextVM
+
+`update` publishes a ContextVM intent event (`kind 25910`, method `task/update`) for status/assignee/title/description changes:
+
+```bash
+nostrig update \
+  --task-id repo-abc12345 \
+  --recipient <contextvm-recipient-pubkey> \
+  --status in_progress \
+  --relay wss://relay.example \
+  --signer-bunker-url 'bunker://<signer-pubkey>?relay=wss://relay.example' \
+  --wait-response
+```
 
 ### Signing posture
 
-The current CLI MVP supports raw Nostr private keys only as an explicit local-development fallback via `--private-key` or `NOSTR_PRIVATE_KEY` (hex or `nsec`). Production task fabric deployments should use Signet/NIP-46 signing; wiring that signer into `nostrig` is tracked as follow-up work alongside the full beads source-of-truth backend/conflict-resolution model.
+Production task fabric deployments should set `NOSTRIG_ENV=production` and configure Signet/NIP-46 with `--signer-bunker-url` or `NOSTRIG_SIGNER_BUNKER_URL`. Raw Nostr private keys are accepted only as an explicit local-development fallback via `--private-key` or `NOSTR_PRIVATE_KEY` (hex or `nsec`) and are rejected in production mode.
 
 ### Identifier options
 
