@@ -1,6 +1,6 @@
 # nostrig
 
-`nostrig` fetches NIP-34 (git-related) Nostr events for a single repository and renders them into **beads-compatible JSONL artifacts**.
+`nostrig` bridges NIP-34 (git-related) Nostr events and a relay-backed task-fabric view for a single repository. It can fetch/render **beads-compatible JSONL artifacts**, publish canonical task-state events, sync those events back into `.beads`, and dispatch task claim commands.
 
 It gives you a unified local view of work items for a repo:
 - Repositories (NIP-34 kind `30617`) → **beads Epics**
@@ -23,6 +23,12 @@ For a target repo (identified by its NIP-34 repository announcement `d` tag):
 4. Fetches and resolves status events (kinds `1630`-`1633`) for those root items
 5. Converts everything to beads protobuf types
 6. Renders JSONL files compatible with `jira-beads-sync` / beads tooling
+7. Optionally publishes canonical task fabric events:
+   - `30900` `d=task:<id>` task-state events
+   - `30000` epic collections
+   - optional NIP-34 issue-link events when source metadata is present
+8. Pulls canonical `30900` task-state events back into `.beads/issues.jsonl`
+9. Publishes `25910` ContextVM `task/claim` commands for relay-backed worker dispatch
 
 ## Installation
 
@@ -70,6 +76,56 @@ nostrig fetch \
 ```
 
 If no `--relay` flags are provided, `nostrig` uses a small default set and merges them with any `relays` tags found in the repo announcement event.
+
+### Publish canonical task fabric events
+
+`publish` reuses the fetch/conversion pipeline, then publishes canonical task-fabric events to the relays selected from `--relay` and the repository announcement:
+
+```bash
+nostrig publish \
+  --repo-id my-repo \
+  --owner <hexpubkey> \
+  --relay wss://relay.example \
+  --private-key <hex-or-nsec>
+```
+
+Use `--dry-run` to print generated events as JSONL instead of sending them to relays. If a private key is supplied during dry-run, events are signed before printing:
+
+```bash
+nostrig publish --repo-id my-repo --owner <hexpubkey> --dry-run
+```
+
+### Sync canonical task state back to beads
+
+`sync` pulls canonical `30900` task-state events and renders them into `.beads/issues.jsonl`:
+
+```bash
+nostrig sync \
+  --repo-addr 30617:<owner-pubkey>:my-repo \
+  --relay wss://relay.example \
+  --out .
+```
+
+You can also derive the repo address from `--repo-id` and `--owner`, or sync exact tasks with repeated `--task-id`. To avoid broad relay scans, `sync` requires either `--repo-addr` (or `--repo-id` + `--owner`) or at least one `--task-id`. `--relay` falls back to `NOSTR_RELAY`/`NOSTR_RELAYS` for `sync` and `claim`.
+
+### Claim a task
+
+`claim` publishes a ContextVM intent event (`kind 25910`, method `task/claim`) to dispatch a claim request to a worker or fleet agent:
+
+```bash
+nostrig claim \
+  --task-id repo-abc12345 \
+  --claimer <agent-or-worker-pubkey> \
+  --recipient <contextvm-recipient-pubkey> \
+  --relay wss://relay.example \
+  --private-key <hex-or-nsec>
+```
+
+If `--claimer` is omitted and a private key is available, the claimer defaults to the signer pubkey. Use `--dry-run` to inspect the command event without publishing.
+
+### Signing posture
+
+The current CLI MVP supports raw Nostr private keys only as an explicit local-development fallback via `--private-key` or `NOSTR_PRIVATE_KEY` (hex or `nsec`). Production task fabric deployments should use Signet/NIP-46 signing; wiring that signer into `nostrig` is tracked as follow-up work alongside the full beads source-of-truth backend/conflict-resolution model.
 
 ### Identifier options
 

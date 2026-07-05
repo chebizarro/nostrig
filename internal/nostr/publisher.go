@@ -10,6 +10,7 @@ import (
 
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	gonostr "github.com/nbd-wtf/go-nostr"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
@@ -219,7 +220,14 @@ func ParseTaskStateEvent(ev *gonostr.Event) (*beadspb.Issue, error) {
 	if state.ID == "" {
 		state.ID = strings.TrimPrefix(d, "task:")
 	}
-	return &beadspb.Issue{Id: state.ID, Title: state.Title, Description: state.Description, Status: ParseStatus(state.Status), Priority: ParsePriority(state.Priority), Epic: state.Epic, Assignee: state.Assignee, Labels: append([]string(nil), state.Labels...), DependsOn: append([]string(nil), state.DependsOn...), Metadata: &beadspb.Metadata{Custom: state.Metadata}}, nil
+	issue := &beadspb.Issue{Id: state.ID, Title: state.Title, Description: state.Description, Status: ParseStatus(state.Status), Priority: ParsePriority(state.Priority), Epic: state.Epic, Assignee: state.Assignee, Labels: append([]string(nil), state.Labels...), DependsOn: append([]string(nil), state.DependsOn...), Metadata: &beadspb.Metadata{Custom: state.Metadata}}
+	if created, err := time.Parse(time.RFC3339, strings.TrimSpace(state.Created)); err == nil {
+		issue.Created = timestamppb.New(created.UTC())
+	}
+	if updated, err := time.Parse(time.RFC3339, strings.TrimSpace(state.Updated)); err == nil {
+		issue.Updated = timestamppb.New(updated.UTC())
+	}
+	return issue, nil
 }
 
 func BuildContextVMCommand(method, recipient string, params any, now time.Time) (*gonostr.Event, error) {
