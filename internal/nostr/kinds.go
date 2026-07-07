@@ -1,10 +1,12 @@
 package nostr
 
-// NIP-34 event kinds (git stuff)
+import cascadia "git.sharegap.net/cascadia/cascadia-go"
+
+// Canonical Cascadia task-fabric kinds come from generated cascadia-go bindings.
 const (
-	KindContextVMIntent = 25910
-	KindNamedList       = 30000
-	KindCanonicalState  = 30900
+	KindContextVMIntent = cascadia.CAS_INTENT
+	KindNamedList       = cascadia.NIP51_TASK_COLLECTION
+	KindCanonicalState  = cascadia.CAS_CP_STATE
 
 	KindRepositoryAnnouncement = 30617
 	KindRepositoryState        = 30618

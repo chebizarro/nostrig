@@ -1,3 +1,5 @@
+git.sharegap.net/cascadia/cascadia-go v0.2.1 h1:jYLsDKnOEY+NoS7w5bZgrG6ADnF5L1zqGF93pUdt7GM=
+git.sharegap.net/cascadia/cascadia-go v0.2.1/go.mod h1:W5yw+PrDEZJQJsXdH8NqDJUtUVxn4goBtu39VUmpuCo=
 github.com/aead/siphash v1.0.1/go.mod h1:Nywa3cDsYNNK3gaciGTWPwHt0wlpNV15vwmswBAUSII=
 github.com/btcsuite/btcd v0.20.1-beta/go.mod h1:wVuoA8VJLEcwgqHBwHmzLRazpKxTv13Px/pDuV7OomQ=
 github.com/btcsuite/btcd v0.22.0-beta.0.20220111032746-97732e52810c/go.mod h1:tjmYdS6MLJ5/s0Fj4DbLgSbDHbEqLJrtnHecBFkdz5M=

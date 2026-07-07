@@ -28,7 +28,7 @@ For a target repo (identified by its NIP-34 repository announcement `d` tag):
    - `30000` epic collections
    - optional NIP-34 issue-link events when source metadata is present
 8. Pulls canonical `30900` task-state events back into `.beads/issues.jsonl`
-9. Publishes `25910` ContextVM `task/claim` and `task/update` commands for relay-backed worker dispatch, with optional correlated response waiting
+9. Publishes `25910` ContextVM `task/claim`, `task/assign`, and `task/update` commands for relay-backed worker dispatch, with optional correlated response waiting
 
 ## Installation
 
@@ -125,6 +125,14 @@ nostrig claim \
 ```
 
 If `--claimer` is omitted and the configured signer can provide a public key, the claimer defaults to that signer pubkey. Use `--dry-run` to inspect the command event without publishing. Add `--wait-response --response-timeout 30s` to subscribe for a scoped ContextVM JSON-RPC response correlated by the signed command event ID or JSON-RPC request ID.
+
+### Assign a task through ContextVM
+
+`assign` publishes a ContextVM intent event (`kind 25910`, method `task/assign`) for assignee changes:
+
+```bash
+nostrig assign --task-id repo-abc12345 --assignee agent-pubkey --recipient coordinator-pubkey --relay wss://relay.sharegap.net --wait-response
+```
 
 ### Update a task through ContextVM
 

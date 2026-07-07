@@ -24,6 +24,23 @@ func TestClaimDryRunPrintsTaskClaimEvent(t *testing.T) {
 	}
 }
 
+func TestAssignDryRunPrintsTaskAssignEvent(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"assign", "--task-id", "task-1", "--assignee", "agent-b", "--recipient", "recipient-pubkey", "--dry-run"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{"\"kind\":25910", "task/assign", "recipient-pubkey", "agent-b", "task-1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("dry-run output missing %q: %s", want, got)
+		}
+	}
+}
+
 func TestUpdateDryRunPrintsTaskUpdateEvent(t *testing.T) {
 	cmd := newRootCmd()
 	cmd.SetArgs([]string{"update", "--task-id", "task-1", "--recipient", "recipient-pubkey", "--status", "in_progress", "--dry-run"})
