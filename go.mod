@@ -5,6 +5,7 @@ go 1.23
 toolchain go1.24.4 // auto-downloads and pins this Go toolchain version
 
 require (
+	git.sharegap.net/cascadia/cascadia-go v0.2.1
 	github.com/nbd-wtf/go-nostr v0.32.0
 	github.com/spf13/cobra v1.8.1
 	google.golang.org/protobuf v1.36.11

@@ -248,6 +248,10 @@ func BuildClaimDispatch(taskID, claimer, recipient string, now time.Time) (*gono
 	return BuildContextVMCommand("task/claim", recipient, map[string]string{"task_id": taskID, "claimer": claimer, "dispatch": "fleet-worker"}, now)
 }
 
+func BuildAssignCommand(taskID, assignee, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("task/assign", recipient, map[string]string{"task_id": taskID, "assignee": assignee}, now)
+}
+
 func StatusString(s beadspb.Status) string {
 	switch s {
 	case beadspb.Status_STATUS_IN_PROGRESS:

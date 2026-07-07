@@ -31,7 +31,7 @@ func newRootCmd() *cobra.Command {
 		Short: "Relay-backed NIP-34 to beads task-fabric bridge",
 	}
 
-	cmd.AddCommand(newFetchCmd(), newServeCmd(), newPublishCmd(), newSyncCmd(), newClaimCmd(), newUpdateCmd())
+	cmd.AddCommand(newFetchCmd(), newServeCmd(), newPublishCmd(), newSyncCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd())
 	return cmd
 }
 
@@ -337,6 +337,68 @@ func newClaimCmd() *cobra.Command {
 	return claimCmd
 }
 
+func newAssignCmd() *cobra.Command {
+	var taskID string
+	var assignee string
+	var recipient string
+	var relays []string
+	var signing signingOptions
+	var response responseOptions
+
+	assignCmd := &cobra.Command{
+		Use:   "assign",
+		Short: "Publish a ContextVM task/assign command",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			if strings.TrimSpace(taskID) == "" {
+				return fmt.Errorf("--task-id is required")
+			}
+			if strings.TrimSpace(assignee) == "" {
+				return fmt.Errorf("--assignee is required")
+			}
+			if strings.TrimSpace(recipient) == "" {
+				return fmt.Errorf("--recipient is required")
+			}
+			signer, _, err := signerFromOptions(ctx, signing, !signing.dryRun)
+			if err != nil {
+				return err
+			}
+			event, err := nip34.BuildAssignCommand(taskID, assignee, recipient, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			events := []*gonostr.Event{event}
+			if signing.dryRun {
+				if signer != nil {
+					if err := signEvents(ctx, signer, events); err != nil {
+						return err
+					}
+				}
+				return writeEvents(cmd, events)
+			}
+			relays = relaysWithEnv(relays)
+			if len(relays) == 0 {
+				return fmt.Errorf("at least one --relay or NOSTR_RELAY is required")
+			}
+			if err := nip34.NewPublisher().Publish(ctx, relays, signer, events); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "published assignment for %s to %d relay(s)\n", taskID, len(relays)); err != nil {
+				return err
+			}
+			return maybeWaitForResponse(cmd, relays, event, response)
+		},
+	}
+
+	assignCmd.Flags().StringVar(&taskID, "task-id", "", "Task id to assign (required)")
+	assignCmd.Flags().StringVar(&assignee, "assignee", "", "Assignee agent/worker pubkey or stable id (required)")
+	assignCmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
+	assignCmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	addSigningFlags(assignCmd, &signing)
+	addResponseFlags(assignCmd, &response)
+	return assignCmd
+}
+
 func newUpdateCmd() *cobra.Command {
 	var taskID string
 	var recipient string
@@ -440,8 +502,8 @@ type responseOptions struct {
 
 func addSigningFlags(cmd *cobra.Command, opts *signingOptions) {
 	cmd.Flags().StringVar(&opts.bunkerURL, "signer-bunker-url", "", "Signet/NIP-46 bunker URL; defaults to NOSTRIG_SIGNER_BUNKER_URL")
-	cmd.Flags().StringVar(&opts.clientSecretKey, "signer-client-secret-key", "", "NIP-46 client secret key (hex or nsec); defaults to NOSTRIG_SIGNER_CLIENT_SECRET_KEY and may be ephemeral if omitted")
-	cmd.Flags().StringVar(&opts.privateKey, "private-key", "", "Local-dev Nostr private key (hex or nsec); defaults to NOSTR_PRIVATE_KEY and is forbidden when NOSTRIG_ENV=production")
+	cmd.Flags().StringVar(&opts.clientSecretKey, "signer-client-secret-key", "", "NIP-46 client secret key (hex); defaults to NOSTRIG_SIGNER_CLIENT_SECRET_KEY and may be ephemeral if omitted")
+	cmd.Flags().StringVar(&opts.privateKey, "private-key", "", "Local-dev Nostr private key (hex); defaults to NOSTR_PRIVATE_KEY and is forbidden when NOSTRIG_ENV=production")
 	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "Print generated events as JSONL instead of publishing")
 }
 
@@ -510,25 +572,7 @@ func resolveClientSecretKey(clientSecretKey string) (string, error) {
 }
 
 func normalizeSecretKey(key string) (string, error) {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return "", nil
-	}
-	if strings.HasPrefix(key, "nsec1") {
-		prefix, value, err := nip19.Decode(key)
-		if err != nil {
-			return "", fmt.Errorf("failed to decode nsec: %w", err)
-		}
-		if prefix != "nsec" {
-			return "", fmt.Errorf("expected nsec, got %s", prefix)
-		}
-		hex, ok := value.(string)
-		if !ok {
-			return "", fmt.Errorf("decoded nsec value is not a string")
-		}
-		return hex, nil
-	}
-	return key, nil
+	return strings.TrimSpace(key), nil
 }
 
 func signerFromOptions(ctx context.Context, opts signingOptions, required bool) (nip34.Signer, bool, error) {
