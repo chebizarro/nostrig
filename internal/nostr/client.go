@@ -5,18 +5,18 @@ import (
 	"fmt"
 	"time"
 
-	gonostr "github.com/nbd-wtf/go-nostr"
+	gonostr "fiatjaf.com/nostr"
 )
 
 // Client wraps a go-nostr SimplePool and provides higher-level fetch helpers.
 type Client struct {
-	pool *gonostr.SimplePool
+	pool *gonostr.Pool
 }
 
 // NewClient creates a new nostr client using a SimplePool.
 func NewClient() *Client {
 	return &Client{
-		pool: gonostr.NewSimplePool(context.Background()),
+		pool: gonostr.NewPool(),
 	}
 }
 
@@ -48,24 +48,27 @@ func (c *Client) FetchMany(ctx context.Context, relays []string, filters []gonos
 	queryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	ch := c.pool.SubManyEose(queryCtx, relays, gonostr.Filters(filters))
-	if ch == nil {
-		return nil, fmt.Errorf("failed to create subscription")
-	}
-
 	seen := make(map[string]struct{}, 1024)
 	out := make([]*gonostr.Event, 0, 256)
 
-	for ie := range ch {
-		ev := ie.Event
-		if ev == nil || ev.ID == "" {
-			continue
+	for _, filter := range filters {
+		ch := c.pool.FetchMany(queryCtx, relays, filter, gonostr.SubscriptionOptions{})
+		if ch == nil {
+			return nil, fmt.Errorf("failed to create subscription")
 		}
-		if _, exists := seen[ev.ID]; exists {
-			continue
+		for ie := range ch {
+			ev := ie.Event
+			if ev.ID == gonostr.ZeroID {
+				continue
+			}
+			id := ev.ID.Hex()
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			seen[id] = struct{}{}
+			evCopy := ev
+			out = append(out, &evCopy)
 		}
-		seen[ev.ID] = struct{}{}
-		out = append(out, ev)
 	}
 
 	// Don't treat timeout as error if we got some results

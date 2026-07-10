@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
+	gonostr "fiatjaf.com/nostr"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	gonostr "github.com/nbd-wtf/go-nostr"
 )
 
 func TestMatchContextVMResponseByEventTag(t *testing.T) {
@@ -14,8 +14,8 @@ func TestMatchContextVMResponseByEventTag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd.ID = "cmd-event-id"
-	respEvent := &gonostr.Event{Kind: nip34.KindContextVMIntent, Tags: gonostr.Tags{{"e", cmd.ID}}, Content: `{"jsonrpc":"2.0","id":"` + jsonRPCID(cmd.Content) + `","result":{"ok":true}}`}
+	cmd.ID = testID(4)
+	respEvent := &gonostr.Event{Kind: nip34.KindContextVMIntent, Tags: gonostr.Tags{{"e", cmd.ID.Hex()}}, Content: `{"jsonrpc":"2.0","id":"` + jsonRPCID(cmd.Content) + `","result":{"ok":true}}`}
 	resp, ok := MatchContextVMResponse(cmd, respEvent)
 	if !ok {
 		t.Fatal("response did not match")
@@ -30,7 +30,7 @@ func TestMatchContextVMResponseRejectsUncorrelated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd.ID = "cmd-event-id"
+	cmd.ID = testID(4)
 	respEvent := &gonostr.Event{Kind: nip34.KindContextVMIntent, Tags: gonostr.Tags{{"e", "other"}}, Content: `{"jsonrpc":"2.0","id":"other","result":{"ok":true}}`}
 	if _, ok := MatchContextVMResponse(cmd, respEvent); ok {
 		t.Fatal("uncorrelated response matched")

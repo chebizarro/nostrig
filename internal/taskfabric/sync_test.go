@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
+	gonostr "fiatjaf.com/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	gonostr "github.com/nbd-wtf/go-nostr"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -24,10 +24,10 @@ func TestExportFromTaskStateEventsLatestWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldEvent.ID = "old-event"
-	oldEvent.PubKey = "old-pubkey"
-	newEvent.ID = "new-event"
-	newEvent.PubKey = "new-pubkey"
+	oldEvent.ID = testID(20)
+	oldEvent.PubKey = testPubKey(20)
+	newEvent.ID = testID(21)
+	newEvent.PubKey = testPubKey(21)
 
 	export, err := ExportFromTaskStateEvents([]*gonostr.Event{oldEvent, newEvent})
 	if err != nil {
@@ -40,7 +40,7 @@ func TestExportFromTaskStateEventsLatestWins(t *testing.T) {
 	if issue.Title != "new" || issue.Status != beadspb.Status_STATUS_IN_PROGRESS {
 		t.Fatalf("latest issue not selected: %#v", issue)
 	}
-	if issue.Metadata.Custom["nostr.id"] != "new-event" {
+	if issue.Metadata.Custom["nostr.id"] != testID(21).Hex() {
 		t.Fatalf("metadata not updated: %#v", issue.Metadata.Custom)
 	}
 }

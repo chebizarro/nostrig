@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
+	gonostr "fiatjaf.com/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	"github.com/chebizarro/nostrig/internal/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	gonostr "github.com/nbd-wtf/go-nostr"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -160,9 +160,13 @@ func FetchTaskStateEvents(ctx context.Context, client *nip34.Client, opts SyncOp
 		limit = 500
 	}
 
-	f := gonostr.Filter{Kinds: []int{nip34.KindCanonicalState}, Limit: limit}
+	f := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindCanonicalState)}, Limit: limit}
 	if len(opts.Authors) > 0 {
-		f.Authors = cleanStrings(opts.Authors)
+		for _, author := range cleanStrings(opts.Authors) {
+			if pk, err := gonostr.PubKeyFromHex(author); err == nil {
+				f.Authors = append(f.Authors, pk)
+			}
+		}
 	}
 	tags := gonostr.TagMap{}
 	if repoAddr != "" {
@@ -198,8 +202,8 @@ func ExportFromTaskStateEvents(events []*gonostr.Event) (*beadspb.Export, error)
 		}
 		createdAt := nip34.EventTime(ev)
 		ensureMetadata(issue)
-		issue.Metadata.Custom["nostr.id"] = ev.ID
-		issue.Metadata.Custom["nostr.pubkey"] = ev.PubKey
+		issue.Metadata.Custom["nostr.id"] = ev.ID.Hex()
+		issue.Metadata.Custom["nostr.pubkey"] = ev.PubKey.Hex()
 		issue.Metadata.Custom["nostr.kind"] = fmt.Sprintf("%d", ev.Kind)
 		issue.Metadata.Custom["nostrig.source"] = "canonical-task-state"
 		if issue.Updated == nil && !createdAt.IsZero() {

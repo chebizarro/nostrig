@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
+	gonostr "fiatjaf.com/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	gonostr "github.com/nbd-wtf/go-nostr"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -44,7 +44,7 @@ func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.
 	if method == "" {
 		method, _ = nip34.TagFirst(ev, "method")
 	}
-	result, err := h.dispatch(ctx, method, req.Params, ev.PubKey, now)
+	result, err := h.dispatch(ctx, method, req.Params, ev.PubKey.Hex(), now)
 	resp := map[string]any{"jsonrpc": "2.0"}
 	if len(req.ID) > 0 {
 		var id any
@@ -60,11 +60,11 @@ func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.
 	if err != nil {
 		return nil, err
 	}
-	tags := gonostr.Tags{{"e", ev.ID}, {"p", ev.PubKey}, {"method", method}, {"schema", nip34.TaskIntentSchema}}
+	tags := gonostr.Tags{{"e", ev.ID.Hex()}, {"p", ev.PubKey.Hex()}, {"method", method}, {"schema", nip34.TaskIntentSchema}}
 	if id := rawIDString(req.ID); id != "" {
 		tags = append(tags, gonostr.Tag{"correlation", id}, gonostr.Tag{"request", id})
 	}
-	return &gonostr.Event{Kind: nip34.KindContextVMIntent, CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: string(content)}, nil
+	return &gonostr.Event{Kind: gonostr.Kind(nip34.KindContextVMIntent), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: string(content)}, nil
 }
 
 func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessage, caller string, now time.Time) (any, error) {

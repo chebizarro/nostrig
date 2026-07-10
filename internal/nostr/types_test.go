@@ -4,8 +4,20 @@ import (
 	"testing"
 	"time"
 
-	gonostr "github.com/nbd-wtf/go-nostr"
+	gonostr "fiatjaf.com/nostr"
 )
+
+func testID(n byte) gonostr.ID {
+	var id gonostr.ID
+	id[31] = n
+	return id
+}
+
+func testPubKey(n byte) gonostr.PubKey {
+	var pk gonostr.PubKey
+	pk[31] = n
+	return pk
+}
 
 func TestTagHelpers(t *testing.T) {
 	ev := &gonostr.Event{
@@ -73,8 +85,8 @@ func TestSanitizeSlug(t *testing.T) {
 
 func TestParseRepoAnnouncement(t *testing.T) {
 	ev := &gonostr.Event{
-		ID:        "ev1",
-		PubKey:    "pub1",
+		ID:        testID(1),
+		PubKey:    testPubKey(1),
 		Kind:      KindRepositoryAnnouncement,
 		CreatedAt: 123,
 		Tags: gonostr.Tags{
@@ -129,8 +141,8 @@ func TestParseRepoAnnouncement(t *testing.T) {
 
 func TestParseRepoState(t *testing.T) {
 	ev := &gonostr.Event{
-		ID:        "st1",
-		PubKey:    "pub1",
+		ID:        testID(2),
+		PubKey:    testPubKey(1),
 		Kind:      KindRepositoryState,
 		CreatedAt: 200,
 		Tags: gonostr.Tags{
@@ -162,8 +174,8 @@ func TestParseRepoState(t *testing.T) {
 
 func TestParseRootItemAndStatusEvent(t *testing.T) {
 	rootEv := &gonostr.Event{
-		ID:        "root1",
-		PubKey:    "pubA",
+		ID:        testID(3),
+		PubKey:    testPubKey(2),
 		Kind:      KindIssue,
 		CreatedAt: 300,
 		Content:   "Hello world\nMore text",
@@ -178,8 +190,8 @@ func TestParseRootItemAndStatusEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseRootItem error: %v", err)
 	}
-	if root.EventID != "root1" {
-		t.Fatalf("Root.EventID=%q, want %q", root.EventID, "root1")
+	if root.EventID != testID(3).Hex() {
+		t.Fatalf("Root.EventID=%q, want %q", root.EventID, testID(3).Hex())
 	}
 	if root.Subject != "Test issue" {
 		t.Fatalf("Root.Subject=%q, want %q", root.Subject, "Test issue")
@@ -192,8 +204,8 @@ func TestParseRootItemAndStatusEvent(t *testing.T) {
 	}
 
 	statusEv := &gonostr.Event{
-		ID:        "st-root1",
-		PubKey:    "pubB",
+		ID:        testID(4),
+		PubKey:    testPubKey(3),
 		Kind:      KindStatusDraft,
 		CreatedAt: 400,
 		Content:   "drafting",

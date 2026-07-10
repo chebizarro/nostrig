@@ -5,7 +5,7 @@ import (
 	"time"
 
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
-	gonostr "github.com/nbd-wtf/go-nostr"
+	gonostr "fiatjaf.com/nostr"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )

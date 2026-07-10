@@ -13,7 +13,7 @@ import (
 
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	gonostr "github.com/nbd-wtf/go-nostr"
+	gonostr "fiatjaf.com/nostr"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 

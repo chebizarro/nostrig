@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	gonostr "github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip46"
+	gonostr "fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip46"
 )
 
 // PrivateKeySigner signs events with a raw Nostr private key. It is intended as
@@ -37,7 +37,11 @@ func (s *PrivateKeySigner) SignEvent(ctx context.Context, ev *gonostr.Event) err
 	if ev == nil {
 		return fmt.Errorf("event is nil")
 	}
-	return ev.Sign(s.PrivateKey)
+	sk, err := gonostr.SecretKeyFromHex(s.PrivateKey)
+	if err != nil {
+		return fmt.Errorf("parse private key: %w", err)
+	}
+	return ev.Sign(sk)
 }
 
 func (s *PrivateKeySigner) PublicKey(ctx context.Context) (string, error) {
@@ -50,11 +54,11 @@ func (s *PrivateKeySigner) PublicKey(ctx context.Context) (string, error) {
 	if s == nil || strings.TrimSpace(s.PrivateKey) == "" {
 		return "", fmt.Errorf("private key signer is not configured")
 	}
-	pub, err := gonostr.GetPublicKey(s.PrivateKey)
+	sk, err := gonostr.SecretKeyFromHex(s.PrivateKey)
 	if err != nil {
-		return "", fmt.Errorf("derive public key: %w", err)
+		return "", fmt.Errorf("parse private key: %w", err)
 	}
-	return pub, nil
+	return sk.Public().Hex(), nil
 }
 
 // PublicKeyProvider is implemented by signers that can report the Nostr public
@@ -86,9 +90,13 @@ func ConnectNIP46Signer(ctx context.Context, bunkerURL, clientSecretKey string) 
 	}
 	clientSecretKey = strings.TrimSpace(clientSecretKey)
 	if clientSecretKey == "" {
-		clientSecretKey = gonostr.GeneratePrivateKey()
+		clientSecretKey = gonostr.Generate().Hex()
 	}
-	client, err := nip46.ConnectBunker(ctx, clientSecretKey, bunkerURL, nil, func(string) {})
+	clientSK, err := gonostr.SecretKeyFromHex(clientSecretKey)
+	if err != nil {
+		return nil, fmt.Errorf("parse nip46 client secret key: %w", err)
+	}
+	client, err := nip46.ConnectBunker(ctx, clientSK, bunkerURL, nil, func(string) {})
 	if err != nil {
 		return nil, fmt.Errorf("connect nip46 signer: %w", err)
 	}
@@ -121,5 +129,9 @@ func (s *NIP46Signer) PublicKey(ctx context.Context) (string, error) {
 	if s == nil || s.client == nil {
 		return "", fmt.Errorf("nip46 signer is not configured")
 	}
-	return s.client.GetPublicKey(ctx)
+	pub, err := s.client.GetPublicKey(ctx)
+	if err != nil {
+		return "", err
+	}
+	return pub.Hex(), nil
 }

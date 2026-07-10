@@ -6,7 +6,7 @@ import (
 	"time"
 	"unicode"
 
-	gonostr "github.com/nbd-wtf/go-nostr"
+	gonostr "fiatjaf.com/nostr"
 )
 
 // TagFirst returns the first value for tags with the given name.
@@ -160,8 +160,8 @@ func ParseRepoAnnouncement(ev *gonostr.Event) (*RepoAnnouncement, error) {
 	desc, _ := TagFirst(ev, "description")
 
 	ra := &RepoAnnouncement{
-		EventID:     ev.ID,
-		PubKey:      ev.PubKey,
+		EventID:     ev.ID.Hex(),
+		PubKey:      ev.PubKey.Hex(),
 		RepoID:      repoID,
 		Name:        name,
 		Description: desc,
@@ -211,8 +211,8 @@ func ParseRepoState(ev *gonostr.Event) (*RepoState, error) {
 	}
 
 	rs := &RepoState{
-		EventID:   ev.ID,
-		PubKey:    ev.PubKey,
+		EventID:   ev.ID.Hex(),
+		PubKey:    ev.PubKey.Hex(),
 		RepoID:    repoID,
 		Refs:      make(map[string]string),
 		CreatedAt: EventTime(ev),
@@ -272,9 +272,9 @@ func ParseRootItem(ev *gonostr.Event) (*RootItem, error) {
 	subject, _ := TagFirst(ev, "subject")
 
 	item := &RootItem{
-		EventID:   ev.ID,
-		PubKey:    ev.PubKey,
-		Kind:      ev.Kind,
+		EventID:   ev.ID.Hex(),
+		PubKey:    ev.PubKey.Hex(),
+		Kind:      int(ev.Kind),
 		RepoAddr:  repoAddr,
 		Subject:   subject,
 		Content:   ev.Content,
@@ -340,9 +340,9 @@ func ParseStatusEvent(ev *gonostr.Event) (*StatusEvent, error) {
 	}
 
 	return &StatusEvent{
-		EventID:     ev.ID,
-		PubKey:      ev.PubKey,
-		Kind:        ev.Kind,
+		EventID:     ev.ID.Hex(),
+		PubKey:      ev.PubKey.Hex(),
+		Kind:        int(ev.Kind),
 		RootEventID: rootID,
 		Content:     ev.Content,
 		CreatedAt:   EventTime(ev),
