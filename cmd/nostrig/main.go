@@ -132,6 +132,7 @@ func newSyncCmd() *cobra.Command {
 	var limit int
 	var failOnConflict bool
 	var push bool
+	var syncNIP34Status bool
 	var signing signingOptions
 
 	syncCmd := &cobra.Command{
@@ -151,7 +152,7 @@ func newSyncCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			result, err := taskfabric.Sync(cmd.Context(), nip34.NewClient(), taskfabric.SyncOptions{Relays: relays, RepoAddr: addr, TaskIDs: taskIDs, Authors: authors, OutDir: outDir, CachePath: cachePath, Limit: limit, FailOnConflict: failOnConflict, Push: push && !signing.dryRun, Signer: signer})
+			result, err := taskfabric.Sync(cmd.Context(), nip34.NewClient(), taskfabric.SyncOptions{Relays: relays, RepoAddr: addr, TaskIDs: taskIDs, Authors: authors, OutDir: outDir, CachePath: cachePath, Limit: limit, FailOnConflict: failOnConflict, Push: push && !signing.dryRun, SyncNIP34Status: syncNIP34Status, Signer: signer})
 			if err != nil {
 				return err
 			}
@@ -170,6 +171,7 @@ func newSyncCmd() *cobra.Command {
 	syncCmd.Flags().StringVar(&cachePath, "cache", "", "Durable nostrig task cache path (default: <out>/.nostrig/task-cache.jsonl)")
 	syncCmd.Flags().BoolVar(&failOnConflict, "fail-on-conflict", false, "Exit non-zero when local and relay changes conflict")
 	syncCmd.Flags().BoolVar(&push, "push", false, "Publish local .beads changes back to relay after relay-source-of-truth reconciliation")
+	syncCmd.Flags().BoolVar(&syncNIP34Status, "sync-nip34-status", false, "Opt-in: with --push, publish NIP-34 issue status events for linked tasks")
 	syncCmd.Flags().IntVar(&limit, "limit", 500, "Maximum task-state events to request")
 	addSigningFlags(syncCmd, &signing)
 	return syncCmd
@@ -532,15 +534,17 @@ func newServeCmd() *cobra.Command {
 	var relays []string
 	var signing signingOptions
 	var pubkey string
+	var syncNIP34Status bool
 	cmd := &cobra.Command{Use: "serve", Short: "Serve incoming ContextVM task and queue intents", RunE: func(cmd *cobra.Command, args []string) error {
 		signer, _, err := signerFromOptions(cmd.Context(), signing, true)
 		if err != nil {
 			return err
 		}
-		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), Signer: signer, PubKey: pubkey})
+		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), Signer: signer, PubKey: pubkey, SyncNIP34Status: syncNIP34Status})
 	}}
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to subscribe/publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
 	cmd.Flags().StringVar(&pubkey, "pubkey", "", "Server recipient pubkey; defaults to signer pubkey when available")
+	cmd.Flags().BoolVar(&syncNIP34Status, "sync-nip34-status", false, "Opt-in: publish NIP-34 issue status events when linked tasks change")
 	addSigningFlags(cmd, &signing)
 	return cmd
 }
