@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	gonostr "fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/keyer"
 	"fiatjaf.com/nostr/nip46"
 )
 
@@ -42,6 +43,57 @@ func (s *PrivateKeySigner) SignEvent(ctx context.Context, ev *gonostr.Event) err
 		return fmt.Errorf("parse private key: %w", err)
 	}
 	return ev.Sign(sk)
+}
+
+func (s *PrivateKeySigner) keyer() (keyer.KeySigner, error) {
+	if s == nil || strings.TrimSpace(s.PrivateKey) == "" {
+		return keyer.KeySigner{}, fmt.Errorf("private key signer is not configured")
+	}
+	sk, err := gonostr.SecretKeyFromHex(s.PrivateKey)
+	if err != nil {
+		return keyer.KeySigner{}, fmt.Errorf("parse private key: %w", err)
+	}
+	return keyer.NewPlainKeySigner(sk), nil
+}
+
+func (s *PrivateKeySigner) GetPublicKey(ctx context.Context) (gonostr.PubKey, error) {
+	ks, err := s.keyer()
+	if err != nil {
+		return gonostr.ZeroPK, err
+	}
+	return ks.GetPublicKey(ctx)
+}
+
+func (s *PrivateKeySigner) Encrypt(ctx context.Context, plaintext string, recipient gonostr.PubKey) (string, error) {
+	ks, err := s.keyer()
+	if err != nil {
+		return "", err
+	}
+	return ks.Encrypt(ctx, plaintext, recipient)
+}
+
+func (s *PrivateKeySigner) Decrypt(ctx context.Context, ciphertext string, sender gonostr.PubKey) (string, error) {
+	ks, err := s.keyer()
+	if err != nil {
+		return "", err
+	}
+	return ks.Decrypt(ctx, ciphertext, sender)
+}
+
+func (s *PrivateKeySigner) Nip04Encrypt(ctx context.Context, plaintext string, recipient gonostr.PubKey) (string, error) {
+	ks, err := s.keyer()
+	if err != nil {
+		return "", err
+	}
+	return ks.Nip04Encrypt(ctx, plaintext, recipient)
+}
+
+func (s *PrivateKeySigner) Nip04Decrypt(ctx context.Context, ciphertext string, sender gonostr.PubKey) (string, error) {
+	ks, err := s.keyer()
+	if err != nil {
+		return "", err
+	}
+	return ks.Nip04Decrypt(ctx, ciphertext, sender)
 }
 
 func (s *PrivateKeySigner) PublicKey(ctx context.Context) (string, error) {
@@ -117,6 +169,41 @@ func (s *NIP46Signer) SignEvent(ctx context.Context, ev *gonostr.Event) error {
 		return fmt.Errorf("event is nil")
 	}
 	return s.client.SignEvent(ctx, ev)
+}
+
+func (s *NIP46Signer) GetPublicKey(ctx context.Context) (gonostr.PubKey, error) {
+	if s == nil || s.client == nil {
+		return gonostr.ZeroPK, fmt.Errorf("nip46 signer is not configured")
+	}
+	return s.client.GetPublicKey(ctx)
+}
+
+func (s *NIP46Signer) Encrypt(ctx context.Context, plaintext string, recipient gonostr.PubKey) (string, error) {
+	if s == nil || s.client == nil {
+		return "", fmt.Errorf("nip46 signer is not configured")
+	}
+	return s.client.NIP44Encrypt(ctx, recipient, plaintext)
+}
+
+func (s *NIP46Signer) Decrypt(ctx context.Context, ciphertext string, sender gonostr.PubKey) (string, error) {
+	if s == nil || s.client == nil {
+		return "", fmt.Errorf("nip46 signer is not configured")
+	}
+	return s.client.NIP44Decrypt(ctx, sender, ciphertext)
+}
+
+func (s *NIP46Signer) Nip04Encrypt(ctx context.Context, plaintext string, recipient gonostr.PubKey) (string, error) {
+	if s == nil || s.client == nil {
+		return "", fmt.Errorf("nip46 signer is not configured")
+	}
+	return s.client.NIP04Encrypt(ctx, recipient, plaintext)
+}
+
+func (s *NIP46Signer) Nip04Decrypt(ctx context.Context, ciphertext string, sender gonostr.PubKey) (string, error) {
+	if s == nil || s.client == nil {
+		return "", fmt.Errorf("nip46 signer is not configured")
+	}
+	return s.client.NIP04Decrypt(ctx, sender, ciphertext)
 }
 
 func (s *NIP46Signer) PublicKey(ctx context.Context) (string, error) {

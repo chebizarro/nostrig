@@ -8,6 +8,9 @@ import (
 	"time"
 
 	gonostr "fiatjaf.com/nostr"
+	cascadia "git.sharegap.net/cascadia/cascadia-go"
+	cascontextvm "git.sharegap.net/cascadia/cascadia-go/contextvm"
+	casnostr "git.sharegap.net/cascadia/cascadia-go/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 )
@@ -142,11 +145,15 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if pubkey == "" {
 		return fmt.Errorf("serve requires --pubkey when signer cannot provide one")
 	}
+	contextSigner, err := contextVMSigner(opts.Signer)
+	if err != nil {
+		return err
+	}
 	ledger := &RelayLedger{Relays: relays, Signer: opts.Signer, SyncNIP34Status: opts.SyncNIP34Status}
 	handler := &Handler{Ledger: ledger}
 	pool := gonostr.NewPool()
 	defer pool.Close("nostrig serve complete")
-	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent)}, Tags: gonostr.TagMap{"p": []string{pubkey}, "domain": []string{"task", "queue"}}}
+	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent), gonostr.Kind(cascadia.NIP59_GIFT_WRAP)}, Tags: gonostr.TagMap{"p": []string{pubkey}}}
 	ch := pool.SubscribeMany(ctx, relays, filter, gonostr.SubscriptionOptions{})
 	for {
 		select {
@@ -157,11 +164,27 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 				return fmt.Errorf("subscription closed")
 			}
 			ev := ie.Event
-			if !allowedMethod(&ev) {
+			inner := &ev
+			wrapped := ev.Kind == gonostr.Kind(cascadia.NIP59_GIFT_WRAP)
+			if wrapped {
+				unwrapped, err := cascontextvm.Unwrap(ctx, contextSigner, (*casnostr.Event)(&ev))
+				if err != nil {
+					continue
+				}
+				inner = (*gonostr.Event)(unwrapped)
+			}
+			if !allowedMethod(inner) {
 				continue
 			}
-			resp, err := handler.HandleIntent(ctx, &ev, time.Now().UTC())
+			resp, err := handler.HandleIntent(ctx, inner, time.Now().UTC())
 			if err != nil {
+				continue
+			}
+			if wrapped {
+				outer, _, err := cascontextvm.Wrap(ctx, contextSigner, inner.PubKey.Hex(), json.RawMessage(resp.Content))
+				if err == nil {
+					_, _ = casnostr.Publish(ctx, relays, *outer)
+				}
 				continue
 			}
 			_ = nip34.NewPublisher().Publish(ctx, relays, opts.Signer, []*gonostr.Event{resp})
@@ -172,7 +195,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 func allowedMethod(ev *gonostr.Event) bool {
 	method, _ := nip34.TagFirst(ev, "method")
 	if method == "" {
-		var req rpcEnvelope
+		var req cascontextvm.Request
 		_ = json.Unmarshal([]byte(ev.Content), &req)
 		method = req.Method
 	}
@@ -182,4 +205,12 @@ func allowedMethod(ev *gonostr.Event) bool {
 	default:
 		return false
 	}
+}
+
+func contextVMSigner(s nip34.Signer) (casnostr.Signer, error) {
+	keyer, ok := s.(casnostr.Signer)
+	if !ok {
+		return nil, fmt.Errorf("signer does not support ContextVM NIP-59 encryption")
+	}
+	return keyer, nil
 }

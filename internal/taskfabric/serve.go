@@ -8,6 +8,7 @@ import (
 	"time"
 
 	gonostr "fiatjaf.com/nostr"
+	cascontextvm "git.sharegap.net/cascadia/cascadia-go/contextvm"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -22,13 +23,6 @@ type Ledger interface {
 
 type Handler struct{ Ledger Ledger }
 
-type rpcEnvelope struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Method  string          `json:"method,omitempty"`
-	Params  json.RawMessage `json:"params,omitempty"`
-}
-
 func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.Time) (*gonostr.Event, error) {
 	if h == nil || h.Ledger == nil {
 		return nil, fmt.Errorf("handler ledger is nil")
@@ -36,35 +30,36 @@ func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.
 	if ev == nil || ev.Kind != nip34.KindContextVMIntent {
 		return nil, fmt.Errorf("expected ContextVM intent")
 	}
-	var req rpcEnvelope
+	var req cascontextvm.Request
 	if err := json.Unmarshal([]byte(ev.Content), &req); err != nil {
 		return nil, err
 	}
-	method := strings.TrimSpace(req.Method)
-	if method == "" {
-		method, _ = nip34.TagFirst(ev, "method")
+	if strings.TrimSpace(req.Method) == "" {
+		req.Method, _ = nip34.TagFirst(ev, "method")
 	}
-	result, err := h.dispatch(ctx, method, req.Params, ev.PubKey.Hex(), now)
-	resp := map[string]any{"jsonrpc": "2.0"}
-	if len(req.ID) > 0 {
-		var id any
-		_ = json.Unmarshal(req.ID, &id)
-		resp["id"] = id
-	}
-	if err != nil {
-		resp["error"] = map[string]any{"code": -32000, "message": err.Error()}
-	} else {
-		resp["result"] = result
-	}
+	resp := h.registry(ev.PubKey.Hex(), now).Dispatch(ctx, req)
 	content, err := json.Marshal(resp)
 	if err != nil {
 		return nil, err
 	}
-	tags := gonostr.Tags{{"e", ev.ID.Hex()}, {"p", ev.PubKey.Hex()}, {"method", method}, {"schema", nip34.TaskIntentSchema}}
+	tags := gonostr.Tags{{"e", ev.ID.Hex()}, {"p", ev.PubKey.Hex()}, {"method", req.Method}, {"schema", nip34.TaskIntentSchema}}
 	if id := rawIDString(req.ID); id != "" {
 		tags = append(tags, gonostr.Tag{"correlation", id}, gonostr.Tag{"request", id})
 	}
 	return &gonostr.Event{Kind: gonostr.Kind(nip34.KindContextVMIntent), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: string(content)}, nil
+}
+
+func (h *Handler) registry(caller string, now time.Time) *cascontextvm.Registry {
+	r := cascontextvm.NewRegistry()
+	for _, method := range []string{"task/claim", "task/assign", "task/update", "task/close", "queue/enqueue", "queue/dequeue", "queue/list"} {
+		parts := strings.Split(method, "/")
+		r.Register(parts[0], parts[1], func(method string) cascontextvm.Handler {
+			return func(ctx context.Context, req cascontextvm.Request) (any, error) {
+				return h.dispatch(ctx, method, req.Params, caller, now)
+			}
+		}(method))
+	}
+	return r
 }
 
 func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessage, caller string, now time.Time) (any, error) {
