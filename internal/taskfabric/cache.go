@@ -65,6 +65,10 @@ type CacheRecord struct {
 	Conflict      *ConflictMetadata `json:"conflict,omitempty"`
 }
 
+type MergeOptions struct {
+	RelayWinsOnConflict bool
+}
+
 type MergeResult struct {
 	Records   []*CacheRecord
 	Export    *beadspb.Export
@@ -186,6 +190,10 @@ func LoadLocalIssues(outDir string) ([]*TaskSnapshot, error) {
 }
 
 func MergeTaskState(relayExport *beadspb.Export, local []*TaskSnapshot, previous []*CacheRecord) (*MergeResult, error) {
+	return MergeTaskStateWithOptions(relayExport, local, previous, MergeOptions{})
+}
+
+func MergeTaskStateWithOptions(relayExport *beadspb.Export, local []*TaskSnapshot, previous []*CacheRecord, opts MergeOptions) (*MergeResult, error) {
 	prevByID := map[string]*CacheRecord{}
 	for _, rec := range previous {
 		if rec != nil && strings.TrimSpace(rec.ID) != "" {
@@ -252,7 +260,11 @@ func MergeTaskState(relayExport *beadspb.Export, local []*TaskSnapshot, previous
 				resolved = latestSnapshot(localSnap, relaySnap)
 				resolution = ResolutionLatestWins
 			} else {
-				resolved = previousResolved(prev, latestSnapshot(localSnap, relaySnap))
+				if opts.RelayWinsOnConflict {
+					resolved = relaySnap
+				} else {
+					resolved = previousResolved(prev, latestSnapshot(localSnap, relaySnap))
+				}
 				resolution = ResolutionConflict
 				conflict = &ConflictMetadata{Reason: "local_and_relay_changed", ChangedFields: changed, LocalRevision: localRev, RelayEventID: relayEventID}
 			}

@@ -15,22 +15,31 @@ import (
 )
 
 // SyncOptions configure relay-backed canonical task-state synchronization.
+type EventPublisher interface {
+	Publish(ctx context.Context, relays []string, signer nip34.Signer, events []*gonostr.Event) error
+}
+
 type SyncOptions struct {
-	Relays         []string
-	RepoAddr       string
-	TaskIDs        []string
-	Authors        []string
-	OutDir         string
-	CachePath      string
-	Limit          int
-	FailOnConflict bool
+	Relays              []string
+	RepoAddr            string
+	TaskIDs             []string
+	Authors             []string
+	OutDir              string
+	CachePath           string
+	Limit               int
+	FailOnConflict      bool
+	Push                bool
+	Signer              nip34.Signer
+	Publisher           EventPublisher
+	RelayWinsOnConflict bool
 }
 
 type SyncResult struct {
-	Export        *beadspb.Export
-	EventCount    int
-	CachePath     string
-	ConflictCount int
+	Export         *beadspb.Export
+	EventCount     int
+	CachePath      string
+	ConflictCount  int
+	PublishedCount int
 }
 
 // Sync fetches canonical task-state events, merges them with the durable local
@@ -60,7 +69,11 @@ func Sync(ctx context.Context, client *nip34.Client, opts SyncOptions) (*SyncRes
 	if err != nil {
 		return nil, fmt.Errorf("load local beads issues: %w", err)
 	}
-	merged, err := MergeTaskState(relayExport, local, previous)
+	merged, err := MergeTaskStateWithOptions(relayExport, local, previous, MergeOptions{RelayWinsOnConflict: opts.RelayWinsOnConflict || opts.Push})
+	if err != nil {
+		return nil, err
+	}
+	published, err := publishWriteBack(ctx, opts, merged)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +86,48 @@ func Sync(ctx context.Context, client *nip34.Client, opts SyncOptions) (*SyncRes
 	if opts.FailOnConflict && len(merged.Conflicts) > 0 {
 		return nil, fmt.Errorf("sync detected %d task conflict(s); inspect %s", len(merged.Conflicts), cachePath)
 	}
-	return &SyncResult{Export: merged.Export, EventCount: len(events), CachePath: cachePath, ConflictCount: len(merged.Conflicts)}, nil
+	return &SyncResult{Export: merged.Export, EventCount: len(events), CachePath: cachePath, ConflictCount: len(merged.Conflicts), PublishedCount: published}, nil
+}
+
+func publishWriteBack(ctx context.Context, opts SyncOptions, merged *MergeResult) (int, error) {
+	if !opts.Push {
+		return 0, nil
+	}
+	if opts.Signer == nil {
+		return 0, fmt.Errorf("push requires signer")
+	}
+	publisher := opts.Publisher
+	if publisher == nil {
+		publisher = nip34.NewPublisher()
+	}
+	relays := cleanStrings(opts.Relays)
+	if len(relays) == 0 {
+		return 0, fmt.Errorf("push requires at least one relay")
+	}
+	var events []*gonostr.Event
+	for _, rec := range merged.Records {
+		if shouldPublishRecord(rec) {
+			ev, err := nip34.BuildTaskStateEvent(rec.Resolved.ToIssue(), time.Now().UTC())
+			if err != nil {
+				return 0, err
+			}
+			events = append(events, ev)
+		}
+	}
+	if len(events) == 0 {
+		return 0, nil
+	}
+	if err := publisher.Publish(ctx, relays, opts.Signer, events); err != nil {
+		return 0, err
+	}
+	return len(events), nil
+}
+
+func shouldPublishRecord(rec *CacheRecord) bool {
+	if rec == nil || rec.Resolved == nil || rec.Resolution == ResolutionConflict {
+		return false
+	}
+	return rec.Resolution == ResolutionLocalOnly || (rec.Local != nil && snapshotsEqual(rec.Resolved, rec.Local) && rec.LocalRevision != "")
 }
 
 // FetchTaskStateEvents queries relays for bounded canonical 30900 task states.

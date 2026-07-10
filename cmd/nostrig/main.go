@@ -29,7 +29,7 @@ func newRootCmd() *cobra.Command {
 		Short: "Relay-backed NIP-34 to beads task-fabric bridge",
 	}
 
-	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newQueueCmd(), newServeCmd())
+	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newMigrateCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newQueueCmd(), newServeCmd())
 	return cmd
 }
 
@@ -131,6 +131,8 @@ func newSyncCmd() *cobra.Command {
 	var cachePath string
 	var limit int
 	var failOnConflict bool
+	var push bool
+	var signing signingOptions
 
 	syncCmd := &cobra.Command{
 		Use:   "sync",
@@ -145,11 +147,15 @@ func newSyncCmd() *cobra.Command {
 				addr = nip34.RepoAddress(ownerHex, repoID)
 			}
 			relays = relaysWithEnv(relays)
-			result, err := taskfabric.Sync(cmd.Context(), nip34.NewClient(), taskfabric.SyncOptions{Relays: relays, RepoAddr: addr, TaskIDs: taskIDs, Authors: authors, OutDir: outDir, CachePath: cachePath, Limit: limit, FailOnConflict: failOnConflict})
+			signer, _, err := signerFromOptions(cmd.Context(), signing, push && !signing.dryRun)
 			if err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "synced %d task(s) from %d event(s) into %s/.beads via cache %s (%d conflict(s))\n", len(result.Export.Issues), result.EventCount, strings.TrimRight(outDir, "/"), result.CachePath, result.ConflictCount)
+			result, err := taskfabric.Sync(cmd.Context(), nip34.NewClient(), taskfabric.SyncOptions{Relays: relays, RepoAddr: addr, TaskIDs: taskIDs, Authors: authors, OutDir: outDir, CachePath: cachePath, Limit: limit, FailOnConflict: failOnConflict, Push: push && !signing.dryRun, Signer: signer})
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "synced %d task(s) from %d event(s) into %s/.beads via cache %s (%d conflict(s), %d published)\n", len(result.Export.Issues), result.EventCount, strings.TrimRight(outDir, "/"), result.CachePath, result.ConflictCount, result.PublishedCount)
 			return err
 		},
 	}
@@ -163,8 +169,39 @@ func newSyncCmd() *cobra.Command {
 	syncCmd.Flags().StringVar(&outDir, "out", ".", "Output directory (writes <out>/.beads/issues.jsonl)")
 	syncCmd.Flags().StringVar(&cachePath, "cache", "", "Durable nostrig task cache path (default: <out>/.nostrig/task-cache.jsonl)")
 	syncCmd.Flags().BoolVar(&failOnConflict, "fail-on-conflict", false, "Exit non-zero when local and relay changes conflict")
+	syncCmd.Flags().BoolVar(&push, "push", false, "Publish local .beads changes back to relay after relay-source-of-truth reconciliation")
 	syncCmd.Flags().IntVar(&limit, "limit", 500, "Maximum task-state events to request")
+	addSigningFlags(syncCmd, &signing)
 	return syncCmd
+}
+
+func newMigrateCmd() *cobra.Command {
+	var outDir string
+	var relays []string
+	var signing signingOptions
+	cmd := &cobra.Command{
+		Use:   "migrate",
+		Short: "Publish existing .beads JSONL as canonical task-fabric events",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			signer, _, err := signerFromOptions(cmd.Context(), signing, !signing.dryRun)
+			if err != nil {
+				return err
+			}
+			result, err := taskfabric.Migrate(cmd.Context(), taskfabric.MigrateOptions{OutDir: outDir, Relays: relaysWithEnv(relays), Signer: signer, DryRun: signing.dryRun})
+			if err != nil {
+				return err
+			}
+			if signing.dryRun {
+				return writeEvents(cmd, result.Events)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "migrated %d issue(s), %d epic(s), published %d event(s)\n", len(result.Export.Issues), len(result.Export.Epics), result.PublishedCount)
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&outDir, "out", ".", "Directory containing .beads/issues.jsonl and optional epics.jsonl")
+	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	addSigningFlags(cmd, &signing)
+	return cmd
 }
 
 func newClaimCmd() *cobra.Command {
