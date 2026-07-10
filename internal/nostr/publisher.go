@@ -252,6 +252,22 @@ func BuildAssignCommand(taskID, assignee, recipient string, now time.Time) (*gon
 	return BuildContextVMCommand("task/assign", recipient, map[string]string{"task_id": taskID, "assignee": assignee}, now)
 }
 
+func BuildCloseCommand(taskID, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("task/close", recipient, map[string]string{"task_id": taskID}, now)
+}
+
+func BuildQueueEnqueueCommand(queue, taskID, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("queue/enqueue", recipient, map[string]string{"queue": queue, "task_id": taskID}, now)
+}
+
+func BuildQueueDequeueCommand(queue, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("queue/dequeue", recipient, map[string]string{"queue": queue}, now)
+}
+
+func BuildQueueListCommand(queue, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("queue/list", recipient, map[string]string{"queue": queue}, now)
+}
+
 func StatusString(s beadspb.Status) string {
 	switch s {
 	case beadspb.Status_STATUS_IN_PROGRESS:
