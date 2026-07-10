@@ -29,7 +29,7 @@ func newRootCmd() *cobra.Command {
 		Short: "Relay-backed NIP-34 to beads task-fabric bridge",
 	}
 
-	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd())
+	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newQueueCmd(), newServeCmd())
 	return cmd
 }
 
@@ -378,6 +378,162 @@ func newUpdateCmd() *cobra.Command {
 	addSigningFlags(updateCmd, &signing)
 	addResponseFlags(updateCmd, &response)
 	return updateCmd
+}
+
+func newCloseCmd() *cobra.Command {
+	var taskID string
+	var recipient string
+	var relays []string
+	var signing signingOptions
+	var response responseOptions
+
+	closeCmd := &cobra.Command{
+		Use:   "close",
+		Short: "Publish a ContextVM task/close command",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(taskID) == "" {
+				return fmt.Errorf("--task-id is required")
+			}
+			if strings.TrimSpace(recipient) == "" {
+				return fmt.Errorf("--recipient is required")
+			}
+			event, err := nip34.BuildCloseCommand(taskID, recipient, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			return publishContextVMCommand(cmd, event, relays, signing, response, fmt.Sprintf("published close for %s", taskID))
+		},
+	}
+	closeCmd.Flags().StringVar(&taskID, "task-id", "", "Task id to close (required)")
+	closeCmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
+	closeCmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	addSigningFlags(closeCmd, &signing)
+	addResponseFlags(closeCmd, &response)
+	return closeCmd
+}
+
+func newQueueCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "queue", Short: "Publish ContextVM queue commands"}
+	cmd.AddCommand(newQueueEnqueueCmd(), newQueueDequeueCmd(), newQueueListCmd())
+	return cmd
+}
+
+func newQueueEnqueueCmd() *cobra.Command {
+	var queue, taskID, recipient string
+	var relays []string
+	var signing signingOptions
+	var response responseOptions
+	cmd := &cobra.Command{Use: "enqueue", Short: "Publish a ContextVM queue/enqueue command", RunE: func(cmd *cobra.Command, args []string) error {
+		if strings.TrimSpace(taskID) == "" {
+			return fmt.Errorf("--task-id is required")
+		}
+		if strings.TrimSpace(recipient) == "" {
+			return fmt.Errorf("--recipient is required")
+		}
+		ev, err := nip34.BuildQueueEnqueueCommand(queue, taskID, recipient, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		return publishContextVMCommand(cmd, ev, relays, signing, response, fmt.Sprintf("published enqueue for %s", taskID))
+	}}
+	cmd.Flags().StringVar(&queue, "queue", "backlog", "Queue name")
+	cmd.Flags().StringVar(&taskID, "task-id", "", "Task id to enqueue (required)")
+	cmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
+	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	addSigningFlags(cmd, &signing)
+	addResponseFlags(cmd, &response)
+	return cmd
+}
+
+func newQueueDequeueCmd() *cobra.Command {
+	var queue, recipient string
+	var relays []string
+	var signing signingOptions
+	var response responseOptions
+	cmd := &cobra.Command{Use: "dequeue", Short: "Publish a ContextVM queue/dequeue command", RunE: func(cmd *cobra.Command, args []string) error {
+		if strings.TrimSpace(recipient) == "" {
+			return fmt.Errorf("--recipient is required")
+		}
+		ev, err := nip34.BuildQueueDequeueCommand(queue, recipient, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		return publishContextVMCommand(cmd, ev, relays, signing, response, fmt.Sprintf("published dequeue for %s", queue))
+	}}
+	cmd.Flags().StringVar(&queue, "queue", "backlog", "Queue name")
+	cmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
+	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	addSigningFlags(cmd, &signing)
+	addResponseFlags(cmd, &response)
+	return cmd
+}
+
+func newQueueListCmd() *cobra.Command {
+	var queue, recipient string
+	var relays []string
+	var signing signingOptions
+	var response responseOptions
+	cmd := &cobra.Command{Use: "list", Short: "Publish a ContextVM queue/list command", RunE: func(cmd *cobra.Command, args []string) error {
+		if strings.TrimSpace(recipient) == "" {
+			return fmt.Errorf("--recipient is required")
+		}
+		ev, err := nip34.BuildQueueListCommand(queue, recipient, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		return publishContextVMCommand(cmd, ev, relays, signing, response, fmt.Sprintf("published list for %s", queue))
+	}}
+	cmd.Flags().StringVar(&queue, "queue", "backlog", "Queue name")
+	cmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
+	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	addSigningFlags(cmd, &signing)
+	addResponseFlags(cmd, &response)
+	return cmd
+}
+
+func newServeCmd() *cobra.Command {
+	var relays []string
+	var signing signingOptions
+	var pubkey string
+	cmd := &cobra.Command{Use: "serve", Short: "Serve incoming ContextVM task and queue intents", RunE: func(cmd *cobra.Command, args []string) error {
+		signer, _, err := signerFromOptions(cmd.Context(), signing, true)
+		if err != nil {
+			return err
+		}
+		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), Signer: signer, PubKey: pubkey})
+	}}
+	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to subscribe/publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	cmd.Flags().StringVar(&pubkey, "pubkey", "", "Server recipient pubkey; defaults to signer pubkey when available")
+	addSigningFlags(cmd, &signing)
+	return cmd
+}
+
+func publishContextVMCommand(cmd *cobra.Command, event *gonostr.Event, relays []string, signing signingOptions, response responseOptions, msg string) error {
+	ctx := cmd.Context()
+	events := []*gonostr.Event{event}
+	signer, _, err := signerFromOptions(ctx, signing, !signing.dryRun)
+	if err != nil {
+		return err
+	}
+	if signing.dryRun {
+		if signer != nil {
+			if err := signEvents(ctx, signer, events); err != nil {
+				return err
+			}
+		}
+		return writeEvents(cmd, events)
+	}
+	relays = relaysWithEnv(relays)
+	if len(relays) == 0 {
+		return fmt.Errorf("at least one --relay or NOSTR_RELAY is required")
+	}
+	if err := nip34.NewPublisher().Publish(ctx, relays, signer, events); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s to %d relay(s)\n", msg, len(relays)); err != nil {
+		return err
+	}
+	return maybeWaitForResponse(cmd, relays, event, response)
 }
 
 func addFetchFlags(cmd *cobra.Command, repoID *string, owner *string, relays *[]string, idFormat *string, idPrefix *string) {
