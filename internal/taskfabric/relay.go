@@ -13,9 +13,10 @@ import (
 )
 
 type RelayLedger struct {
-	Relays []string
-	Signer nip34.Signer
-	Client *nip34.Client
+	Relays          []string
+	Signer          nip34.Signer
+	Client          *nip34.Client
+	SyncNIP34Status bool
 }
 
 func (l *RelayLedger) GetTask(ctx context.Context, id string) (*beadspb.Issue, error) {
@@ -40,11 +41,18 @@ func (l *RelayLedger) GetTask(ctx context.Context, id string) (*beadspb.Issue, e
 }
 
 func (l *RelayLedger) PutTask(ctx context.Context, issue *beadspb.Issue) (*gonostr.Event, error) {
-	ev, err := nip34.BuildTaskStateEvent(issue, time.Now().UTC())
+	now := time.Now().UTC()
+	ev, err := nip34.BuildTaskStateEvent(issue, now)
 	if err != nil {
 		return nil, err
 	}
-	return l.publishOne(ctx, ev)
+	events := []*gonostr.Event{ev}
+	if l.SyncNIP34Status {
+		if status := nip34.BuildNIP34IssueStatusEvent(issue, now); status != nil {
+			events = append(events, status)
+		}
+	}
+	return l.publishEvents(ctx, events)
 }
 
 func (l *RelayLedger) GetQueue(ctx context.Context, queue string) ([]string, error) {
@@ -83,13 +91,20 @@ func (l *RelayLedger) PutQueue(ctx context.Context, queue string, ids []string) 
 }
 
 func (l *RelayLedger) publishOne(ctx context.Context, ev *gonostr.Event) (*gonostr.Event, error) {
+	return l.publishEvents(ctx, []*gonostr.Event{ev})
+}
+
+func (l *RelayLedger) publishEvents(ctx context.Context, events []*gonostr.Event) (*gonostr.Event, error) {
 	if l.Signer == nil {
 		return nil, fmt.Errorf("signer is required")
 	}
-	if err := nip34.NewPublisher().Publish(ctx, cleanStrings(l.Relays), l.Signer, []*gonostr.Event{ev}); err != nil {
+	if err := nip34.NewPublisher().Publish(ctx, cleanStrings(l.Relays), l.Signer, events); err != nil {
 		return nil, err
 	}
-	return ev, nil
+	if len(events) == 0 {
+		return nil, nil
+	}
+	return events[0], nil
 }
 
 func (l *RelayLedger) client() *nip34.Client {
@@ -100,9 +115,10 @@ func (l *RelayLedger) client() *nip34.Client {
 }
 
 type ServeOptions struct {
-	Relays []string
-	Signer nip34.Signer
-	PubKey string
+	Relays          []string
+	Signer          nip34.Signer
+	PubKey          string
+	SyncNIP34Status bool
 }
 
 func Serve(ctx context.Context, opts ServeOptions) error {
@@ -126,7 +142,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if pubkey == "" {
 		return fmt.Errorf("serve requires --pubkey when signer cannot provide one")
 	}
-	ledger := &RelayLedger{Relays: relays, Signer: opts.Signer}
+	ledger := &RelayLedger{Relays: relays, Signer: opts.Signer, SyncNIP34Status: opts.SyncNIP34Status}
 	handler := &Handler{Ledger: ledger}
 	pool := gonostr.NewSimplePool(ctx)
 	filters := gonostr.Filters{{Kinds: []int{nip34.KindContextVMIntent}, Tags: gonostr.TagMap{"p": []string{pubkey}, "domain": []string{"task", "queue"}}}}

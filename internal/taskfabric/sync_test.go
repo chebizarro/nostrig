@@ -51,3 +51,35 @@ func TestFetchTaskStateEventsRequiresBoundedSelector(t *testing.T) {
 		t.Fatal("expected bounded selector error")
 	}
 }
+
+func TestPublishWriteBackPublishesNIP34StatusForLinkedClosedTask(t *testing.T) {
+	pub := &statusCapturePublisher{}
+	issue := &beadspb.Issue{Id: "repo-task1", Title: "Close me", Status: beadspb.Status_STATUS_CLOSED, Metadata: &beadspb.Metadata{Custom: map[string]string{"nostr.id": "root-event", "nip34.repo_addr": "30617:owner:repo"}}}
+	result := &MergeResult{Records: []*CacheRecord{{Resolved: SnapshotFromIssue(issue), Local: SnapshotFromIssue(issue), LocalRevision: "rev1", Resolution: ResolutionClean}}}
+	count, err := publishWriteBack(context.Background(), SyncOptions{Push: true, SyncNIP34Status: true, Relays: []string{"wss://relay.example"}, Signer: noopSigner{}, Publisher: pub}, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("published count=%d, want 2", count)
+	}
+	if len(pub.events) != 2 {
+		t.Fatalf("events=%d, want 2", len(pub.events))
+	}
+	if pub.events[1].Kind != nip34.KindStatusClosed {
+		t.Fatalf("status kind=%d, want %d", pub.events[1].Kind, nip34.KindStatusClosed)
+	}
+	if got, _ := nip34.TagFirst(pub.events[1], "a"); got != "30617:owner:repo" {
+		t.Fatalf("status repo tag=%q", got)
+	}
+	if got, _ := nip34.TagFirst(pub.events[1], "e"); got != "root-event" {
+		t.Fatalf("status root tag=%q", got)
+	}
+}
+
+type statusCapturePublisher struct{ events []*gonostr.Event }
+
+func (p *statusCapturePublisher) Publish(ctx context.Context, relays []string, signer nip34.Signer, events []*gonostr.Event) error {
+	p.events = append(p.events, events...)
+	return nil
+}

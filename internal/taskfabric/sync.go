@@ -29,6 +29,7 @@ type SyncOptions struct {
 	Limit               int
 	FailOnConflict      bool
 	Push                bool
+	SyncNIP34Status     bool
 	Signer              nip34.Signer
 	Publisher           EventPublisher
 	RelayWinsOnConflict bool
@@ -107,11 +108,18 @@ func publishWriteBack(ctx context.Context, opts SyncOptions, merged *MergeResult
 	var events []*gonostr.Event
 	for _, rec := range merged.Records {
 		if shouldPublishRecord(rec) {
-			ev, err := nip34.BuildTaskStateEvent(rec.Resolved.ToIssue(), time.Now().UTC())
+			issue := rec.Resolved.ToIssue()
+			now := time.Now().UTC()
+			ev, err := nip34.BuildTaskStateEvent(issue, now)
 			if err != nil {
 				return 0, err
 			}
 			events = append(events, ev)
+			if opts.SyncNIP34Status {
+				if status := nip34.BuildNIP34IssueStatusEvent(issue, now); status != nil {
+					events = append(events, status)
+				}
+			}
 		}
 	}
 	if len(events) == 0 {

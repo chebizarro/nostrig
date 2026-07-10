@@ -167,6 +167,26 @@ func BuildNIP34IssueLinkEvent(issue *beadspb.Issue, now time.Time) *gonostr.Even
 	return &gonostr.Event{Kind: KindIssue, CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: issue.Description}
 }
 
+func BuildNIP34IssueStatusEvent(issue *beadspb.Issue, now time.Time) *gonostr.Event {
+	if issue == nil || issue.Metadata == nil || issue.Metadata.Custom == nil {
+		return nil
+	}
+	repoAddr := strings.TrimSpace(issue.Metadata.Custom["nip34.repo_addr"])
+	rootID := strings.TrimSpace(issue.Metadata.Custom["nostr.id"])
+	if repoAddr == "" || rootID == "" {
+		return nil
+	}
+	kind := KindStatusOpen
+	switch issue.Status {
+	case beadspb.Status_STATUS_CLOSED:
+		kind = KindStatusClosed
+	default:
+		kind = KindStatusOpen
+	}
+	tags := gonostr.Tags{{"a", repoAddr}, {"e", rootID, "", "root"}, {"task", issue.Id}}
+	return &gonostr.Event{Kind: kind, CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
+}
+
 func BuildEpicCollectionEvent(epic *beadspb.Epic, issues []*beadspb.Issue, now time.Time) *gonostr.Event {
 	id, name := "unknown", "unknown"
 	if epic != nil {
