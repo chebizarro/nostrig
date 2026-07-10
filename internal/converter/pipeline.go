@@ -6,10 +6,10 @@ import (
 	"sort"
 	"strings"
 
+	gonostr "fiatjaf.com/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	"github.com/chebizarro/nostrig/internal/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	gonostr "github.com/nbd-wtf/go-nostr"
 )
 
 // FetchOptions configure a single `nostrig fetch` run for one repository.
@@ -159,13 +159,15 @@ func (p *Pipeline) Export(ctx context.Context, opts FetchOptions) (*FetchResult,
 
 func (p *Pipeline) findRepoAnnouncement(ctx context.Context, relays []string, repoID string, owner string) (*nip34.RepoAnnouncement, error) {
 	f := gonostr.Filter{
-		Kinds: []int{nip34.KindRepositoryAnnouncement},
+		Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindRepositoryAnnouncement)},
 		Tags:  gonostr.TagMap{"d": []string{repoID}},
 	}
 
 	owner = strings.TrimSpace(owner)
 	if owner != "" {
-		f.Authors = []string{owner}
+		if pk, err := gonostr.PubKeyFromHex(owner); err == nil {
+			f.Authors = []gonostr.PubKey{pk}
+		}
 	}
 
 	events, err := p.client.Fetch(ctx, relays, f)
@@ -201,9 +203,12 @@ func (p *Pipeline) fetchRepoData(ctx context.Context, relays []string, repoID st
 	var state *nip34.RepoState
 	{
 		f := gonostr.Filter{
-			Kinds:   []int{nip34.KindRepositoryState},
-			Authors: []string{owner},
+			Kinds:   []gonostr.Kind{gonostr.Kind(nip34.KindRepositoryState)},
+			Authors: nil,
 			Tags:    gonostr.TagMap{"d": []string{repoID}},
+		}
+		if pk, err := gonostr.PubKeyFromHex(owner); err == nil {
+			f.Authors = []gonostr.PubKey{pk}
 		}
 
 		events, err := p.client.Fetch(ctx, relays, f)
@@ -232,11 +237,11 @@ func (p *Pipeline) fetchRepoData(ctx context.Context, relays []string, repoID st
 	roots := make([]*nip34.RootItem, 0, 256)
 	{
 		f := gonostr.Filter{
-			Kinds: []int{
-				nip34.KindPatch,
-				nip34.KindPullRequest,
-				nip34.KindPRUpdate,
-				nip34.KindIssue,
+			Kinds: []gonostr.Kind{
+				gonostr.Kind(nip34.KindPatch),
+				gonostr.Kind(nip34.KindPullRequest),
+				gonostr.Kind(nip34.KindPRUpdate),
+				gonostr.Kind(nip34.KindIssue),
 			},
 			Tags: gonostr.TagMap{"a": []string{repoAddr}},
 		}
@@ -288,11 +293,11 @@ func (p *Pipeline) fetchStatuses(ctx context.Context, relays []string, roots []*
 	filters := make([]gonostr.Filter, 0, len(chunks))
 	for _, ch := range chunks {
 		filters = append(filters, gonostr.Filter{
-			Kinds: []int{
-				nip34.KindStatusOpen,
-				nip34.KindStatusApplied,
-				nip34.KindStatusClosed,
-				nip34.KindStatusDraft,
+			Kinds: []gonostr.Kind{
+				gonostr.Kind(nip34.KindStatusOpen),
+				gonostr.Kind(nip34.KindStatusApplied),
+				gonostr.Kind(nip34.KindStatusClosed),
+				gonostr.Kind(nip34.KindStatusDraft),
 			},
 			Tags: gonostr.TagMap{"e": ch},
 		})

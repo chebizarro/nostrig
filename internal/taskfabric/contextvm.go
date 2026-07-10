@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
+	gonostr "fiatjaf.com/nostr"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	gonostr "github.com/nbd-wtf/go-nostr"
 )
 
 type ContextVMResponse struct {
@@ -22,7 +22,7 @@ func WaitForContextVMResponse(ctx context.Context, relays []string, command *gon
 	if ctx == nil {
 		return nil, fmt.Errorf("context is nil")
 	}
-	if command == nil || strings.TrimSpace(command.ID) == "" {
+	if command == nil || command.ID == gonostr.ZeroID {
 		return nil, fmt.Errorf("signed command event with id is required")
 	}
 	relays = cleanStrings(relays)
@@ -48,8 +48,17 @@ func WaitForContextVMResponse(ctx context.Context, relays []string, command *gon
 
 	watchCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	pool := gonostr.NewSimplePool(watchCtx)
-	ch := pool.SubMany(watchCtx, relays, gonostr.Filters(filters))
+	pool := gonostr.NewPool()
+	defer pool.Close("contextvm wait complete")
+	ch := make(chan gonostr.RelayEvent)
+	go func() {
+		defer close(ch)
+		for _, filter := range filters {
+			for ev := range pool.SubscribeMany(watchCtx, relays, filter, gonostr.SubscriptionOptions{}) {
+				ch <- ev
+			}
+		}
+	}()
 	for {
 		select {
 		case ie, ok := <-ch:
@@ -59,10 +68,8 @@ func WaitForContextVMResponse(ctx context.Context, relays []string, command *gon
 				}
 				return nil, fmt.Errorf("subscription closed before ContextVM response")
 			}
-			if ie.Event == nil {
-				continue
-			}
-			if resp, ok := MatchContextVMResponse(command, ie.Event); ok {
+			ev := ie.Event
+			if resp, ok := MatchContextVMResponse(command, &ev); ok {
 				return resp, nil
 			}
 		case <-watchCtx.Done():
@@ -109,18 +116,18 @@ func MatchContextVMResponse(command, candidate *gonostr.Event) (*ContextVMRespon
 }
 
 func responseFilters(command *gonostr.Event, since gonostr.Timestamp) []gonostr.Filter {
-	filters := []gonostr.Filter{{Kinds: []int{nip34.KindContextVMIntent}, Tags: gonostr.TagMap{"e": []string{command.ID}}, Since: &since}}
+	filters := []gonostr.Filter{{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent)}, Tags: gonostr.TagMap{"e": []string{command.ID.Hex()}}, Since: since}}
 	if id := jsonRPCID(command.Content); id != "" {
-		filters = append(filters, gonostr.Filter{Kinds: []int{nip34.KindContextVMIntent}, Tags: gonostr.TagMap{"correlation": []string{id}}, Since: &since})
-		filters = append(filters, gonostr.Filter{Kinds: []int{nip34.KindContextVMIntent}, Tags: gonostr.TagMap{"request": []string{id}}, Since: &since})
+		filters = append(filters, gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent)}, Tags: gonostr.TagMap{"correlation": []string{id}}, Since: since})
+		filters = append(filters, gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent)}, Tags: gonostr.TagMap{"request": []string{id}}, Since: since})
 	}
 	return filters
 }
 
 func hasCorrelation(command, candidate *gonostr.Event, cmdRPCID string) bool {
-	if command.ID != "" {
+	if command.ID != gonostr.ZeroID {
 		for _, e := range nip34.TagAll(candidate, "e") {
-			if e == command.ID {
+			if e == command.ID.Hex() {
 				return true
 			}
 		}

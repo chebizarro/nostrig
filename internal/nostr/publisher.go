@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
+	gonostr "fiatjaf.com/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
-	gonostr "github.com/nbd-wtf/go-nostr"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -22,9 +22,9 @@ type Signer interface {
 	SignEvent(ctx context.Context, ev *gonostr.Event) error
 }
 
-type Publisher struct{ pool *gonostr.SimplePool }
+type Publisher struct{ pool *gonostr.Pool }
 
-func NewPublisher() *Publisher { return &Publisher{pool: gonostr.NewSimplePool(context.Background())} }
+func NewPublisher() *Publisher { return &Publisher{pool: gonostr.NewPool()} }
 
 func (p *Publisher) Publish(ctx context.Context, relays []string, signer Signer, events []*gonostr.Event) error {
 	if ctx == nil {
@@ -143,7 +143,7 @@ func BuildTaskStateEvent(issue *beadspb.Issue, now time.Time) (*gonostr.Event, e
 	if v := state.Metadata["nip34.repo_addr"]; v != "" {
 		tags = append(tags, gonostr.Tag{"a", v, "", "nip34-repo"})
 	}
-	return &gonostr.Event{Kind: KindCanonicalState, CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: string(content)}, nil
+	return &gonostr.Event{Kind: gonostr.Kind(KindCanonicalState), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: string(content)}, nil
 }
 
 func BuildNIP34IssueLinkEvent(issue *beadspb.Issue, now time.Time) *gonostr.Event {
@@ -164,7 +164,7 @@ func BuildNIP34IssueLinkEvent(issue *beadspb.Issue, now time.Time) *gonostr.Even
 			tags = append(tags, gonostr.Tag{"t", label})
 		}
 	}
-	return &gonostr.Event{Kind: KindIssue, CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: issue.Description}
+	return &gonostr.Event{Kind: gonostr.Kind(KindIssue), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: issue.Description}
 }
 
 func BuildNIP34IssueStatusEvent(issue *beadspb.Issue, now time.Time) *gonostr.Event {
@@ -184,7 +184,7 @@ func BuildNIP34IssueStatusEvent(issue *beadspb.Issue, now time.Time) *gonostr.Ev
 		kind = KindStatusOpen
 	}
 	tags := gonostr.Tags{{"a", repoAddr}, {"e", rootID, "", "root"}, {"task", issue.Id}}
-	return &gonostr.Event{Kind: kind, CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
+	return &gonostr.Event{Kind: gonostr.Kind(kind), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
 }
 
 func BuildEpicCollectionEvent(epic *beadspb.Epic, issues []*beadspb.Issue, now time.Time) *gonostr.Event {
@@ -205,7 +205,7 @@ func BuildEpicCollectionEvent(epic *beadspb.Epic, issues []*beadspb.Issue, now t
 			tags = append(tags, gonostr.Tag{"a", "30900::task:" + issue.Id})
 		}
 	}
-	return &gonostr.Event{Kind: KindNamedList, CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
+	return &gonostr.Event{Kind: gonostr.Kind(KindNamedList), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
 }
 
 func BuildQueueCollectionEvent(queue string, issueIDs []string, now time.Time) *gonostr.Event {
@@ -219,7 +219,7 @@ func BuildQueueCollectionEvent(queue string, issueIDs []string, now time.Time) *
 			tags = append(tags, gonostr.Tag{"a", "30900::task:" + id})
 		}
 	}
-	return &gonostr.Event{Kind: KindNamedList, CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
+	return &gonostr.Event{Kind: gonostr.Kind(KindNamedList), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
 }
 
 func ParseTaskStateEvent(ev *gonostr.Event) (*beadspb.Issue, error) {
@@ -261,7 +261,7 @@ func BuildContextVMCommand(method, recipient string, params any, now time.Time) 
 		return nil, err
 	}
 	tags := gonostr.Tags{{"p", recipient}, {"method", method}, {"domain", parts[0]}, {"op", parts[1]}, {"schema", TaskIntentSchema}}
-	return &gonostr.Event{Kind: KindContextVMIntent, CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: string(content)}, nil
+	return &gonostr.Event{Kind: gonostr.Kind(KindContextVMIntent), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: string(content)}, nil
 }
 
 func BuildClaimDispatch(taskID, claimer, recipient string, now time.Time) (*gonostr.Event, error) {

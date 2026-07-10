@@ -13,8 +13,8 @@ import (
 	"github.com/chebizarro/nostrig/internal/fabric"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 	"github.com/chebizarro/nostrig/internal/taskfabric"
-	gonostr "github.com/nbd-wtf/go-nostr"
-	"github.com/nbd-wtf/go-nostr/nip19"
+	gonostr "fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 	"github.com/spf13/cobra"
 )
 

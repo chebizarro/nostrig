@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
+	gonostr "fiatjaf.com/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	gonostr "github.com/nbd-wtf/go-nostr"
 )
 
 type RelayLedger struct {
@@ -61,7 +61,7 @@ func (l *RelayLedger) GetQueue(ctx context.Context, queue string) ([]string, err
 	if len(relays) == 0 {
 		return nil, fmt.Errorf("at least one relay is required")
 	}
-	f := gonostr.Filter{Kinds: []int{nip34.KindNamedList}, Tags: gonostr.TagMap{"d": []string{"queue:" + queue}}, Limit: 20}
+	f := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindNamedList)}, Tags: gonostr.TagMap{"d": []string{"queue:" + queue}}, Limit: 20}
 	events, err := l.client().Fetch(ctx, relays, f)
 	if err != nil {
 		return nil, err
@@ -144,9 +144,10 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	ledger := &RelayLedger{Relays: relays, Signer: opts.Signer, SyncNIP34Status: opts.SyncNIP34Status}
 	handler := &Handler{Ledger: ledger}
-	pool := gonostr.NewSimplePool(ctx)
-	filters := gonostr.Filters{{Kinds: []int{nip34.KindContextVMIntent}, Tags: gonostr.TagMap{"p": []string{pubkey}, "domain": []string{"task", "queue"}}}}
-	ch := pool.SubMany(ctx, relays, filters)
+	pool := gonostr.NewPool()
+	defer pool.Close("nostrig serve complete")
+	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent)}, Tags: gonostr.TagMap{"p": []string{pubkey}, "domain": []string{"task", "queue"}}}
+	ch := pool.SubscribeMany(ctx, relays, filter, gonostr.SubscriptionOptions{})
 	for {
 		select {
 		case <-ctx.Done():
@@ -155,10 +156,11 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			if !ok {
 				return fmt.Errorf("subscription closed")
 			}
-			if ie.Event == nil || !allowedMethod(ie.Event) {
+			ev := ie.Event
+			if !allowedMethod(&ev) {
 				continue
 			}
-			resp, err := handler.HandleIntent(ctx, ie.Event, time.Now().UTC())
+			resp, err := handler.HandleIntent(ctx, &ev, time.Now().UTC())
 			if err != nil {
 				continue
 			}
