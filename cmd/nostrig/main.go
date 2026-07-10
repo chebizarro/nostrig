@@ -9,12 +9,14 @@ import (
 	"strings"
 	"time"
 
+	gonostr "fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
+	cascontextvm "git.sharegap.net/cascadia/cascadia-go/contextvm"
+	casnostr "git.sharegap.net/cascadia/cascadia-go/nostr"
 	"github.com/chebizarro/nostrig/internal/converter"
 	"github.com/chebizarro/nostrig/internal/fabric"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 	"github.com/chebizarro/nostrig/internal/taskfabric"
-	gonostr "fiatjaf.com/nostr"
-	"fiatjaf.com/nostr/nip19"
 	"github.com/spf13/cobra"
 )
 
@@ -651,32 +653,55 @@ func newServeCmd() *cobra.Command {
 
 func publishContextVMCommand(cmd *cobra.Command, event *gonostr.Event, relays []string, signing signingOptions, response responseOptions, msg string) error {
 	ctx := cmd.Context()
-	events := []*gonostr.Event{event}
 	signer, _, err := signerFromOptions(ctx, signing, !signing.dryRun)
 	if err != nil {
 		return err
 	}
 	if signing.dryRun {
 		if signer != nil {
-			if err := signEvents(ctx, signer, events); err != nil {
+			if err := signEvents(ctx, signer, []*gonostr.Event{event}); err != nil {
 				return err
 			}
 		}
-		return writeEvents(cmd, events)
+		return writeEvents(cmd, []*gonostr.Event{event})
 	}
 	relays = relaysWithEnv(relays)
 	if len(relays) == 0 {
 		return fmt.Errorf("at least one --relay or NOSTR_RELAY is required")
 	}
-	if err := nip34.NewPublisher().Publish(ctx, relays, signer, events); err != nil {
+	contextSigner, err := commandContextVMSigner(signer)
+	if err != nil {
 		return err
+	}
+	recipient, _ := nip34.TagFirst(event, "p")
+	var req cascontextvm.Request
+	if err := json.Unmarshal([]byte(event.Content), &req); err != nil {
+		return err
+	}
+	outer, inner, err := cascontextvm.Wrap(ctx, contextSigner, recipient, req)
+	if err != nil {
+		return err
+	}
+	accepted, err := casnostr.Publish(ctx, relays, *outer)
+	if err != nil {
+		return err
+	}
+	if accepted == 0 {
+		return fmt.Errorf("no relay accepted ContextVM gift wrap")
 	}
 	if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s to %d relay(s)\n", msg, len(relays)); err != nil {
 		return err
 	}
-	return maybeWaitForResponse(cmd, relays, event, response)
+	return maybeWaitForResponse(cmd, relays, (*gonostr.Event)(inner), response)
 }
 
+func commandContextVMSigner(s nip34.Signer) (casnostr.Signer, error) {
+	keyer, ok := s.(casnostr.Signer)
+	if !ok {
+		return nil, fmt.Errorf("signer does not support ContextVM NIP-59 encryption")
+	}
+	return keyer, nil
+}
 func addFetchFlags(cmd *cobra.Command, repoID *string, owner *string, relays *[]string, idFormat *string, idPrefix *string) {
 	cmd.Flags().StringVar(repoID, "repo-id", "", "Repository id (d tag) to fetch (required)")
 	cmd.Flags().StringVar(owner, "owner", "", "Repository owner pubkey (hex or npub). Recommended to disambiguate.")

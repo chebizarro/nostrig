@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
 	gonostr "fiatjaf.com/nostr"
+	cascontextvm "git.sharegap.net/cascadia/cascadia-go/contextvm"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -255,12 +255,19 @@ func BuildContextVMCommand(method, recipient string, params any, now time.Time) 
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return nil, fmt.Errorf("method must be <domain>/<op>")
 	}
-	body := map[string]any{"jsonrpc": "2.0", "id": strconv.FormatInt(now.UnixNano(), 36), "method": method, "params": params}
-	content, err := json.Marshal(body)
+	id, err := json.Marshal(now.UnixNano())
 	if err != nil {
 		return nil, err
 	}
-	tags := gonostr.Tags{{"p", recipient}, {"method", method}, {"domain", parts[0]}, {"op", parts[1]}, {"schema", TaskIntentSchema}}
+	req, err := cascontextvm.NewRequest(id, cascontextvm.Method(parts[0], parts[1]), params)
+	if err != nil {
+		return nil, err
+	}
+	content, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	tags := gonostr.Tags{{"p", recipient}, {"method", req.Method}, {"domain", parts[0]}, {"op", parts[1]}, {"schema", TaskIntentSchema}}
 	return &gonostr.Event{Kind: gonostr.Kind(KindContextVMIntent), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: string(content)}, nil
 }
 
