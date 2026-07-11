@@ -637,16 +637,18 @@ func newServeCmd() *cobra.Command {
 	var signing signingOptions
 	var pubkey string
 	var syncNIP34Status bool
+	var qualityProject string
 	cmd := &cobra.Command{Use: "serve", Short: "Serve incoming ContextVM task and queue intents", RunE: func(cmd *cobra.Command, args []string) error {
 		signer, _, err := signerFromOptions(cmd.Context(), signing, true)
 		if err != nil {
 			return err
 		}
-		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), Signer: signer, PubKey: pubkey, SyncNIP34Status: syncNIP34Status})
+		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), Signer: signer, PubKey: pubkey, SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject})
 	}}
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to subscribe/publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
 	cmd.Flags().StringVar(&pubkey, "pubkey", "", "Server recipient pubkey; defaults to signer pubkey when available")
 	cmd.Flags().BoolVar(&syncNIP34Status, "sync-nip34-status", false, "Opt-in: publish NIP-34 issue status events when linked tasks change")
+	cmd.Flags().StringVar(&qualityProject, "quality-project", "", "Optional PSTF project tag used to scope quality status/audit events")
 	addSigningFlags(cmd, &signing)
 	return cmd
 }

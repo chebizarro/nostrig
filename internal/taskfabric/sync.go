@@ -3,7 +3,6 @@ package taskfabric
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -11,7 +10,6 @@ import (
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	"github.com/chebizarro/nostrig/internal/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // SyncOptions configure relay-backed canonical task-state synchronization.
@@ -188,53 +186,7 @@ func FetchTaskStateEvents(ctx context.Context, client *nip34.Client, opts SyncOp
 
 // ExportFromTaskStateEvents converts canonical 30900 task-state events into a beads export.
 func ExportFromTaskStateEvents(events []*gonostr.Event) (*beadspb.Export, error) {
-	latest := map[string]*beadspb.Issue{}
-	latestTime := map[string]time.Time{}
-
-	for _, ev := range events {
-		issue, err := nip34.ParseTaskStateEvent(ev)
-		if err != nil {
-			continue
-		}
-		id := strings.TrimSpace(issue.Id)
-		if id == "" {
-			continue
-		}
-		createdAt := nip34.EventTime(ev)
-		ensureMetadata(issue)
-		issue.Metadata.Custom["nostr.id"] = ev.ID.Hex()
-		issue.Metadata.Custom["nostr.pubkey"] = ev.PubKey.Hex()
-		issue.Metadata.Custom["nostr.kind"] = fmt.Sprintf("%d", ev.Kind)
-		issue.Metadata.Custom["nostrig.source"] = "canonical-task-state"
-		if issue.Updated == nil && !createdAt.IsZero() {
-			issue.Updated = timestamppb.New(createdAt)
-		}
-		if issue.Created == nil && !createdAt.IsZero() {
-			issue.Created = timestamppb.New(createdAt)
-		}
-
-		prevTime, ok := latestTime[id]
-		if !ok || createdAt.After(prevTime) {
-			latest[id] = issue
-			latestTime[id] = createdAt
-		}
-	}
-
-	issues := make([]*beadspb.Issue, 0, len(latest))
-	for _, issue := range latest {
-		issues = append(issues, issue)
-	}
-	sort.Slice(issues, func(i, j int) bool { return issues[i].Id < issues[j].Id })
-	return &beadspb.Export{Issues: issues}, nil
-}
-
-func ensureMetadata(issue *beadspb.Issue) {
-	if issue.Metadata == nil {
-		issue.Metadata = &beadspb.Metadata{}
-	}
-	if issue.Metadata.Custom == nil {
-		issue.Metadata.Custom = map[string]string{}
-	}
+	return beads.ExportFromTaskStateEvents(events)
 }
 
 func cleanStrings(in []string) []string {
