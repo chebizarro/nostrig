@@ -122,6 +122,7 @@ type ServeOptions struct {
 	Signer          nip34.Signer
 	PubKey          string
 	SyncNIP34Status bool
+	QualityProject  string
 }
 
 func Serve(ctx context.Context, opts ServeOptions) error {
@@ -150,7 +151,8 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		return err
 	}
 	ledger := &RelayLedger{Relays: relays, Signer: opts.Signer, SyncNIP34Status: opts.SyncNIP34Status}
-	handler := &Handler{Ledger: ledger}
+	quality := &RelayQualitySource{Relays: relays, Project: opts.QualityProject}
+	handler := &Handler{Ledger: ledger, Quality: quality}
 	pool := gonostr.NewPool()
 	defer pool.Close("nostrig serve complete")
 	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent), gonostr.Kind(cascadia.NIP59_GIFT_WRAP)}, Tags: gonostr.TagMap{"p": []string{pubkey}}}
@@ -200,7 +202,7 @@ func allowedMethod(ev *gonostr.Event) bool {
 		method = req.Method
 	}
 	switch method {
-	case "task/claim", "task/assign", "task/update", "task/close", "queue/enqueue", "queue/dequeue", "queue/list":
+	case "task/claim", "task/assign", "task/update", "task/close", "task/quality-status", "queue/enqueue", "queue/dequeue", "queue/list":
 		return true
 	default:
 		return false

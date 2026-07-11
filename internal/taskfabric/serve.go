@@ -21,7 +21,10 @@ type Ledger interface {
 	PutQueue(ctx context.Context, queue string, ids []string) (*gonostr.Event, error)
 }
 
-type Handler struct{ Ledger Ledger }
+type Handler struct {
+	Ledger  Ledger
+	Quality QualityLookup
+}
 
 func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.Time) (*gonostr.Event, error) {
 	if h == nil || h.Ledger == nil {
@@ -51,7 +54,7 @@ func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.
 
 func (h *Handler) registry(caller string, now time.Time) *cascontextvm.Registry {
 	r := cascontextvm.NewRegistry()
-	for _, method := range []string{"task/claim", "task/assign", "task/update", "task/close", "queue/enqueue", "queue/dequeue", "queue/list"} {
+	for _, method := range []string{"task/claim", "task/assign", "task/update", "task/close", "task/quality-status", "queue/enqueue", "queue/dequeue", "queue/list"} {
 		parts := strings.Split(method, "/")
 		r.Register(parts[0], parts[1], func(method string) cascontextvm.Handler {
 			return func(ctx context.Context, req cascontextvm.Request) (any, error) {
@@ -90,7 +93,9 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		if err != nil {
 			return nil, err
 		}
-		return taskResult(issue, ev), nil
+		r := taskResult(issue, ev)
+		h.annotateQuality(ctx, r, []string{issue.Id})
+		return r, nil
 	case "task/assign":
 		id, assignee := get("task_id"), get("assignee")
 		if assignee == "" {
@@ -105,7 +110,9 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		if err != nil {
 			return nil, err
 		}
-		return taskResult(issue, ev), nil
+		r := taskResult(issue, ev)
+		h.annotateQuality(ctx, r, []string{issue.Id})
+		return r, nil
 	case "task/update":
 		issue, err := h.task(ctx, get("task_id"))
 		if err != nil {
@@ -128,7 +135,9 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		if err != nil {
 			return nil, err
 		}
-		return taskResult(issue, ev), nil
+		r := taskResult(issue, ev)
+		h.annotateQuality(ctx, r, []string{issue.Id})
+		return r, nil
 	case "task/close":
 		issue, err := h.task(ctx, get("task_id"))
 		if err != nil {
@@ -139,7 +148,34 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		if err != nil {
 			return nil, err
 		}
-		return taskResult(issue, ev), nil
+		r := taskResult(issue, ev)
+		h.annotateQuality(ctx, r, []string{issue.Id})
+		return r, nil
+	case "task/quality-status":
+		ids := paramList(p, "task_ids")
+		if id := get("task_id"); id != "" {
+			ids = append(ids, id)
+		}
+		if q := get("queue"); q != "" && len(ids) == 0 {
+			queueIDs, err := h.Ledger.GetQueue(ctx, queueName(q))
+			if err != nil {
+				return nil, err
+			}
+			ids = append(ids, queueIDs...)
+		}
+		ids = cleanStrings(ids)
+		if len(ids) == 0 {
+			return nil, fmt.Errorf("task_id, task_ids, or queue is required")
+		}
+		quality := pendingQuality(ids)
+		if h.Quality != nil {
+			var err error
+			quality, err = h.Quality.GetQuality(ctx, ids)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return map[string]any{"quality": quality}, nil
 	case "queue/enqueue":
 		q, id := queueName(get("queue")), get("task_id")
 		if id == "" {
@@ -180,7 +216,9 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		if err != nil {
 			return nil, err
 		}
-		return queueResult(q, ids, nil), nil
+		r := queueResult(q, ids, nil)
+		h.annotateQueueQuality(ctx, r, ids)
+		return r, nil
 	default:
 		return nil, fmt.Errorf("unsupported method %q", method)
 	}
@@ -209,12 +247,61 @@ func taskResult(i *beadspb.Issue, ev *gonostr.Event) map[string]any {
 	return r
 }
 
+func (h *Handler) annotateQuality(ctx context.Context, r map[string]any, ids []string) {
+	if h == nil || h.Quality == nil || len(ids) == 0 {
+		return
+	}
+	quality, err := h.Quality.GetQuality(ctx, ids)
+	if err != nil {
+		r["quality_error"] = err.Error()
+		return
+	}
+	if len(ids) == 1 {
+		if q, ok := quality[ids[0]]; ok {
+			r["quality"] = q
+			return
+		}
+	}
+	r["quality"] = quality
+}
+
+func (h *Handler) annotateQueueQuality(ctx context.Context, r map[string]any, ids []string) {
+	if h == nil || h.Quality == nil || len(ids) == 0 {
+		return
+	}
+	quality, err := h.Quality.GetQuality(ctx, ids)
+	if err != nil {
+		r["quality_error"] = err.Error()
+		return
+	}
+	r["quality"] = quality
+}
+
 func queueResult(q string, ids []string, ev *gonostr.Event) map[string]any {
 	r := map[string]any{"queue": q, "task_ids": append([]string(nil), ids...)}
 	if ev != nil {
 		r["event_id"] = ev.ID
 	}
 	return r
+}
+
+func paramList(p map[string]any, key string) []string {
+	v, ok := p[key]
+	if !ok || v == nil {
+		return nil
+	}
+	switch x := v.(type) {
+	case []any:
+		out := make([]string, 0, len(x))
+		for _, item := range x {
+			out = append(out, strings.TrimSpace(fmt.Sprint(item)))
+		}
+		return out
+	case []string:
+		return append([]string(nil), x...)
+	default:
+		return []string{strings.TrimSpace(fmt.Sprint(x))}
+	}
 }
 
 func queueName(q string) string {
