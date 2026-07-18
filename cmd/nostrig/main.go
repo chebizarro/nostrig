@@ -31,7 +31,7 @@ func newRootCmd() *cobra.Command {
 		Short: "Relay-backed NIP-34 to beads task-fabric bridge",
 	}
 
-	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newMigrateCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newQueueCmd(), newServeCmd())
+	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newMigrateCmd(), newCreateCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newDeleteCmd(), newQueueCmd(), newServeCmd())
 	return cmd
 }
 
@@ -208,6 +208,88 @@ func newMigrateCmd() *cobra.Command {
 	return cmd
 }
 
+func newCreateCmd() *cobra.Command {
+	var taskID, title, description, status, priority, epic, assignee, recipient string
+	var repoAddr, repoID, owner string
+	var labels, dependsOn, relays []string
+	var signing signingOptions
+	var response responseOptions
+
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Publish a ContextVM task/create command",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(taskID) == "" {
+				return fmt.Errorf("--task-id is required")
+			}
+			if strings.TrimSpace(title) == "" {
+				return fmt.Errorf("--title is required")
+			}
+			if strings.TrimSpace(recipient) == "" {
+				return fmt.Errorf("--recipient is required")
+			}
+			params := map[string]any{"task_id": strings.TrimSpace(taskID), "title": strings.TrimSpace(title)}
+			addr := strings.TrimSpace(repoAddr)
+			if addr == "" && (strings.TrimSpace(repoID) != "" || strings.TrimSpace(owner) != "") {
+				if strings.TrimSpace(repoID) == "" || strings.TrimSpace(owner) == "" {
+					return fmt.Errorf("provide both --repo-id and --owner when --repo-addr is not set")
+				}
+				ownerHex, err := resolveOwner(owner)
+				if err != nil {
+					return fmt.Errorf("invalid owner: %w", err)
+				}
+				addr = nip34.RepoAddress(ownerHex, strings.TrimSpace(repoID))
+			}
+			if addr != "" {
+				params["repo_addr"] = addr
+			}
+			if v := strings.TrimSpace(description); v != "" {
+				params["description"] = v
+			}
+			if v := strings.TrimSpace(status); v != "" {
+				params["status"] = v
+			}
+			if v := strings.TrimSpace(priority); v != "" {
+				params["priority"] = v
+			}
+			if v := strings.TrimSpace(epic); v != "" {
+				params["epic"] = v
+			}
+			if v := strings.TrimSpace(assignee); v != "" {
+				params["assignee"] = v
+			}
+			if values := cleanStrings(labels); len(values) > 0 {
+				params["labels"] = values
+			}
+			if values := cleanStrings(dependsOn); len(values) > 0 {
+				params["depends_on"] = values
+			}
+			event, err := nip34.BuildContextVMCommand("task/create", recipient, params, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			return publishContextVMCommand(cmd, event, relays, signing, response, fmt.Sprintf("published create for %s", taskID))
+		},
+	}
+	cmd.Flags().StringVar(&taskID, "task-id", "", "Task id to create (required)")
+	cmd.Flags().StringVar(&title, "title", "", "Task title (required)")
+	cmd.Flags().StringVar(&repoAddr, "repo-addr", "", "Canonical repository address (30617:<owner>:<repo-id>)")
+	cmd.Flags().StringVar(&repoID, "repo-id", "", "Repository id used with --owner to derive --repo-addr")
+	cmd.Flags().StringVar(&owner, "owner", "", "Repository owner hex/npub used with --repo-id to derive --repo-addr")
+	cmd.Flags().StringVar(&description, "description", "", "Task description")
+	cmd.Flags().StringVar(&status, "status", "open", "Initial task status")
+	cmd.Flags().StringVar(&priority, "priority", "", "Task priority (P0-P4 or 0-4)")
+	cmd.Flags().StringVar(&epic, "epic", "", "Parent epic id")
+	cmd.Flags().StringVar(&assignee, "assignee", "", "Initial task assignee")
+	cmd.Flags().StringSliceVar(&labels, "label", nil, "Task label(s), repeatable")
+	cmd.Flags().StringSliceVar(&dependsOn, "depends-on", nil, "Dependency task id(s), repeatable")
+	cmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
+	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	addSigningFlags(cmd, &signing)
+	addResponseFlags(cmd, &response)
+	return cmd
+}
+
 func newClaimCmd() *cobra.Command {
 	var taskID string
 	var claimer string
@@ -347,6 +429,13 @@ func newUpdateCmd() *cobra.Command {
 	var assignee string
 	var title string
 	var description string
+	var priority string
+	var epic string
+	var setLabels []string
+	var addLabels []string
+	var removeLabels []string
+	var addDeps []string
+	var removeDeps []string
 	var relays []string
 	var signing signingOptions
 	var response responseOptions
@@ -366,17 +455,38 @@ func newUpdateCmd() *cobra.Command {
 			if strings.TrimSpace(status) != "" {
 				params["status"] = strings.TrimSpace(status)
 			}
-			if strings.TrimSpace(assignee) != "" {
+			if cmd.Flags().Changed("assignee") {
 				params["assignee"] = strings.TrimSpace(assignee)
 			}
-			if strings.TrimSpace(title) != "" {
+			if cmd.Flags().Changed("title") {
 				params["title"] = strings.TrimSpace(title)
 			}
-			if strings.TrimSpace(description) != "" {
-				params["description"] = strings.TrimSpace(description)
+			if cmd.Flags().Changed("description") {
+				params["description"] = description
+			}
+			if cmd.Flags().Changed("priority") {
+				params["priority"] = strings.TrimSpace(priority)
+			}
+			if cmd.Flags().Changed("epic") {
+				params["epic"] = strings.TrimSpace(epic)
+			}
+			if cmd.Flags().Changed("set-label") {
+				params["set_labels"] = cleanStrings(setLabels)
+			}
+			if values := cleanStrings(addLabels); len(values) > 0 {
+				params["add_labels"] = values
+			}
+			if values := cleanStrings(removeLabels); len(values) > 0 {
+				params["remove_labels"] = values
+			}
+			if values := cleanStrings(addDeps); len(values) > 0 {
+				params["add_dependencies"] = values
+			}
+			if values := cleanStrings(removeDeps); len(values) > 0 {
+				params["remove_dependencies"] = values
 			}
 			if len(params) == 1 {
-				return fmt.Errorf("provide at least one update field: --status, --assignee, --title, or --description")
+				return fmt.Errorf("provide at least one update field")
 			}
 			signer, _, err := signerFromOptions(ctx, signing, !signing.dryRun)
 			if err != nil {
@@ -415,6 +525,13 @@ func newUpdateCmd() *cobra.Command {
 	updateCmd.Flags().StringVar(&assignee, "assignee", "", "New task assignee")
 	updateCmd.Flags().StringVar(&title, "title", "", "New task title")
 	updateCmd.Flags().StringVar(&description, "description", "", "New task description")
+	updateCmd.Flags().StringVar(&priority, "priority", "", "New task priority (P0-P4 or 0-4)")
+	updateCmd.Flags().StringVar(&epic, "epic", "", "New parent epic id; empty clears it")
+	updateCmd.Flags().StringSliceVar(&setLabels, "set-label", nil, "Replace task labels (repeatable)")
+	updateCmd.Flags().StringSliceVar(&addLabels, "add-label", nil, "Add task label(s), repeatable")
+	updateCmd.Flags().StringSliceVar(&removeLabels, "remove-label", nil, "Remove task label(s), repeatable")
+	updateCmd.Flags().StringSliceVar(&addDeps, "add-dep", nil, "Add dependency task id(s), repeatable")
+	updateCmd.Flags().StringSliceVar(&removeDeps, "remove-dep", nil, "Remove dependency task id(s), repeatable")
 	updateCmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
 	addSigningFlags(updateCmd, &signing)
 	addResponseFlags(updateCmd, &response)
@@ -451,6 +568,36 @@ func newCloseCmd() *cobra.Command {
 	addSigningFlags(closeCmd, &signing)
 	addResponseFlags(closeCmd, &response)
 	return closeCmd
+}
+
+func newDeleteCmd() *cobra.Command {
+	var taskID, recipient string
+	var relays []string
+	var signing signingOptions
+	var response responseOptions
+	cmd := &cobra.Command{
+		Use:   "delete",
+		Short: "Publish a ContextVM task/delete command",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(taskID) == "" {
+				return fmt.Errorf("--task-id is required")
+			}
+			if strings.TrimSpace(recipient) == "" {
+				return fmt.Errorf("--recipient is required")
+			}
+			event, err := nip34.BuildContextVMCommand("task/delete", recipient, map[string]any{"task_id": strings.TrimSpace(taskID)}, time.Now().UTC())
+			if err != nil {
+				return err
+			}
+			return publishContextVMCommand(cmd, event, relays, signing, response, fmt.Sprintf("published delete for %s", taskID))
+		},
+	}
+	cmd.Flags().StringVar(&taskID, "task-id", "", "Task id to delete (required)")
+	cmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
+	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	addSigningFlags(cmd, &signing)
+	addResponseFlags(cmd, &response)
+	return cmd
 }
 
 func newQueueCmd() *cobra.Command {
@@ -534,21 +681,25 @@ func newQueueListCmd() *cobra.Command {
 
 func newServeCmd() *cobra.Command {
 	var relays []string
+	var repoAddrs []string
 	var signing signingOptions
 	var pubkey string
 	var syncNIP34Status bool
 	var qualityProject string
+	var healthFile string
 	cmd := &cobra.Command{Use: "serve", Short: "Serve incoming ContextVM task and queue intents", RunE: func(cmd *cobra.Command, args []string) error {
 		signer, _, err := signerFromOptions(cmd.Context(), signing, true)
 		if err != nil {
 			return err
 		}
-		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), Signer: signer, PubKey: pubkey, SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject})
+		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), RepoAddrs: repoAddrsWithEnv(repoAddrs), Signer: signer, PubKey: pubkey, SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject, HealthFile: healthFile})
 	}}
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to subscribe/publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	cmd.Flags().StringSliceVar(&repoAddrs, "repo-addr", nil, "Allowed canonical repository address(es), repeatable; falls back to NOSTRIG_REPO_ADDR/NOSTRIG_REPO_ADDRS")
 	cmd.Flags().StringVar(&pubkey, "pubkey", "", "Server recipient pubkey; defaults to signer pubkey when available")
 	cmd.Flags().BoolVar(&syncNIP34Status, "sync-nip34-status", false, "Opt-in: publish NIP-34 issue status events when linked tasks change")
 	cmd.Flags().StringVar(&qualityProject, "quality-project", "", "Optional PSTF project tag used to scope quality status/audit events")
+	cmd.Flags().StringVar(&healthFile, "health-file", "", "Touch this liveness file while serve is running")
 	addSigningFlags(cmd, &signing)
 	return cmd
 }
@@ -692,6 +843,16 @@ func resolveClientSecretKey(clientSecretKey string) (string, error) {
 	if key == "" {
 		key = strings.TrimSpace(os.Getenv("NOSTRIG_SIGNER_SECRET_KEY"))
 	}
+	if key == "" {
+		path := strings.TrimSpace(os.Getenv("NOSTRIG_SIGNER_CLIENT_SECRET_KEY_FILE"))
+		if path != "" {
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				return "", fmt.Errorf("read NOSTRIG_SIGNER_CLIENT_SECRET_KEY_FILE: %w", err)
+			}
+			key = strings.TrimSpace(string(contents))
+		}
+	}
 	return normalizeSecretKey(key)
 }
 
@@ -804,6 +965,15 @@ func relaysWithEnv(relays []string) []string {
 	if len(cleanStrings(out)) == 0 {
 		out = append(out, splitEnvList(os.Getenv("NOSTR_RELAYS"))...)
 		out = append(out, splitEnvList(os.Getenv("NOSTR_RELAY"))...)
+	}
+	return cleanStrings(out)
+}
+
+func repoAddrsWithEnv(repoAddrs []string) []string {
+	out := append([]string(nil), repoAddrs...)
+	if len(cleanStrings(out)) == 0 {
+		out = append(out, splitEnvList(os.Getenv("NOSTRIG_REPO_ADDRS"))...)
+		out = append(out, splitEnvList(os.Getenv("NOSTRIG_REPO_ADDR"))...)
 	}
 	return cleanStrings(out)
 }

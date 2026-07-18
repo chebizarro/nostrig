@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -56,6 +58,37 @@ func (l *RelayLedger) PutTask(ctx context.Context, issue *beadspb.Issue) (*gonos
 		}
 	}
 	return l.publishEvents(ctx, events)
+}
+
+func (l *RelayLedger) DeleteTask(ctx context.Context, id string) (*gonostr.Event, error) {
+	id = strings.TrimPrefix(strings.TrimSpace(id), "task:")
+	if id == "" {
+		return nil, fmt.Errorf("task id is required")
+	}
+	events, err := FetchTaskStateEvents(ctx, l.client(), SyncOptions{Relays: l.Relays, TaskIDs: []string{id}, Limit: 10})
+	if err != nil {
+		return nil, err
+	}
+	var latest *gonostr.Event
+	for _, candidate := range events {
+		d, _ := nip34.TagD(candidate)
+		if d != "task:"+id {
+			continue
+		}
+		if latest == nil || nip34.EventTime(candidate).After(nip34.EventTime(latest)) {
+			latest = candidate
+		}
+	}
+	if latest == nil {
+		// NIP-09 deletion is idempotent. A relay may stop returning the target
+		// immediately after accepting the first request, so at-least-once
+		// command replay must treat an already-absent task as success.
+		return nil, nil
+	}
+	tags := gonostr.Tags{{"e", latest.ID.Hex()}, {"k", fmt.Sprintf("%d", nip34.KindCanonicalState)}}
+	tags = append(tags, gonostr.Tag{"a", fmt.Sprintf("%d:%s:task:%s", nip34.KindCanonicalState, latest.PubKey.Hex(), id)})
+	ev := &gonostr.Event{Kind: gonostr.Kind(5), CreatedAt: gonostr.Now(), Tags: tags, Content: "delete task " + id}
+	return l.publishOne(ctx, ev)
 }
 
 func (l *RelayLedger) GetQueue(ctx context.Context, queue string) ([]string, error) {
@@ -119,10 +152,12 @@ func (l *RelayLedger) client() *nip34.Client {
 
 type ServeOptions struct {
 	Relays          []string
+	RepoAddrs       []string
 	Signer          nip34.Signer
 	PubKey          string
 	SyncNIP34Status bool
 	QualityProject  string
+	HealthFile      string
 }
 
 func Serve(ctx context.Context, opts ServeOptions) error {
@@ -152,11 +187,16 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	ledger := &RelayLedger{Relays: relays, Signer: opts.Signer, SyncNIP34Status: opts.SyncNIP34Status}
 	quality := &RelayQualitySource{Relays: relays, Project: opts.QualityProject}
-	handler := &Handler{Ledger: ledger, Quality: quality}
+	handler := &Handler{Ledger: ledger, Quality: quality, RepoAddrs: cleanStrings(opts.RepoAddrs)}
 	pool := gonostr.NewPool()
 	defer pool.Close("nostrig serve complete")
 	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent), gonostr.Kind(cascadia.NIP59_GIFT_WRAP)}, Tags: gonostr.TagMap{"p": []string{pubkey}}}
 	ch := pool.SubscribeMany(ctx, relays, filter, gonostr.SubscriptionOptions{})
+	stopHealth, err := startHealthFile(ctx, opts.HealthFile)
+	if err != nil {
+		return err
+	}
+	defer stopHealth()
 	for {
 		select {
 		case <-ctx.Done():
@@ -194,6 +234,42 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 }
 
+func startHealthFile(ctx context.Context, path string) (func(), error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return func() {}, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create health file directory: %w", err)
+	}
+	_ = os.Remove(path)
+	write := func() error {
+		return os.WriteFile(path, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644)
+	}
+	if err := write(); err != nil {
+		return nil, fmt.Errorf("write health file: %w", err)
+	}
+	stop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				_ = write()
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		_ = os.Remove(path)
+	}, nil
+}
+
 func allowedMethod(ev *gonostr.Event) bool {
 	method, _ := nip34.TagFirst(ev, "method")
 	if method == "" {
@@ -202,7 +278,7 @@ func allowedMethod(ev *gonostr.Event) bool {
 		method = req.Method
 	}
 	switch method {
-	case "task/claim", "task/assign", "task/update", "task/close", "task/quality-status", "queue/enqueue", "queue/dequeue", "queue/list":
+	case "task/create", "task/claim", "task/assign", "task/update", "task/close", "task/delete", "task/quality-status", "queue/enqueue", "queue/dequeue", "queue/list":
 		return true
 	default:
 		return false

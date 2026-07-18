@@ -17,13 +17,15 @@ import (
 type Ledger interface {
 	GetTask(ctx context.Context, id string) (*beadspb.Issue, error)
 	PutTask(ctx context.Context, issue *beadspb.Issue) (*gonostr.Event, error)
+	DeleteTask(ctx context.Context, id string) (*gonostr.Event, error)
 	GetQueue(ctx context.Context, queue string) ([]string, error)
 	PutQueue(ctx context.Context, queue string, ids []string) (*gonostr.Event, error)
 }
 
 type Handler struct {
-	Ledger  Ledger
-	Quality QualityLookup
+	Ledger    Ledger
+	Quality   QualityLookup
+	RepoAddrs []string
 }
 
 func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.Time) (*gonostr.Event, error) {
@@ -54,7 +56,7 @@ func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.
 
 func (h *Handler) registry(caller string, now time.Time) *cascontextvm.Registry {
 	r := cascontextvm.NewRegistry()
-	for _, method := range []string{"task/claim", "task/assign", "task/update", "task/close", "task/quality-status", "queue/enqueue", "queue/dequeue", "queue/list"} {
+	for _, method := range []string{"task/create", "task/claim", "task/assign", "task/update", "task/close", "task/delete", "task/quality-status", "queue/enqueue", "queue/dequeue", "queue/list"} {
 		parts := strings.Split(method, "/")
 		r.Register(parts[0], parts[1], func(method string) cascontextvm.Handler {
 			return func(ctx context.Context, req cascontextvm.Request) (any, error) {
@@ -78,7 +80,49 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		}
 		return ""
 	}
+	if strings.HasPrefix(method, "task/") && method != "task/quality-status" {
+		if err := h.authorizeRepo(ctx, method, get("task_id"), get("repo_addr")); err != nil {
+			return nil, err
+		}
+	}
 	switch method {
+	case "task/create":
+		id, title := strings.TrimPrefix(get("task_id"), "task:"), get("title")
+		if id == "" {
+			return nil, fmt.Errorf("task_id is required")
+		}
+		if title == "" {
+			return nil, fmt.Errorf("title is required")
+		}
+		status := nip34.ParseStatus(get("status"))
+		if status == beadspb.Status_STATUS_UNSPECIFIED {
+			status = beadspb.Status_STATUS_OPEN
+		}
+		metadata := &beadspb.Metadata{Custom: map[string]string{}}
+		if repoAddr := get("repo_addr"); repoAddr != "" {
+			metadata.Custom["nip34.repo_addr"] = repoAddr
+		}
+		issue := &beadspb.Issue{
+			Id:          id,
+			Title:       title,
+			Description: get("description"),
+			Status:      status,
+			Priority:    parsePriorityParam(get("priority")),
+			Epic:        get("epic"),
+			Assignee:    get("assignee"),
+			Labels:      cleanStrings(paramList(p, "labels")),
+			DependsOn:   cleanTaskIDs(paramList(p, "depends_on")),
+			Created:     timestamppb.New(now),
+			Updated:     timestamppb.New(now),
+			Metadata:    metadata,
+		}
+		ev, err := h.Ledger.PutTask(ctx, issue)
+		if err != nil {
+			return nil, err
+		}
+		r := taskResult(issue, ev)
+		h.annotateQuality(ctx, r, []string{issue.Id})
+		return r, nil
 	case "task/claim":
 		id, claimer := get("task_id"), get("claimer")
 		if claimer == "" {
@@ -121,15 +165,28 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		if v := get("status"); v != "" {
 			issue.Status = nip34.ParseStatus(v)
 		}
-		if v := get("assignee"); v != "" {
-			issue.Assignee = v
+		if _, ok := p["assignee"]; ok {
+			issue.Assignee = get("assignee")
 		}
-		if v := get("title"); v != "" {
-			issue.Title = v
+		if _, ok := p["title"]; ok {
+			issue.Title = get("title")
 		}
-		if v := get("description"); v != "" {
-			issue.Description = v
+		if _, ok := p["description"]; ok {
+			issue.Description = get("description")
 		}
+		if _, ok := p["priority"]; ok {
+			issue.Priority = parsePriorityParam(get("priority"))
+		}
+		if _, ok := p["epic"]; ok {
+			issue.Epic = get("epic")
+		}
+		if _, ok := p["set_labels"]; ok {
+			issue.Labels = cleanStrings(paramList(p, "set_labels"))
+		}
+		issue.Labels = addStrings(issue.Labels, paramList(p, "add_labels"))
+		issue.Labels = removeStrings(issue.Labels, paramList(p, "remove_labels"))
+		issue.DependsOn = addStrings(issue.DependsOn, cleanTaskIDs(paramList(p, "add_dependencies")))
+		issue.DependsOn = removeStrings(issue.DependsOn, cleanTaskIDs(paramList(p, "remove_dependencies")))
 		issue.Updated = timestamppb.New(now)
 		ev, err := h.Ledger.PutTask(ctx, issue)
 		if err != nil {
@@ -150,6 +207,20 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		}
 		r := taskResult(issue, ev)
 		h.annotateQuality(ctx, r, []string{issue.Id})
+		return r, nil
+	case "task/delete":
+		id := strings.TrimPrefix(get("task_id"), "task:")
+		if id == "" {
+			return nil, fmt.Errorf("task_id is required")
+		}
+		ev, err := h.Ledger.DeleteTask(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		r := map[string]any{"task_id": id, "deleted": true}
+		if ev != nil {
+			r["event_id"] = ev.ID
+		}
 		return r, nil
 	case "task/quality-status":
 		ids := paramList(p, "task_ids")
@@ -302,6 +373,75 @@ func paramList(p map[string]any, key string) []string {
 	default:
 		return []string{strings.TrimSpace(fmt.Sprint(x))}
 	}
+}
+
+func (h *Handler) authorizeRepo(ctx context.Context, method, taskID, repoAddr string) error {
+	allowed := cleanStrings(h.RepoAddrs)
+	if len(allowed) == 0 {
+		return nil
+	}
+	isAllowed := func(candidate string) bool {
+		candidate = strings.TrimSpace(candidate)
+		for _, addr := range allowed {
+			if candidate == addr {
+				return true
+			}
+		}
+		return false
+	}
+	if method == "task/create" {
+		if !isAllowed(repoAddr) {
+			return fmt.Errorf("repo_addr is not served by this instance")
+		}
+		return nil
+	}
+	issue, err := h.Ledger.GetTask(ctx, strings.TrimPrefix(strings.TrimSpace(taskID), "task:"))
+	if err != nil {
+		if method == "task/delete" {
+			return nil
+		}
+		return err
+	}
+	if issue == nil || !isAllowed(issue.GetMetadata().GetCustom()["nip34.repo_addr"]) {
+		return fmt.Errorf("task is not served by this instance")
+	}
+	return nil
+}
+
+func parsePriorityParam(value string) beadspb.Priority {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	if len(value) == 1 && value[0] >= '0' && value[0] <= '4' {
+		value = "P" + value
+	}
+	return nip34.ParsePriority(value)
+}
+
+func addStrings(base, values []string) []string {
+	return cleanStrings(append(append([]string(nil), base...), values...))
+}
+
+func removeStrings(base, values []string) []string {
+	remove := map[string]struct{}{}
+	for _, value := range values {
+		remove[strings.TrimSpace(value)] = struct{}{}
+	}
+	out := make([]string, 0, len(base))
+	for _, value := range cleanStrings(base) {
+		if _, ok := remove[value]; !ok {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func cleanTaskIDs(ids []string) []string {
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id = strings.TrimPrefix(strings.TrimSpace(id), "task:"); id != "" {
+			out = append(out, id)
+		}
+	}
+	return cleanStrings(out)
 }
 
 func queueName(q string) string {

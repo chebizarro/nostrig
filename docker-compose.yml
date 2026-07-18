@@ -1,0 +1,25 @@
+services:
+  nostrig-serve:
+    build:
+      context: .
+    image: nostrig:local
+    command: ["serve", "--health-file", "/tmp/nostrig/healthy"]
+    environment:
+      NOSTRIG_ENV: production
+      NOSTR_RELAY: ${NOSTR_RELAY:-wss://relay.sharegap.net}
+      NOSTRIG_REPO_ADDRS: ${NOSTRIG_REPO_ADDRS:?set one or more canonical 30617 repo addresses}
+      NOSTRIG_SIGNER_BUNKER_URL: ${NOSTRIG_SIGNER_BUNKER_URL:?set the Signet/NIP-46 bunker URL}
+      NOSTRIG_SIGNER_CLIENT_SECRET_KEY_FILE: /run/secrets/nostrig_signer_client_secret_key
+    secrets:
+      - nostrig_signer_client_secret_key
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/nostrig/healthy -mmin -2 -type f | grep -q ."]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+secrets:
+  nostrig_signer_client_secret_key:
+    file: ${NOSTRIG_SIGNER_CLIENT_SECRET_FILE:-./secrets/nostrig_signer_client_secret_key}

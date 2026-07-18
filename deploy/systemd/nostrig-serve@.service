@@ -1,0 +1,20 @@
+[Unit]
+Description=nostrig task-fabric recipient (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+Environment=NOSTRIG_ENV=production
+Environment=NOSTR_RELAY=wss://relay.sharegap.net
+Environment=NOSTRIG_SIGNER_CLIENT_SECRET_KEY_FILE=%d/nostrig_signer_client_secret_key
+EnvironmentFile=/etc/nostrig/%i.env
+LoadCredential=nostrig_signer_client_secret_key:/etc/nostrig/%i.signer-client-secret
+RuntimeDirectory=nostrig-%i
+ExecStart=/usr/local/bin/nostrig serve --health-file /run/nostrig-%i/healthy
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
