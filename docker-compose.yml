@@ -2,6 +2,8 @@ services:
   nostrig-serve:
     build:
       context: .
+      additional_contexts:
+        cascadia-go: ../cascadia-go
     image: nostrig:local
     command: ["serve", "--health-file", "/tmp/nostrig/healthy"]
     environment:

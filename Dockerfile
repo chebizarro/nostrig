@@ -1,8 +1,10 @@
 FROM golang:1.25-alpine AS build
+COPY --from=cascadia-go . /cascadia-go
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN go mod download
 COPY . .
+RUN go mod edit -replace=git.sharegap.net/cascadia/cascadia-go=/cascadia-go \
+    && go mod download
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/nostrig ./cmd/nostrig
 
 FROM alpine:3.22
