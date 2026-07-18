@@ -7,6 +7,23 @@ import (
 	"testing"
 )
 
+func TestCreateDryRunPrintsFullTaskCreateEvent(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"create", "--task-id", "task-1", "--title", "Build it", "--repo-addr", "30617:owner:repo", "--description", "body", "--priority", "P1", "--epic", "epic-1", "--label", "bug", "--depends-on", "task-0", "--recipient", "recipient-pubkey", "--dry-run"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{"\"kind\":25910", "task/create", "recipient-pubkey", "task-1", "Build it", "30617:owner:repo", "P1", "epic-1", "bug", "task-0"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("dry-run output missing %q: %s", want, got)
+		}
+	}
+}
+
 func TestClaimDryRunPrintsTaskClaimEvent(t *testing.T) {
 	cmd := newRootCmd()
 	cmd.SetArgs([]string{"claim", "--task-id", "task-1", "--claimer", "agent-a", "--recipient", "recipient-pubkey", "--dry-run"})
@@ -43,7 +60,7 @@ func TestAssignDryRunPrintsTaskAssignEvent(t *testing.T) {
 
 func TestUpdateDryRunPrintsTaskUpdateEvent(t *testing.T) {
 	cmd := newRootCmd()
-	cmd.SetArgs([]string{"update", "--task-id", "task-1", "--recipient", "recipient-pubkey", "--status", "in_progress", "--dry-run"})
+	cmd.SetArgs([]string{"update", "--task-id", "task-1", "--recipient", "recipient-pubkey", "--status", "in_progress", "--priority", "P0", "--set-label", "urgent", "--add-dep", "task-0", "--dry-run"})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
@@ -51,7 +68,24 @@ func TestUpdateDryRunPrintsTaskUpdateEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.String()
-	for _, want := range []string{"\"kind\":25910", "task/update", "recipient-pubkey", "in_progress"} {
+	for _, want := range []string{"\"kind\":25910", "task/update", "recipient-pubkey", "in_progress", "P0", "urgent", "task-0"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("dry-run output missing %q: %s", want, got)
+		}
+	}
+}
+
+func TestDeleteDryRunPrintsTaskDeleteEvent(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"delete", "--task-id", "task-1", "--recipient", "recipient-pubkey", "--dry-run"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{"\"kind\":25910", "task/delete", "recipient-pubkey", "task-1"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("dry-run output missing %q: %s", want, got)
 		}
