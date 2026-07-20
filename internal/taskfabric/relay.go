@@ -150,6 +150,16 @@ func (l *RelayLedger) client() *nip34.Client {
 	return nip34.NewClient()
 }
 
+type serveSubscriber func(ctx context.Context, relays []string, filter gonostr.Filter) <-chan gonostr.RelayEvent
+
+type serveUnwrapper func(ctx context.Context, signer casnostr.Signer, outer *gonostr.Event) (*gonostr.Event, error)
+
+type serveWrapper func(ctx context.Context, signer casnostr.Signer, recipientPubkey string, payload json.RawMessage) (*gonostr.Event, error)
+
+type serveWrappedPublisher func(ctx context.Context, relays []string, outer *gonostr.Event) error
+
+type serveErrorReporter func(stage string, err error, event *gonostr.Event)
+
 type ServeOptions struct {
 	Relays          []string
 	RepoAddrs       []string
@@ -158,12 +168,23 @@ type ServeOptions struct {
 	SyncNIP34Status bool
 	QualityProject  string
 	HealthFile      string
+
+	subscribe       serveSubscriber
+	unwrap          serveUnwrapper
+	wrap            serveWrapper
+	publishWrapped  serveWrappedPublisher
+	responsePublisher EventPublisher
+	reportError     serveErrorReporter
 }
 
 func Serve(ctx context.Context, opts ServeOptions) error {
 	relays := cleanStrings(opts.Relays)
 	if len(relays) == 0 {
 		return fmt.Errorf("at least one relay is required")
+	}
+	repoAddrs := cleanStrings(opts.RepoAddrs)
+	if len(repoAddrs) == 0 && serveProductionMode() {
+		return fmt.Errorf("at least one repo addr is required in production serve mode")
 	}
 	if opts.Signer == nil {
 		return fmt.Errorf("signer is required")
@@ -187,11 +208,58 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	ledger := &RelayLedger{Relays: relays, Signer: opts.Signer, SyncNIP34Status: opts.SyncNIP34Status}
 	quality := &RelayQualitySource{Relays: relays, Project: opts.QualityProject}
-	handler := &Handler{Ledger: ledger, Quality: quality, RepoAddrs: cleanStrings(opts.RepoAddrs)}
-	pool := gonostr.NewPool()
-	defer pool.Close("nostrig serve complete")
+	handler := &Handler{Ledger: ledger, Quality: quality, RepoAddrs: repoAddrs}
+	subscribe := opts.subscribe
+	if subscribe == nil {
+		pool := gonostr.NewPool()
+		defer pool.Close("nostrig serve complete")
+		subscribe = func(ctx context.Context, relays []string, filter gonostr.Filter) <-chan gonostr.RelayEvent {
+			return pool.SubscribeMany(ctx, relays, filter, gonostr.SubscriptionOptions{})
+		}
+	}
+	unwrap := opts.unwrap
+	if unwrap == nil {
+		unwrap = func(ctx context.Context, signer casnostr.Signer, outer *gonostr.Event) (*gonostr.Event, error) {
+			inner, err := cascontextvm.Unwrap(ctx, signer, (*casnostr.Event)(outer))
+			if err != nil {
+				return nil, err
+			}
+			return (*gonostr.Event)(inner), nil
+		}
+	}
+	wrap := opts.wrap
+	if wrap == nil {
+		wrap = func(ctx context.Context, signer casnostr.Signer, recipientPubkey string, payload json.RawMessage) (*gonostr.Event, error) {
+			outer, _, err := cascontextvm.Wrap(ctx, signer, recipientPubkey, payload)
+			if err != nil {
+				return nil, err
+			}
+			return (*gonostr.Event)(outer), nil
+		}
+	}
+	publishWrapped := opts.publishWrapped
+	if publishWrapped == nil {
+		publishWrapped = func(ctx context.Context, relays []string, outer *gonostr.Event) error {
+			accepted, err := casnostr.Publish(ctx, relays, *(*casnostr.Event)(outer))
+			if err != nil {
+				return err
+			}
+			if accepted == 0 {
+				return fmt.Errorf("no relay accepted wrapped response")
+			}
+			return nil
+		}
+	}
+	responsePublisher := opts.responsePublisher
+	if responsePublisher == nil {
+		responsePublisher = nip34.NewPublisher()
+	}
+	reportError := opts.reportError
+	if reportError == nil {
+		reportError = defaultServeErrorReporter
+	}
 	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent), gonostr.Kind(cascadia.NIP59_GIFT_WRAP)}, Tags: gonostr.TagMap{"p": []string{pubkey}}}
-	ch := pool.SubscribeMany(ctx, relays, filter, gonostr.SubscriptionOptions{})
+	ch := subscribe(ctx, relays, filter)
 	stopHealth, err := startHealthFile(ctx, opts.HealthFile)
 	if err != nil {
 		return err
@@ -206,30 +274,9 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 				return fmt.Errorf("subscription closed")
 			}
 			ev := ie.Event
-			inner := &ev
-			wrapped := ev.Kind == gonostr.Kind(cascadia.NIP59_GIFT_WRAP)
-			if wrapped {
-				unwrapped, err := cascontextvm.Unwrap(ctx, contextSigner, (*casnostr.Event)(&ev))
-				if err != nil {
-					continue
-				}
-				inner = (*gonostr.Event)(unwrapped)
+			if err := serveRelayEvent(ctx, relays, opts.Signer, contextSigner, handler, unwrap, wrap, publishWrapped, responsePublisher, reportError, &ev); err != nil {
+				return err
 			}
-			if !allowedMethod(inner) {
-				continue
-			}
-			resp, err := handler.HandleIntent(ctx, inner, time.Now().UTC())
-			if err != nil {
-				continue
-			}
-			if wrapped {
-				outer, _, err := cascontextvm.Wrap(ctx, contextSigner, inner.PubKey.Hex(), json.RawMessage(resp.Content))
-				if err == nil {
-					_, _ = casnostr.Publish(ctx, relays, *outer)
-				}
-				continue
-			}
-			_ = nip34.NewPublisher().Publish(ctx, relays, opts.Signer, []*gonostr.Event{resp})
 		}
 	}
 }
@@ -285,10 +332,67 @@ func allowedMethod(ev *gonostr.Event) bool {
 	}
 }
 
+func serveRelayEvent(ctx context.Context, relays []string, signer nip34.Signer, contextSigner casnostr.Signer, handler *Handler, unwrap serveUnwrapper, wrap serveWrapper, publishWrapped serveWrappedPublisher, responsePublisher EventPublisher, reportError serveErrorReporter, event *gonostr.Event) error {
+	if event == nil {
+		return nil
+	}
+	inner := event
+	wrapped := event.Kind == gonostr.Kind(cascadia.NIP59_GIFT_WRAP)
+	if wrapped {
+		unwrapped, err := unwrap(ctx, contextSigner, event)
+		if err != nil {
+			reportError("unwrap", err, event)
+			return nil
+		}
+		inner = unwrapped
+	}
+	if !allowedMethod(inner) {
+		return nil
+	}
+	resp, err := handler.HandleIntent(ctx, inner, time.Now().UTC())
+	if err != nil {
+		reportError("handle_intent", err, inner)
+		return nil
+	}
+	if wrapped {
+		outer, err := wrap(ctx, contextSigner, inner.PubKey.Hex(), json.RawMessage(resp.Content))
+		if err != nil {
+			reportError("wrap_response", err, inner)
+			return fmt.Errorf("wrap ContextVM response: %w", err)
+		}
+		if err := publishWrapped(ctx, relays, outer); err != nil {
+			reportError("publish_wrapped_response", err, outer)
+			return fmt.Errorf("publish wrapped ContextVM response: %w", err)
+		}
+		return nil
+	}
+	if err := responsePublisher.Publish(ctx, relays, signer, []*gonostr.Event{resp}); err != nil {
+		reportError("publish_response", err, resp)
+		return fmt.Errorf("publish ContextVM response: %w", err)
+	}
+	return nil
+}
+
+func defaultServeErrorReporter(stage string, err error, event *gonostr.Event) {
+	if err == nil {
+		return
+	}
+	if event != nil {
+		fmt.Fprintf(os.Stderr, "nostrig serve %s failed for kind %d event %s: %v\n", stage, event.Kind, event.ID.Hex(), err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "nostrig serve %s failed: %v\n", stage, err)
+}
+
 func contextVMSigner(s nip34.Signer) (casnostr.Signer, error) {
 	keyer, ok := s.(casnostr.Signer)
 	if !ok {
 		return nil, fmt.Errorf("signer does not support ContextVM NIP-59 encryption")
 	}
 	return keyer, nil
+}
+
+func serveProductionMode() bool {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NOSTRIG_ENV")))
+	return env == "production" || env == "prod"
 }

@@ -233,14 +233,13 @@ func (p *Pipeline) fetchRepoData(ctx context.Context, relays []string, repoID st
 		}
 	}
 
-	// Root items + PR updates (we fetch 1619 now, but only convert 1617/1618/1621 for now).
+	// Root items supported by the converter surface.
 	roots := make([]*nip34.RootItem, 0, 256)
 	{
 		f := gonostr.Filter{
 			Kinds: []gonostr.Kind{
 				gonostr.Kind(nip34.KindPatch),
 				gonostr.Kind(nip34.KindPullRequest),
-				gonostr.Kind(nip34.KindPRUpdate),
 				gonostr.Kind(nip34.KindIssue),
 			},
 			Tags: gonostr.TagMap{"a": []string{repoAddr}},
@@ -254,7 +253,6 @@ func (p *Pipeline) fetchRepoData(ctx context.Context, relays []string, repoID st
 		for _, ev := range events {
 			item, err := nip34.ParseRootItem(ev)
 			if err != nil {
-				// Includes KindPRUpdate which is not a root item; ignore.
 				continue
 			}
 			roots = append(roots, item)

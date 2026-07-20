@@ -36,11 +36,14 @@ func WaitForContextVMResponse(ctx context.Context, relays []string, command *gon
 	since := command.CreatedAt
 	filters := responseFilters(command, since)
 	client := nip34.NewClient()
-	if events, err := client.FetchMany(ctx, relays, filters); err == nil {
+	if events, err := client.FetchMany(ctx, relays, filters); err == nil || nip34.IsPartialFetch(err) {
 		for _, ev := range events {
 			if resp, ok := MatchContextVMResponse(command, ev); ok {
 				return resp, nil
 			}
+		}
+		if err != nil && ctx.Err() != nil {
+			return nil, err
 		}
 	} else if ctx.Err() != nil {
 		return nil, err

@@ -2,6 +2,7 @@ package nostr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,14 +10,23 @@ import (
 )
 
 // Client wraps a go-nostr SimplePool and provides higher-level fetch helpers.
+type fetchManyFunc func(ctx context.Context, relays []string, filter gonostr.Filter, opts gonostr.SubscriptionOptions) <-chan gonostr.RelayEvent
+
 type Client struct {
-	pool *gonostr.Pool
+	pool         *gonostr.Pool
+	fetchMany    fetchManyFunc
+	queryTimeout time.Duration
 }
 
 // NewClient creates a new nostr client using a SimplePool.
 func NewClient() *Client {
+	pool := gonostr.NewPool()
 	return &Client{
-		pool: gonostr.NewPool(),
+		pool:         pool,
+		queryTimeout: 30 * time.Second,
+		fetchMany: func(ctx context.Context, relays []string, filter gonostr.Filter, opts gonostr.SubscriptionOptions) <-chan gonostr.RelayEvent {
+			return pool.FetchMany(ctx, relays, filter, opts)
+		},
 	}
 }
 
@@ -25,10 +35,36 @@ func (c *Client) Fetch(ctx context.Context, relays []string, f gonostr.Filter) (
 	return c.FetchMany(ctx, relays, []gonostr.Filter{f})
 }
 
+// PartialFetchError reports that a fetch ended before full completion and the
+// returned events may be incomplete.
+type PartialFetchError struct {
+	Cause      error
+	EventCount int
+}
+
+func (e *PartialFetchError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.EventCount > 0 {
+		return fmt.Sprintf("nostr fetch incomplete after %d event(s): %v", e.EventCount, e.Cause)
+	}
+	return fmt.Sprintf("nostr fetch incomplete: %v", e.Cause)
+}
+
+func (e *PartialFetchError) Unwrap() error { return e.Cause }
+
+func IsPartialFetch(err error) bool {
+	var target *PartialFetchError
+	return errors.As(err, &target)
+}
+
 // FetchMany queries relays for events matching multiple filters.
 //
 // It deduplicates events by ID across relays and filters.
-// If ctx is cancelled, it returns any collected events plus ctx.Err().
+// If the caller context is cancelled, it returns any collected events plus
+// ctx.Err(). If the internal deadline expires first, it returns any collected
+// events plus a PartialFetchError so callers can reject incomplete projections.
 func (c *Client) FetchMany(ctx context.Context, relays []string, filters []gonostr.Filter) ([]*gonostr.Event, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("context is nil")
@@ -45,14 +81,24 @@ func (c *Client) FetchMany(ctx context.Context, relays []string, filters []gonos
 
 	// Use SubManyEose which closes the channel after receiving EOSE from all relays
 	// Add a timeout to avoid hanging if relays don't respond
-	queryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	timeout := c.queryTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	seen := make(map[string]struct{}, 1024)
 	out := make([]*gonostr.Event, 0, 256)
 
+	fetchMany := c.fetchMany
+	if fetchMany == nil {
+		fetchMany = func(ctx context.Context, relays []string, filter gonostr.Filter, opts gonostr.SubscriptionOptions) <-chan gonostr.RelayEvent {
+			return c.pool.FetchMany(ctx, relays, filter, opts)
+		}
+	}
 	for _, filter := range filters {
-		ch := c.pool.FetchMany(queryCtx, relays, filter, gonostr.SubscriptionOptions{})
+		ch := fetchMany(queryCtx, relays, filter, gonostr.SubscriptionOptions{})
 		if ch == nil {
 			return nil, fmt.Errorf("failed to create subscription")
 		}
@@ -71,9 +117,11 @@ func (c *Client) FetchMany(ctx context.Context, relays []string, filters []gonos
 		}
 	}
 
-	// Don't treat timeout as error if we got some results
-	if ctx.Err() != nil && len(out) == 0 {
+	if ctx.Err() != nil {
 		return out, ctx.Err()
+	}
+	if err := queryCtx.Err(); err != nil {
+		return out, &PartialFetchError{Cause: err, EventCount: len(out)}
 	}
 	return out, nil
 }
