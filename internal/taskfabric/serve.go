@@ -397,9 +397,6 @@ func (h *Handler) authorizeRepo(ctx context.Context, method, taskID, repoAddr st
 	}
 	issue, err := h.Ledger.GetTask(ctx, strings.TrimPrefix(strings.TrimSpace(taskID), "task:"))
 	if err != nil {
-		if method == "task/delete" {
-			return nil
-		}
 		return err
 	}
 	if issue == nil || !isAllowed(issue.GetMetadata().GetCustom()["nip34.repo_addr"]) {
