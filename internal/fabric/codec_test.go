@@ -1,10 +1,12 @@
 package fabric
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
+	gonostr "github.com/nbd-wtf/go-nostr"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -40,5 +42,71 @@ func TestDecodeRejectsAddressMismatch(t *testing.T) {
 	events[0].Tags[0][1] = "task:fp-51"
 	if _, err := Decode(events); err == nil {
 		t.Fatal("expected mismatch error")
+	}
+}
+
+func TestDecodeLatestWinsAndReplayIsIdempotent(t *testing.T) {
+	pub := "author"
+	old, _ := Encode(&beadspb.Export{Issues: []*beadspb.Issue{{Id: "fp-50", Title: "old"}}}, pub, time.Unix(10, 0))
+	newer, _ := Encode(&beadspb.Export{Issues: []*beadspb.Issue{{Id: "fp-50", Title: "new"}}}, pub, time.Unix(20, 0))
+	got, err := Decode([]*gonostr.Event{newer[0], old[0], newer[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Issues) != 1 || got.Issues[0].Title != "new" {
+		t.Fatalf("latest-wins replay failed: %v", got.Issues)
+	}
+}
+
+func TestDecodeTombstoneAndAuthorIsolation(t *testing.T) {
+	pub := "author"
+	events, _ := Encode(&beadspb.Export{Issues: []*beadspb.Issue{{Id: "fp-50"}}}, pub, time.Unix(10, 0))
+	foreignDelete := &gonostr.Event{PubKey: "attacker", CreatedAt: 30, Kind: gonostr.KindDeletion,
+		Tags: gonostr.Tags{{"a", fmt.Sprintf("30900:%s:task:fp-50", pub)}}}
+	delete := &gonostr.Event{PubKey: pub, CreatedAt: 20, Kind: gonostr.KindDeletion,
+		Tags: gonostr.Tags{{"a", fmt.Sprintf("30900:%s:task:fp-50", pub)}}}
+
+	got, err := Decode([]*gonostr.Event{events[0], foreignDelete})
+	if err != nil || len(got.Issues) != 1 {
+		t.Fatalf("foreign deletion affected task: issues=%v err=%v", got.Issues, err)
+	}
+	got, err = Decode([]*gonostr.Event{delete, events[0]})
+	if err != nil || len(got.Issues) != 0 {
+		t.Fatalf("authorized tombstone not applied: issues=%v err=%v", got.Issues, err)
+	}
+}
+
+func TestDecodeRejectsMalformedCanonicalEvent(t *testing.T) {
+	_, err := Decode([]*gonostr.Event{{Kind: 30900, Content: `{}`}})
+	if err == nil {
+		t.Fatal("expected missing d tag error")
+	}
+	events, _ := Encode(&beadspb.Export{Issues: []*beadspb.Issue{{Id: "fp-50"}}}, "author", time.Now())
+	events[0].Content = `{"schema":"wrong","issue":{}}`
+	if _, err := Decode(events); err == nil {
+		t.Fatal("expected unsupported schema error")
+	}
+}
+
+func TestDecodeVerifiedRejectsTamperAndFiltersAuthor(t *testing.T) {
+	secret := gonostr.GeneratePrivateKey()
+	pub, err := gonostr.GetPublicKey(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, _ := Encode(&beadspb.Export{Issues: []*beadspb.Issue{{Id: "fp-50"}}}, pub, time.Unix(20, 0))
+	if err := events[0].Sign(secret); err != nil {
+		t.Fatal(err)
+	}
+	foreign := *events[0]
+	foreign.PubKey = "foreign"
+	got, err := DecodeVerified([]*gonostr.Event{events[0], &foreign}, pub)
+	if err != nil || len(got.Issues) != 1 {
+		t.Fatalf("verified decode failed: issues=%v err=%v", got.Issues, err)
+	}
+	tampered := *events[0]
+	tampered.Content += " "
+	if _, err := DecodeVerified([]*gonostr.Event{&tampered}, pub); err == nil {
+		t.Fatal("expected tampered signature rejection")
 	}
 }
