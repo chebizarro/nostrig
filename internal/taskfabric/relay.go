@@ -21,6 +21,7 @@ type RelayLedger struct {
 	Relays          []string
 	Signer          nip34.Signer
 	Client          *nip34.Client
+	Publisher       EventPublisher
 	CanonicalAuthor string
 	SyncNIP34Status bool
 }
@@ -165,7 +166,11 @@ func (l *RelayLedger) publishEvents(ctx context.Context, events []*gonostr.Event
 	if l.Signer == nil {
 		return nil, fmt.Errorf("signer is required")
 	}
-	if err := nip34.NewPublisher().Publish(ctx, cleanStrings(l.Relays), l.Signer, events); err != nil {
+	publisher := l.Publisher
+	if publisher == nil {
+		publisher = nip34.NewPublisher()
+	}
+	if err := publisher.Publish(ctx, cleanStrings(l.Relays), l.Signer, events); err != nil {
 		return nil, err
 	}
 	if len(events) == 0 {
@@ -203,6 +208,7 @@ type ServeOptions struct {
 	HealthFile      string
 	Authorization   AuthorizationConfig
 	Audit           AuthzAuditSink
+	Publication     nip34.ReliablePublisherOptions
 
 	subscribe         serveSubscriber
 	unwrap            serveUnwrapper
@@ -214,8 +220,14 @@ type ServeOptions struct {
 }
 
 func Serve(ctx context.Context, opts ServeOptions) error {
-	relays := cleanStrings(opts.Relays)
-	if len(relays) == 0 {
+	legacyRelays := cleanStrings(opts.Relays)
+	requiredRelays := cleanStrings(opts.Publication.RequiredRelays)
+	if len(requiredRelays) == 0 {
+		requiredRelays = legacyRelays
+	}
+	mirrorRelays := cleanStrings(opts.Publication.MirrorRelays)
+	relays := cleanStrings(append(append(append([]string(nil), legacyRelays...), requiredRelays...), mirrorRelays...))
+	if len(requiredRelays) == 0 {
 		return fmt.Errorf("at least one relay is required")
 	}
 	repoAddrs := cleanStrings(opts.RepoAddrs)
@@ -252,12 +264,37 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if err != nil {
 		return err
 	}
-	ledger := &RelayLedger{Relays: relays, Signer: opts.Signer, CanonicalAuthor: strings.ToLower(pubkey), SyncNIP34Status: opts.SyncNIP34Status}
-	quality := &RelayQualitySource{Relays: relays, Project: opts.QualityProject}
 	audit := opts.Audit
 	if audit == nil {
 		audit = NewJSONAuditSink(os.Stderr)
 	}
+	reportError := opts.reportError
+	if reportError == nil {
+		reportError = defaultServeErrorReporter
+	}
+	eventPublisher := EventPublisher(nip34.NewPublisher())
+	var reliablePublisher *nip34.ReliablePublisher
+	var outboxErrors <-chan error
+	if strings.TrimSpace(opts.Publication.OutboxPath) != "" {
+		publication := opts.Publication
+		publication.RequiredRelays = requiredRelays
+		publication.MirrorRelays = mirrorRelays
+		reliablePublisher, err = nip34.NewReliablePublisher(publication)
+		if err != nil {
+			return fmt.Errorf("configure reliable relay publication: %w", err)
+		}
+		defer reliablePublisher.Close()
+		eventPublisher = reliablePublisher
+		errors := make(chan error, 1)
+		outboxErrors = errors
+		go func() {
+			if err := reliablePublisher.Run(ctx); err != nil && ctx.Err() == nil {
+				errors <- err
+			}
+		}()
+	}
+	ledger := &RelayLedger{Relays: requiredRelays, Signer: opts.Signer, Publisher: eventPublisher, CanonicalAuthor: strings.ToLower(pubkey), SyncNIP34Status: opts.SyncNIP34Status}
+	quality := &RelayQualitySource{Relays: requiredRelays, Project: opts.QualityProject}
 	handler := &Handler{Ledger: ledger, Quality: quality, RepoAddrs: repoAddrs, Recipient: pubkey, ACL: opts.Authorization.Callers, ClosePolicy: opts.Authorization.ClosePolicy, Audit: audit}
 	subscribe := opts.subscribe
 	if subscribe == nil {
@@ -289,8 +326,12 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	publishWrapped := opts.publishWrapped
 	if publishWrapped == nil {
-		publishWrapped = func(ctx context.Context, relays []string, outer *gonostr.Event) error {
-			accepted, err := casnostr.Publish(ctx, relays, *(*casnostr.Event)(outer))
+		publishWrapped = func(ctx context.Context, relayURLs []string, outer *gonostr.Event) error {
+			if reliablePublisher != nil {
+				_, err := reliablePublisher.PublishSigned(ctx, outer)
+				return err
+			}
+			accepted, err := casnostr.Publish(ctx, relayURLs, *(*casnostr.Event)(outer))
 			if err != nil {
 				return err
 			}
@@ -302,11 +343,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	responsePublisher := opts.responsePublisher
 	if responsePublisher == nil {
-		responsePublisher = nip34.NewPublisher()
-	}
-	reportError := opts.reportError
-	if reportError == nil {
-		reportError = defaultServeErrorReporter
+		responsePublisher = eventPublisher
 	}
 	verify := opts.verify
 	if verify == nil {
@@ -323,6 +360,9 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-outboxErrors:
+			reportError("drain_outbox", err, nil)
+			return fmt.Errorf("drain durable outbox: %w", err)
 		case ie, ok := <-ch:
 			if !ok {
 				return fmt.Errorf("subscription closed")

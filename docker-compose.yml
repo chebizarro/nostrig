@@ -3,7 +3,7 @@ services:
     build:
       context: .
     image: nostrig:local
-    command: ["serve", "--health-file", "/tmp/nostrig/healthy"]
+    command: ["serve", "--health-file", "/tmp/nostrig/healthy", "--outbox-path", "/var/lib/nostrig/outbox.json"]
     environment:
       NOSTRIG_ENV: production
       NOSTR_RELAY: ${NOSTR_RELAY:-wss://relay.sharegap.net}
@@ -12,6 +12,8 @@ services:
       NOSTRIG_SIGNER_CLIENT_SECRET_KEY_FILE: /run/secrets/nostrig_signer_client_secret_key
     secrets:
       - nostrig_signer_client_secret_key
+    volumes:
+      - nostrig-state:/var/lib/nostrig
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "find /tmp/nostrig/healthy -mmin -2 -type f | grep -q ."]
@@ -23,3 +25,6 @@ services:
 secrets:
   nostrig_signer_client_secret_key:
     file: ${NOSTRIG_SIGNER_CLIENT_SECRET_FILE:-./secrets/nostrig_signer_client_secret_key}
+
+volumes:
+  nostrig-state:

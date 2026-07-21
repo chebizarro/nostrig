@@ -3,9 +3,29 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestOutboxListCommandShowsEmptyDurableSpool(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"outbox", "list", "--path", filepath.Join(t.TempDir(), "outbox.json")})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
+		t.Fatalf("decode outbox JSON %q: %v", out.String(), err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("unexpected outbox entries: %#v", entries)
+	}
+}
 
 func TestCreateDryRunPrintsFullTaskCreateEvent(t *testing.T) {
 	cmd := newRootCmd()

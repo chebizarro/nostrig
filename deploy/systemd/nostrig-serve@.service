@@ -12,7 +12,8 @@ Environment=NOSTRIG_SIGNER_CLIENT_SECRET_KEY_FILE=%d/nostrig_signer_client_secre
 EnvironmentFile=/etc/nostrig/%i.env
 LoadCredential=nostrig_signer_client_secret_key:/etc/nostrig/%i.signer-client-secret
 RuntimeDirectory=nostrig-%i
-ExecStart=/usr/local/bin/nostrig serve --health-file /run/nostrig-%i/healthy
+StateDirectory=nostrig-%i
+ExecStart=/usr/local/bin/nostrig serve --health-file /run/nostrig-%i/healthy --outbox-path /var/lib/nostrig-%i/outbox.json
 Restart=on-failure
 RestartSec=5s
 

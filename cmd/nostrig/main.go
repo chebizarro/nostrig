@@ -31,7 +31,7 @@ func newRootCmd() *cobra.Command {
 		Short: "Relay-backed NIP-34 to beads task-fabric bridge",
 	}
 
-	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newMigrateCmd(), newCreateCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newDeleteCmd(), newQueueCmd(), newServeCmd())
+	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newMigrateCmd(), newCreateCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newDeleteCmd(), newQueueCmd(), newServeCmd(), newOutboxCmd())
 	return cmd
 }
 
@@ -718,6 +718,8 @@ func newQueueListCmd() *cobra.Command {
 
 func newServeCmd() *cobra.Command {
 	var relays []string
+	var ledgerRelays []string
+	var mirrorRelays []string
 	var repoAddrs []string
 	var signing signingOptions
 	var pubkey string
@@ -725,6 +727,15 @@ func newServeCmd() *cobra.Command {
 	var qualityProject string
 	var healthFile string
 	var aclFile string
+	var ackQuorum int
+	var publishTimeout time.Duration
+	var retryBaseBackoff time.Duration
+	var retryMaxBackoff time.Duration
+	var retryMaxAttempts int
+	var circuitFailureLimit int
+	var circuitCooldown time.Duration
+	var outboxDrainInterval time.Duration
+	outboxPath := defaultOutboxPath()
 	cmd := &cobra.Command{Use: "serve", Short: "Serve incoming ContextVM task and queue intents", RunE: func(cmd *cobra.Command, args []string) error {
 		signer, _, err := signerFromOptions(cmd.Context(), signing, true)
 		if err != nil {
@@ -741,15 +752,40 @@ func newServeCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), RepoAddrs: repoAddrsWithEnv(repoAddrs), Signer: signer, PubKey: pubkey, SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject, HealthFile: healthFile, Authorization: authz})
+		required := cleanStrings(ledgerRelays)
+		if len(required) == 0 {
+			required = append(required, splitEnvList(os.Getenv("NOSTRIG_LEDGER_RELAYS"))...)
+		}
+		if len(required) == 0 {
+			required = relaysWithEnv(relays)
+		}
+		mirrors := cleanStrings(append(append([]string(nil), mirrorRelays...), splitEnvList(os.Getenv("NOSTRIG_MIRROR_RELAYS"))...))
+		publication := nip34.ReliablePublisherOptions{
+			RequiredRelays: required, MirrorRelays: mirrors, AckQuorum: ackQuorum, OutboxPath: outboxPath,
+			PublishTimeout: publishTimeout, BaseBackoff: retryBaseBackoff, MaxBackoff: retryMaxBackoff,
+			MaxAttempts: retryMaxAttempts, CircuitFailureLimit: circuitFailureLimit, CircuitCooldown: circuitCooldown,
+			DrainInterval: outboxDrainInterval,
+		}
+		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), RepoAddrs: repoAddrsWithEnv(repoAddrs), Signer: signer, PubKey: pubkey, SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject, HealthFile: healthFile, Authorization: authz, Publication: publication})
 	}}
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to subscribe/publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
+	cmd.Flags().StringSliceVar(&ledgerRelays, "ledger-relay", nil, "Required ledger relay(s), repeatable; defaults to --relay or NOSTRIG_LEDGER_RELAYS")
+	cmd.Flags().StringSliceVar(&mirrorRelays, "mirror-relay", nil, "Optional mirror relay(s), repeatable; also reads NOSTRIG_MIRROR_RELAYS")
 	cmd.Flags().StringSliceVar(&repoAddrs, "repo-addr", nil, "Allowed canonical repository address(es), repeatable; falls back to NOSTRIG_REPO_ADDR/NOSTRIG_REPO_ADDRS")
 	cmd.Flags().StringVar(&pubkey, "pubkey", "", "Server recipient pubkey; defaults to signer pubkey when available")
 	cmd.Flags().BoolVar(&syncNIP34Status, "sync-nip34-status", false, "Opt-in: publish NIP-34 issue status events when linked tasks change")
 	cmd.Flags().StringVar(&qualityProject, "quality-project", "", "Optional PSTF project tag used to scope quality status/audit events")
 	cmd.Flags().StringVar(&healthFile, "health-file", "", "Touch this liveness file while serve is running")
 	cmd.Flags().StringVar(&aclFile, "acl-file", "", "Caller ACL JSON file; defaults to NOSTRIG_ACL_FILE")
+	cmd.Flags().IntVar(&ackQuorum, "relay-ack-quorum", 0, "Required-relay acknowledgements needed; 0 means all required relays")
+	cmd.Flags().StringVar(&outboxPath, "outbox-path", outboxPath, "Durable outbound spool; defaults to NOSTRIG_OUTBOX_PATH")
+	cmd.Flags().DurationVar(&publishTimeout, "relay-publish-timeout", 10*time.Second, "Per-relay publication timeout")
+	cmd.Flags().DurationVar(&retryBaseBackoff, "relay-retry-base", time.Second, "Initial relay retry backoff")
+	cmd.Flags().DurationVar(&retryMaxBackoff, "relay-retry-max", time.Minute, "Maximum relay retry backoff")
+	cmd.Flags().IntVar(&retryMaxAttempts, "relay-retry-attempts", 10, "Attempts per relay before dead-lettering")
+	cmd.Flags().IntVar(&circuitFailureLimit, "relay-circuit-failures", 3, "Consecutive failures before opening a relay circuit")
+	cmd.Flags().DurationVar(&circuitCooldown, "relay-circuit-cooldown", 30*time.Second, "Relay circuit-breaker cooldown")
+	cmd.Flags().DurationVar(&outboxDrainInterval, "outbox-drain-interval", time.Second, "How often to drain due outbox deliveries")
 	addSigningFlags(cmd, &signing)
 	return cmd
 }

@@ -40,7 +40,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-`docker-compose.yml` sets `NOSTRIG_ENV=production`, uses `restart: unless-stopped`, mounts the client key as a Compose secret, and checks the freshness of `/tmp/nostrig/healthy`. Multiple repository addresses may be comma-separated in `NOSTRIG_REPO_ADDRS`.
+`docker-compose.yml` sets `NOSTRIG_ENV=production`, uses `restart: unless-stopped`, mounts the client key as a Compose secret, persists the signed-event outbox in the `nostrig-state` volume, and checks the freshness of `/tmp/nostrig/healthy`. Multiple repository addresses may be comma-separated in `NOSTRIG_REPO_ADDRS`.
 
 Useful checks:
 
@@ -67,13 +67,28 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now nostrig-serve@fleet
 ```
 
-The unit defaults `NOSTR_RELAY` to the fleet relay, loads the client key with systemd credentials, restarts on failure, and writes liveness to `/run/nostrig-fleet/healthy`.
+The unit defaults `NOSTR_RELAY` to the fleet relay, loads the client key with systemd credentials, restarts on failure, persists the signed-event outbox in `/var/lib/nostrig-fleet/outbox.json`, and writes liveness to `/run/nostrig-fleet/healthy`.
 
 ```bash
 systemctl status nostrig-serve@fleet
 journalctl -u nostrig-serve@fleet -f
 find /run/nostrig-fleet/healthy -mmin -2 -type f
 ```
+
+## Relay quorum and outbox recovery
+
+Use `--ledger-relay` for authoritative relays and `--mirror-relay` for optional copies. `--relay-ack-quorum` counts only ledger-relay acknowledgements; when it is zero, every configured ledger relay is required. Mirror failures never turn an otherwise quorate write into a command failure, but the signed event remains queued until every target acknowledges it or reaches `--relay-retry-attempts`.
+
+The outbox drains immediately when `nostrig serve` restarts. Each retry republishes the original signed event ID and skips relays that already acknowledged it. Inspect pending and dead-lettered entries, then return selected or all dead letters to the retry queue with:
+
+```bash
+nostrig outbox list --path /var/lib/nostrig-fleet/outbox.json
+nostrig outbox dlq --path /var/lib/nostrig-fleet/outbox.json
+nostrig outbox retry --path /var/lib/nostrig-fleet/outbox.json <event-id>
+nostrig outbox retry --path /var/lib/nostrig-fleet/outbox.json # retry all DLQ entries
+```
+
+The service publishes each relay attempt with a bounded timeout, exponential backoff with jitter, and a per-relay circuit breaker. Configure these with the `serve --help` retry, timeout, and circuit flags.
 
 ## Bahia service registration
 
