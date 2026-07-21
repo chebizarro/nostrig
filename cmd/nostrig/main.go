@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/chebizarro/nostrig/internal/converter"
+	"github.com/chebizarro/nostrig/internal/fabric"
 	"github.com/nbd-wtf/go-nostr/nip19"
 	"github.com/spf13/cobra"
 )
@@ -25,6 +27,52 @@ func newRootCmd() *cobra.Command {
 	}
 
 	cmd.AddCommand(newFetchCmd())
+	cmd.AddCommand(newServeCmd())
+	return cmd
+}
+
+func newServeCmd() *cobra.Command {
+	var relays []string
+	var bunkerURL, statePath string
+	var interval time.Duration
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Run the bidirectional bd/relay task-fabric adapter",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if len(relays) == 0 {
+				return fmt.Errorf("at least one --relay is required")
+			}
+			if bunkerURL == "" {
+				return fmt.Errorf("--signet-bunker is required (raw keys are not supported)")
+			}
+			if statePath == "" {
+				return fmt.Errorf("--state is required")
+			}
+			signer, err := fabric.NewBunkerSigner(cmd.Context(), bunkerURL)
+			if err != nil {
+				return err
+			}
+			pubkey, err := signer.PublicKey(cmd.Context())
+			if err != nil {
+				return err
+			}
+			relayPublishers := make([]fabric.Relay, 0, len(relays))
+			for _, url := range relays {
+				relayPublishers = append(relayPublishers, fabric.WebsocketRelay{URL: url})
+			}
+			service := &fabric.Service{
+				Store:     &fabric.JSONStore{Path: statePath},
+				Source:    &fabric.RelaySource{Relays: relays},
+				Publisher: &fabric.Publisher{Signer: signer, Relays: relayPublishers},
+				PubKey:    pubkey, Interval: interval,
+			}
+			return service.Run(cmd.Context())
+		},
+	}
+	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s)")
+	cmd.Flags().StringVar(&bunkerURL, "signet-bunker", "", "Signet NIP-46 bunker URL")
+	cmd.Flags().StringVar(&statePath, "state", ".beads/fabric-state.json", "Durable protobuf-JSON ledger path")
+	cmd.Flags().DurationVar(&interval, "interval", 15*time.Second, "Relay reconciliation interval")
 	return cmd
 }
 
