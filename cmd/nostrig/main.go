@@ -72,6 +72,7 @@ func newPublishCmd() *cobra.Command {
 	var relays []string
 	var idFormat string
 	var idPrefix string
+	var canonicalAuthor string
 	var signing signingOptions
 
 	publishCmd := &cobra.Command{
@@ -88,17 +89,27 @@ func newPublishCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			events, err := nip34.BuildCanonicalEvents(result.Export, time.Now().UTC())
+			signer, _, err := signerFromOptions(ctx, signing, !signing.dryRun)
+			if err != nil {
+				return err
+			}
+			author := strings.ToLower(strings.TrimSpace(canonicalAuthor))
+			if signer != nil {
+				signerAuthor, err := publicKeyFromSigner(ctx, signer)
+				if err != nil {
+					return err
+				}
+				if author != "" && author != strings.ToLower(signerAuthor) {
+					return fmt.Errorf("--canonical-author does not match signer pubkey")
+				}
+				author = strings.ToLower(signerAuthor)
+			}
+			events, err := nip34.BuildCanonicalEvents(result.Export, author, time.Now().UTC())
 			if err != nil {
 				return err
 			}
 			if len(events) == 0 {
 				return fmt.Errorf("no canonical events generated")
-			}
-
-			signer, _, err := signerFromOptions(ctx, signing, !signing.dryRun)
-			if err != nil {
-				return err
 			}
 			if signing.dryRun {
 				if signer != nil {
@@ -118,6 +129,7 @@ func newPublishCmd() *cobra.Command {
 	}
 
 	addFetchFlags(publishCmd, &repoID, &owner, &relays, &idFormat, &idPrefix)
+	publishCmd.Flags().StringVar(&canonicalAuthor, "canonical-author", "", "Canonical ledger author pubkey; defaults to signer pubkey")
 	addSigningFlags(publishCmd, &signing)
 	return publishCmd
 }
@@ -181,6 +193,7 @@ func newSyncCmd() *cobra.Command {
 
 func newMigrateCmd() *cobra.Command {
 	var outDir string
+	var canonicalAuthor string
 	var relays []string
 	var signing signingOptions
 	cmd := &cobra.Command{
@@ -191,7 +204,18 @@ func newMigrateCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			result, err := taskfabric.Migrate(cmd.Context(), taskfabric.MigrateOptions{OutDir: outDir, Relays: relaysWithEnv(relays), Signer: signer, DryRun: signing.dryRun})
+			author := strings.ToLower(strings.TrimSpace(canonicalAuthor))
+			if signer != nil {
+				signerAuthor, err := publicKeyFromSigner(cmd.Context(), signer)
+				if err != nil {
+					return err
+				}
+				if author != "" && author != strings.ToLower(signerAuthor) {
+					return fmt.Errorf("--canonical-author does not match signer pubkey")
+				}
+				author = strings.ToLower(signerAuthor)
+			}
+			result, err := taskfabric.Migrate(cmd.Context(), taskfabric.MigrateOptions{OutDir: outDir, CanonicalAuthor: author, Relays: relaysWithEnv(relays), Signer: signer, DryRun: signing.dryRun})
 			if err != nil {
 				return err
 			}
@@ -203,6 +227,7 @@ func newMigrateCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&outDir, "out", ".", "Directory containing .beads/issues.jsonl and optional epics.jsonl")
+	cmd.Flags().StringVar(&canonicalAuthor, "canonical-author", "", "Canonical ledger author pubkey; defaults to signer pubkey")
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
 	addSigningFlags(cmd, &signing)
 	return cmd
@@ -607,7 +632,7 @@ func newQueueCmd() *cobra.Command {
 }
 
 func newQueueEnqueueCmd() *cobra.Command {
-	var queue, taskID, recipient string
+	var repoAddr, queue, taskID, recipient string
 	var relays []string
 	var signing signingOptions
 	var response responseOptions
@@ -618,12 +643,16 @@ func newQueueEnqueueCmd() *cobra.Command {
 		if strings.TrimSpace(recipient) == "" {
 			return fmt.Errorf("--recipient is required")
 		}
-		ev, err := nip34.BuildQueueEnqueueCommand(queue, taskID, recipient, time.Now().UTC())
+		if strings.TrimSpace(repoAddr) == "" {
+			return fmt.Errorf("--repo-addr is required")
+		}
+		ev, err := nip34.BuildQueueEnqueueCommandForRepo(repoAddr, queue, taskID, recipient, time.Now().UTC())
 		if err != nil {
 			return err
 		}
 		return publishContextVMCommand(cmd, ev, relays, signing, response, fmt.Sprintf("published enqueue for %s", taskID))
 	}}
+	cmd.Flags().StringVar(&repoAddr, "repo-addr", "", "Canonical repository address (required)")
 	cmd.Flags().StringVar(&queue, "queue", "backlog", "Queue name")
 	cmd.Flags().StringVar(&taskID, "task-id", "", "Task id to enqueue (required)")
 	cmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
@@ -634,7 +663,7 @@ func newQueueEnqueueCmd() *cobra.Command {
 }
 
 func newQueueDequeueCmd() *cobra.Command {
-	var queue, recipient string
+	var repoAddr, queue, recipient string
 	var relays []string
 	var signing signingOptions
 	var response responseOptions
@@ -642,12 +671,16 @@ func newQueueDequeueCmd() *cobra.Command {
 		if strings.TrimSpace(recipient) == "" {
 			return fmt.Errorf("--recipient is required")
 		}
-		ev, err := nip34.BuildQueueDequeueCommand(queue, recipient, time.Now().UTC())
+		if strings.TrimSpace(repoAddr) == "" {
+			return fmt.Errorf("--repo-addr is required")
+		}
+		ev, err := nip34.BuildQueueDequeueCommandForRepo(repoAddr, queue, recipient, time.Now().UTC())
 		if err != nil {
 			return err
 		}
 		return publishContextVMCommand(cmd, ev, relays, signing, response, fmt.Sprintf("published dequeue for %s", queue))
 	}}
+	cmd.Flags().StringVar(&repoAddr, "repo-addr", "", "Canonical repository address (required)")
 	cmd.Flags().StringVar(&queue, "queue", "backlog", "Queue name")
 	cmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
@@ -657,7 +690,7 @@ func newQueueDequeueCmd() *cobra.Command {
 }
 
 func newQueueListCmd() *cobra.Command {
-	var queue, recipient string
+	var repoAddr, queue, recipient string
 	var relays []string
 	var signing signingOptions
 	var response responseOptions
@@ -665,12 +698,16 @@ func newQueueListCmd() *cobra.Command {
 		if strings.TrimSpace(recipient) == "" {
 			return fmt.Errorf("--recipient is required")
 		}
-		ev, err := nip34.BuildQueueListCommand(queue, recipient, time.Now().UTC())
+		if strings.TrimSpace(repoAddr) == "" {
+			return fmt.Errorf("--repo-addr is required")
+		}
+		ev, err := nip34.BuildQueueListCommandForRepo(repoAddr, queue, recipient, time.Now().UTC())
 		if err != nil {
 			return err
 		}
 		return publishContextVMCommand(cmd, ev, relays, signing, response, fmt.Sprintf("published list for %s", queue))
 	}}
+	cmd.Flags().StringVar(&repoAddr, "repo-addr", "", "Canonical repository address (required)")
 	cmd.Flags().StringVar(&queue, "queue", "backlog", "Queue name")
 	cmd.Flags().StringVar(&recipient, "recipient", "", "ContextVM recipient pubkey (required)")
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
@@ -687,12 +724,24 @@ func newServeCmd() *cobra.Command {
 	var syncNIP34Status bool
 	var qualityProject string
 	var healthFile string
+	var aclFile string
 	cmd := &cobra.Command{Use: "serve", Short: "Serve incoming ContextVM task and queue intents", RunE: func(cmd *cobra.Command, args []string) error {
 		signer, _, err := signerFromOptions(cmd.Context(), signing, true)
 		if err != nil {
 			return err
 		}
-		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), RepoAddrs: repoAddrsWithEnv(repoAddrs), Signer: signer, PubKey: pubkey, SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject, HealthFile: healthFile})
+		path := strings.TrimSpace(aclFile)
+		if path == "" {
+			path = strings.TrimSpace(os.Getenv("NOSTRIG_ACL_FILE"))
+		}
+		if path == "" {
+			return fmt.Errorf("--acl-file or NOSTRIG_ACL_FILE is required")
+		}
+		authz, err := taskfabric.LoadAuthorizationConfig(path)
+		if err != nil {
+			return err
+		}
+		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), RepoAddrs: repoAddrsWithEnv(repoAddrs), Signer: signer, PubKey: pubkey, SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject, HealthFile: healthFile, Authorization: authz})
 	}}
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to subscribe/publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
 	cmd.Flags().StringSliceVar(&repoAddrs, "repo-addr", nil, "Allowed canonical repository address(es), repeatable; falls back to NOSTRIG_REPO_ADDR/NOSTRIG_REPO_ADDRS")
@@ -700,6 +749,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&syncNIP34Status, "sync-nip34-status", false, "Opt-in: publish NIP-34 issue status events when linked tasks change")
 	cmd.Flags().StringVar(&qualityProject, "quality-project", "", "Optional PSTF project tag used to scope quality status/audit events")
 	cmd.Flags().StringVar(&healthFile, "health-file", "", "Touch this liveness file while serve is running")
+	cmd.Flags().StringVar(&aclFile, "acl-file", "", "Caller ACL JSON file; defaults to NOSTRIG_ACL_FILE")
 	addSigningFlags(cmd, &signing)
 	return cmd
 }

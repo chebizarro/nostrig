@@ -43,12 +43,24 @@ func (testServeSigner) SignEvent(_ context.Context, event *gonostr.Event) error 
 	}
 	return nil
 }
-func (testServeSigner) Encrypt(context.Context, string, gonostr.PubKey) (string, error)      { return "", nil }
-func (testServeSigner) Decrypt(context.Context, string, gonostr.PubKey) (string, error)      { return "", nil }
-func (testServeSigner) Nip04Encrypt(context.Context, string, gonostr.PubKey) (string, error) { return "", nil }
-func (testServeSigner) Nip04Decrypt(context.Context, string, gonostr.PubKey) (string, error) { return "", nil }
-func (testServeSigner) GetPublicKey(context.Context) (gonostr.PubKey, error)                  { return testPubKey(9), nil }
-func (testServeSigner) PublicKey(context.Context) (string, error)                              { return fmt.Sprintf("%064x", 9), nil }
+func (testServeSigner) Encrypt(context.Context, string, gonostr.PubKey) (string, error) {
+	return "", nil
+}
+func (testServeSigner) Decrypt(context.Context, string, gonostr.PubKey) (string, error) {
+	return "", nil
+}
+func (testServeSigner) Nip04Encrypt(context.Context, string, gonostr.PubKey) (string, error) {
+	return "", nil
+}
+func (testServeSigner) Nip04Decrypt(context.Context, string, gonostr.PubKey) (string, error) {
+	return "", nil
+}
+func (testServeSigner) GetPublicKey(context.Context) (gonostr.PubKey, error) {
+	return testPubKey(1), nil
+}
+func (testServeSigner) PublicKey(context.Context) (string, error) {
+	return fmt.Sprintf("%064x", 1), nil
+}
 
 type errPublisher struct{ err error }
 
@@ -64,10 +76,11 @@ func (m *memoryLedger) GetTask(ctx context.Context, id string) (*beadspb.Issue, 
 }
 func (m *memoryLedger) PutTask(ctx context.Context, issue *beadspb.Issue) (*gonostr.Event, error) {
 	m.tasks[issue.Id] = issue
-	ev, err := nip34.BuildTaskStateEvent(issue, time.Unix(10, 0))
+	ev, err := nip34.BuildTaskStateEvent(issue, testPubKey(1).Hex(), time.Unix(10, 0))
 	if err != nil {
 		return nil, err
 	}
+	ev.PubKey = testPubKey(1)
 	m.lastTaskEvent = ev
 	return ev, nil
 }
@@ -76,17 +89,37 @@ func (m *memoryLedger) DeleteTask(ctx context.Context, id string) (*gonostr.Even
 	delete(m.tasks, id)
 	return &gonostr.Event{ID: testID(12), Kind: gonostr.Kind(5)}, nil
 }
-func (m *memoryLedger) GetQueue(ctx context.Context, queue string) ([]string, error) {
-	return append([]string(nil), m.queues[queue]...), nil
+func (m *memoryLedger) GetQueue(ctx context.Context, repoAddr, queue string) ([]string, error) {
+	return append([]string(nil), m.queues[repoAddr+"|"+queue]...), nil
 }
-func (m *memoryLedger) PutQueue(ctx context.Context, queue string, ids []string) (*gonostr.Event, error) {
-	m.queues[queue] = append([]string(nil), ids...)
+func (m *memoryLedger) PutQueue(ctx context.Context, repoAddr, queue string, ids []string) (*gonostr.Event, error) {
+	m.queues[repoAddr+"|"+queue] = append([]string(nil), ids...)
 	return &gonostr.Event{ID: testID(11)}, nil
+}
+
+type discardAudit struct{}
+
+func (discardAudit) Record(context.Context, AuthzAuditRecord) error { return nil }
+
+func testHandler(ledger Ledger) *Handler {
+	caller := testPubKey(1).Hex()
+	return &Handler{
+		Ledger: ledger,
+		ACL:    map[string]CallerPolicy{caller: {Roles: []Role{RoleAdmin}, Repositories: []string{"*"}}},
+		Audit:  discardAudit{},
+	}
+}
+
+func testAuthorization() AuthorizationConfig {
+	caller := testPubKey(1).Hex()
+	return AuthorizationConfig{Callers: map[string]CallerPolicy{
+		caller: {Roles: []Role{RoleAdmin}, Repositories: []string{"30617:owner:repo"}},
+	}}
 }
 
 func TestTaskCreateUpdateDeleteIntentRoundTrip(t *testing.T) {
 	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{}, queues: map[string][]string{}}
-	h := &Handler{Ledger: ledger}
+	h := testHandler(ledger)
 	now := time.Unix(2, 0)
 
 	create, _ := nip34.BuildContextVMCommand("task/create", "server", map[string]any{
@@ -134,7 +167,7 @@ func TestTaskCreateUpdateDeleteIntentRoundTrip(t *testing.T) {
 
 func TestTaskClaimIntentUpdatesTaskStateAndReturnsResult(t *testing.T) {
 	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{"task-1": {Id: "task-1", Title: "claim me", Status: beadspb.Status_STATUS_OPEN}}, queues: map[string][]string{}}
-	h := &Handler{Ledger: ledger}
+	h := testHandler(ledger)
 	req, _ := nip34.BuildContextVMCommand("task/claim", "server", map[string]string{"task_id": "task-1", "claimer": "agent-a"}, time.Unix(1, 0))
 	req.ID, req.PubKey = testID(1), testPubKey(1)
 	resp, err := h.HandleIntent(context.Background(), req, time.Unix(2, 0))
@@ -157,7 +190,7 @@ func TestTaskClaimIntentUpdatesTaskStateAndReturnsResult(t *testing.T) {
 
 func TestTaskCloseIntentClosesTask(t *testing.T) {
 	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{"task-1": {Id: "task-1", Title: "close me", Status: beadspb.Status_STATUS_IN_PROGRESS}}, queues: map[string][]string{}}
-	h := &Handler{Ledger: ledger}
+	h := testHandler(ledger)
 	req, _ := nip34.BuildCloseCommand("task-1", "server", time.Unix(1, 0))
 	req.ID, req.PubKey = testID(1), testPubKey(1)
 	if _, err := h.HandleIntent(context.Background(), req, time.Unix(2, 0)); err != nil {
@@ -169,14 +202,14 @@ func TestTaskCloseIntentClosesTask(t *testing.T) {
 }
 
 func TestQueueEnqueueDequeueRoundTrip(t *testing.T) {
-	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{}, queues: map[string][]string{}}
-	h := &Handler{Ledger: ledger}
-	enq, _ := nip34.BuildQueueEnqueueCommand("backlog", "task-1", "server", time.Unix(1, 0))
+	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{"task-1": {Id: "task-1", Title: "queued", Metadata: &beadspb.Metadata{Custom: map[string]string{"nip34.repo_addr": "30617:owner:repo"}}}}, queues: map[string][]string{}}
+	h := testHandler(ledger)
+	enq, _ := nip34.BuildQueueEnqueueCommandForRepo("30617:owner:repo", "backlog", "task-1", "server", time.Unix(1, 0))
 	enq.ID, enq.PubKey = testID(2), testPubKey(1)
 	if _, err := h.HandleIntent(context.Background(), enq, time.Unix(2, 0)); err != nil {
 		t.Fatal(err)
 	}
-	deq, _ := nip34.BuildQueueDequeueCommand("backlog", "server", time.Unix(3, 0))
+	deq, _ := nip34.BuildQueueDequeueCommandForRepo("30617:owner:repo", "backlog", "server", time.Unix(3, 0))
 	deq.ID, deq.PubKey = testID(3), testPubKey(1)
 	resp, err := h.HandleIntent(context.Background(), deq, time.Unix(4, 0))
 	if err != nil {
@@ -188,15 +221,16 @@ func TestQueueEnqueueDequeueRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(resp.Content), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Result["task_id"] != "task-1" || len(ledger.queues["backlog"]) != 0 {
-		t.Fatalf("unexpected dequeue result=%s queue=%#v", resp.Content, ledger.queues["backlog"])
+	if body.Result["task_id"] != "task-1" || len(ledger.queues["30617:owner:repo|backlog"]) != 0 {
+		t.Fatalf("unexpected dequeue result=%s queue=%#v", resp.Content, ledger.queues["30617:owner:repo|backlog"])
 	}
 }
 
 func TestTaskDeleteRequiresSuccessfulRepoLookupWhenScoped(t *testing.T) {
 	lookupErr := errors.New("relay lookup failed")
 	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{}, queues: map[string][]string{}, getTaskErr: lookupErr}
-	h := &Handler{Ledger: ledger, RepoAddrs: []string{"30617:owner:repo"}}
+	h := testHandler(ledger)
+	h.RepoAddrs = []string{"30617:owner:repo"}
 	req, _ := nip34.BuildContextVMCommand("task/delete", "server", map[string]string{"task_id": "task-1"}, time.Unix(1, 0))
 	req.ID, req.PubKey = testID(4), testPubKey(1)
 	resp, err := h.HandleIntent(context.Background(), req, time.Unix(2, 0))
@@ -217,6 +251,28 @@ func TestTaskDeleteRequiresSuccessfulRepoLookupWhenScoped(t *testing.T) {
 	}
 }
 
+func TestValidateIntentRejectsSignatureRecipientAndMethodMismatch(t *testing.T) {
+	recipient := testPubKey(1).Hex()
+	ev, err := nip34.BuildContextVMCommand("task/create", recipient, map[string]any{"repo_addr": "30617:owner:repo", "task_id": "task-1", "title": "new"}, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateIntent(ev, recipient, func(*gonostr.Event) bool { return false }); err == nil {
+		t.Fatal("expected invalid signature rejection")
+	}
+	if err := validateIntent(ev, testPubKey(8).Hex(), func(*gonostr.Event) bool { return true }); err == nil {
+		t.Fatal("expected recipient mismatch rejection")
+	}
+	for _, tag := range ev.Tags {
+		if len(tag) >= 2 && tag[0] == "method" {
+			tag[1] = "task/delete"
+		}
+	}
+	if err := validateIntent(ev, recipient, func(*gonostr.Event) bool { return true }); err == nil {
+		t.Fatal("expected method tag mismatch rejection")
+	}
+}
+
 func TestServeRequiresRepoAddrInProduction(t *testing.T) {
 	t.Setenv("NOSTRIG_ENV", "production")
 	err := Serve(context.Background(), ServeOptions{Relays: []string{"wss://relay.example"}})
@@ -232,10 +288,12 @@ func TestServeReportsUnwrapFailureAndContinuesUntilCanceled(t *testing.T) {
 	ch <- gonostr.RelayEvent{Event: gonostr.Event{ID: testID(20), Kind: gonostr.Kind(cascadia.NIP59_GIFT_WRAP)}}
 	var stages []string
 	err := Serve(ctx, ServeOptions{
-		Relays: []string{"wss://relay.example"},
-		Signer: testServeSigner{},
-		PubKey: fmt.Sprintf("%064x", 9),
-		subscribe: func(ctx context.Context, relays []string, filter gonostr.Filter) <-chan gonostr.RelayEvent { return ch },
+		Relays:        []string{"wss://relay.example"},
+		Signer:        testServeSigner{},
+		PubKey:        fmt.Sprintf("%064x", 1),
+		Authorization: testAuthorization(),
+		verify:        func(*gonostr.Event) bool { return true },
+		subscribe:     func(ctx context.Context, relays []string, filter gonostr.Filter) <-chan gonostr.RelayEvent { return ch },
 		unwrap: func(ctx context.Context, signer casnostr.Signer, outer *gonostr.Event) (*gonostr.Event, error) {
 			cancel()
 			return nil, errors.New("boom")
@@ -252,19 +310,21 @@ func TestServeReportsUnwrapFailureAndContinuesUntilCanceled(t *testing.T) {
 
 func TestServeReturnsPlainPublishError(t *testing.T) {
 	ch := make(chan gonostr.RelayEvent, 1)
-	req, _ := nip34.BuildContextVMCommand("task/create", "server", map[string]any{"task_id": "task-1", "title": "created", "repo_addr": "30617:owner:repo"}, time.Unix(1, 0))
+	req, _ := nip34.BuildContextVMCommand("task/create", fmt.Sprintf("%064x", 1), map[string]any{"task_id": "task-1", "title": "created", "repo_addr": "30617:owner:repo"}, time.Unix(1, 0))
 	req.ID, req.PubKey = testID(21), testPubKey(1)
 	ch <- gonostr.RelayEvent{Event: *req}
 	publishErr := errors.New("publish failed")
 	var stages []string
 	err := Serve(context.Background(), ServeOptions{
-		Relays: []string{"wss://relay.example"},
-		RepoAddrs: []string{"30617:owner:repo"},
-		Signer: testServeSigner{},
-		PubKey: fmt.Sprintf("%064x", 9),
-		subscribe: func(ctx context.Context, relays []string, filter gonostr.Filter) <-chan gonostr.RelayEvent { return ch },
+		Relays:            []string{"wss://relay.example"},
+		RepoAddrs:         []string{"30617:owner:repo"},
+		Signer:            testServeSigner{},
+		PubKey:            fmt.Sprintf("%064x", 1),
+		Authorization:     testAuthorization(),
+		verify:            func(*gonostr.Event) bool { return true },
+		subscribe:         func(ctx context.Context, relays []string, filter gonostr.Filter) <-chan gonostr.RelayEvent { return ch },
 		responsePublisher: errPublisher{err: publishErr},
-		reportError: func(stage string, err error, event *gonostr.Event) { stages = append(stages, stage) },
+		reportError:       func(stage string, err error, event *gonostr.Event) { stages = append(stages, stage) },
 	})
 	if !errors.Is(err, publishErr) {
 		t.Fatalf("expected publish error, got %v", err)
@@ -277,16 +337,18 @@ func TestServeReturnsPlainPublishError(t *testing.T) {
 func TestServeReturnsWrappedPublishError(t *testing.T) {
 	ch := make(chan gonostr.RelayEvent, 1)
 	ch <- gonostr.RelayEvent{Event: gonostr.Event{ID: testID(22), Kind: gonostr.Kind(cascadia.NIP59_GIFT_WRAP)}}
-	inner, _ := nip34.BuildContextVMCommand("task/create", "server", map[string]any{"task_id": "task-1", "title": "created", "repo_addr": "30617:owner:repo"}, time.Unix(1, 0))
+	inner, _ := nip34.BuildContextVMCommand("task/create", fmt.Sprintf("%064x", 1), map[string]any{"task_id": "task-1", "title": "created", "repo_addr": "30617:owner:repo"}, time.Unix(1, 0))
 	inner.PubKey = testPubKey(1)
 	publishErr := errors.New("wrapped publish failed")
 	var stages []string
 	err := Serve(context.Background(), ServeOptions{
-		Relays: []string{"wss://relay.example"},
-		RepoAddrs: []string{"30617:owner:repo"},
-		Signer: testServeSigner{},
-		PubKey: fmt.Sprintf("%064x", 9),
-		subscribe: func(ctx context.Context, relays []string, filter gonostr.Filter) <-chan gonostr.RelayEvent { return ch },
+		Relays:        []string{"wss://relay.example"},
+		RepoAddrs:     []string{"30617:owner:repo"},
+		Signer:        testServeSigner{},
+		PubKey:        fmt.Sprintf("%064x", 1),
+		Authorization: testAuthorization(),
+		verify:        func(*gonostr.Event) bool { return true },
+		subscribe:     func(ctx context.Context, relays []string, filter gonostr.Filter) <-chan gonostr.RelayEvent { return ch },
 		unwrap: func(ctx context.Context, signer casnostr.Signer, outer *gonostr.Event) (*gonostr.Event, error) {
 			return inner, nil
 		},
@@ -294,7 +356,7 @@ func TestServeReturnsWrappedPublishError(t *testing.T) {
 			return &gonostr.Event{ID: testID(23), Kind: gonostr.Kind(cascadia.NIP59_GIFT_WRAP)}, nil
 		},
 		publishWrapped: func(ctx context.Context, relays []string, outer *gonostr.Event) error { return publishErr },
-		reportError: func(stage string, err error, event *gonostr.Event) { stages = append(stages, stage) },
+		reportError:    func(stage string, err error, event *gonostr.Event) { stages = append(stages, stage) },
 	})
 	if !errors.Is(err, publishErr) {
 		t.Fatalf("expected wrapped publish error, got %v", err)

@@ -68,9 +68,10 @@ func (s staticQuality) GetQuality(ctx context.Context, taskIDs []string) (map[st
 }
 
 func TestQueueListAnnotatesQuality(t *testing.T) {
-	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{}, queues: map[string][]string{"backlog": []string{"task-1"}}}
-	h := &Handler{Ledger: ledger, Quality: staticQuality{values: map[string]QualityResult{"task-1": {State: QualityFailing, Result: "fail", Reason: "drift"}}}}
-	req, _ := nip34.BuildQueueListCommand("backlog", "server", time.Unix(1, 0))
+	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{}, queues: map[string][]string{"30617:owner:repo|backlog": {"task-1"}}}
+	h := testHandler(ledger)
+	h.Quality = staticQuality{values: map[string]QualityResult{"task-1": {State: QualityFailing, Result: "fail", Reason: "drift"}}}
+	req, _ := nip34.BuildQueueListCommandForRepo("30617:owner:repo", "backlog", "server", time.Unix(1, 0))
 	req.ID, req.PubKey = testID(32), testPubKey(1)
 	resp, err := h.HandleIntent(context.Background(), req, time.Unix(2, 0))
 	if err != nil {
@@ -90,9 +91,11 @@ func TestQueueListAnnotatesQuality(t *testing.T) {
 }
 
 func TestTaskQualityStatusIntentReturnsQualityForIDs(t *testing.T) {
-	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{}, queues: map[string][]string{}}
-	h := &Handler{Ledger: ledger, Quality: staticQuality{values: map[string]QualityResult{"task-1": {State: QualityPassing, Result: "pass"}}}}
-	req, _ := nip34.BuildContextVMCommand("task/quality-status", "server", map[string]any{"task_ids": []string{"task-1", "task-2"}}, time.Unix(1, 0))
+	repoMeta := &beadspb.Metadata{Custom: map[string]string{"nip34.repo_addr": "30617:owner:repo"}}
+	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{"task-1": {Id: "task-1", Metadata: repoMeta}, "task-2": {Id: "task-2", Metadata: repoMeta}}, queues: map[string][]string{}}
+	h := testHandler(ledger)
+	h.Quality = staticQuality{values: map[string]QualityResult{"task-1": {State: QualityPassing, Result: "pass"}}}
+	req, _ := nip34.BuildContextVMCommand("task/quality-status", "server", map[string]any{"repo_addr": "30617:owner:repo", "task_ids": []string{"task-1", "task-2"}}, time.Unix(1, 0))
 	req.ID, req.PubKey = testID(33), testPubKey(1)
 	resp, err := h.HandleIntent(context.Background(), req, time.Unix(2, 0))
 	if err != nil {

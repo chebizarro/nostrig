@@ -21,6 +21,7 @@ type RelayLedger struct {
 	Relays          []string
 	Signer          nip34.Signer
 	Client          *nip34.Client
+	CanonicalAuthor string
 	SyncNIP34Status bool
 }
 
@@ -29,7 +30,7 @@ func (l *RelayLedger) GetTask(ctx context.Context, id string) (*beadspb.Issue, e
 	if id == "" {
 		return nil, fmt.Errorf("task id is required")
 	}
-	events, err := FetchTaskStateEvents(ctx, l.client(), SyncOptions{Relays: l.Relays, TaskIDs: []string{id}, Limit: 10})
+	events, err := FetchTaskStateEvents(ctx, l.client(), SyncOptions{Relays: l.Relays, TaskIDs: []string{id}, Authors: []string{l.CanonicalAuthor}, Limit: 10})
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +48,7 @@ func (l *RelayLedger) GetTask(ctx context.Context, id string) (*beadspb.Issue, e
 
 func (l *RelayLedger) PutTask(ctx context.Context, issue *beadspb.Issue) (*gonostr.Event, error) {
 	now := time.Now().UTC()
-	ev, err := nip34.BuildTaskStateEvent(issue, now)
+	ev, err := nip34.BuildTaskStateEvent(issue, l.CanonicalAuthor, now)
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +66,7 @@ func (l *RelayLedger) DeleteTask(ctx context.Context, id string) (*gonostr.Event
 	if id == "" {
 		return nil, fmt.Errorf("task id is required")
 	}
-	events, err := FetchTaskStateEvents(ctx, l.client(), SyncOptions{Relays: l.Relays, TaskIDs: []string{id}, Limit: 10})
+	events, err := FetchTaskStateEvents(ctx, l.client(), SyncOptions{Relays: l.Relays, TaskIDs: []string{id}, Authors: []string{l.CanonicalAuthor}, Limit: 10})
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +76,10 @@ func (l *RelayLedger) DeleteTask(ctx context.Context, id string) (*gonostr.Event
 		if d != "task:"+id {
 			continue
 		}
-		if latest == nil || nip34.EventTime(candidate).After(nip34.EventTime(latest)) {
+		if candidate.PubKey.Hex() != strings.ToLower(strings.TrimSpace(l.CanonicalAuthor)) {
+			continue
+		}
+		if latest == nil || eventAfter(candidate, latest) {
 			latest = candidate
 		}
 	}
@@ -85,44 +89,71 @@ func (l *RelayLedger) DeleteTask(ctx context.Context, id string) (*gonostr.Event
 		// command replay must treat an already-absent task as success.
 		return nil, nil
 	}
-	tags := gonostr.Tags{{"e", latest.ID.Hex()}, {"k", fmt.Sprintf("%d", nip34.KindCanonicalState)}}
-	tags = append(tags, gonostr.Tag{"a", fmt.Sprintf("%d:%s:task:%s", nip34.KindCanonicalState, latest.PubKey.Hex(), id)})
-	ev := &gonostr.Event{Kind: gonostr.Kind(5), CreatedAt: gonostr.Now(), Tags: tags, Content: "delete task " + id}
+	issue, err := nip34.ParseTaskStateEvent(latest)
+	if err != nil {
+		return nil, err
+	}
+	repoAddr := issue.GetMetadata().GetCustom()["nip34.repo_addr"]
+	ev, err := nip34.BuildTaskTombstone(latest, repoAddr, l.CanonicalAuthor, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
 	return l.publishOne(ctx, ev)
 }
 
-func (l *RelayLedger) GetQueue(ctx context.Context, queue string) ([]string, error) {
+func (l *RelayLedger) GetQueue(ctx context.Context, repoAddr, queue string) ([]string, error) {
+	repoAddr = strings.TrimSpace(repoAddr)
+	if repoAddr == "" {
+		return nil, fmt.Errorf("repo addr is required")
+	}
 	queue = queueName(queue)
 	relays := cleanStrings(l.Relays)
 	if len(relays) == 0 {
 		return nil, fmt.Errorf("at least one relay is required")
 	}
-	f := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindNamedList)}, Tags: gonostr.TagMap{"d": []string{"queue:" + queue}}, Limit: 20}
+	author, err := gonostr.PubKeyFromHex(strings.TrimSpace(l.CanonicalAuthor))
+	if err != nil {
+		return nil, fmt.Errorf("canonical author is required")
+	}
+	f := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindNamedList)}, Authors: []gonostr.PubKey{author}, Tags: gonostr.TagMap{"d": []string{queueIdentifier(repoAddr, queue)}, "a": []string{repoAddr}}, Limit: 20}
 	events, err := l.client().Fetch(ctx, relays, f)
 	if err != nil {
 		return nil, err
 	}
 	var latest *gonostr.Event
+	expectedD := queueIdentifier(repoAddr, queue)
 	for _, ev := range events {
-		if latest == nil || nip34.EventTime(ev).After(nip34.EventTime(latest)) {
+		if ev == nil || ev.PubKey.Hex() != strings.ToLower(strings.TrimSpace(l.CanonicalAuthor)) {
+			continue
+		}
+		d, _ := nip34.TagD(ev)
+		schema, _ := nip34.TagFirst(ev, "schema")
+		if d != expectedD || schema != "cascadia.task-collection.v1" || !hasMarkedTag(ev, "a", repoAddr, "nip34-repo") {
+			return nil, fmt.Errorf("relay returned malformed queue state")
+		}
+		if latest == nil || eventAfter(ev, latest) {
 			latest = ev
 		}
 	}
 	if latest == nil {
 		return nil, nil
 	}
+	prefix := nip34.Address(nip34.KindCanonicalState, strings.ToLower(strings.TrimSpace(l.CanonicalAuthor)), "task:")
 	ids := []string{}
 	for _, tag := range latest.Tags {
-		if len(tag) >= 2 && tag[0] == "a" && strings.Contains(tag[1], "task:") {
-			parts := strings.Split(tag[1], "task:")
-			ids = append(ids, parts[len(parts)-1])
+		if len(tag) >= 2 && tag[0] == "a" && strings.HasPrefix(tag[1], prefix) {
+			id := strings.TrimPrefix(tag[1], prefix)
+			if id == "" {
+				return nil, fmt.Errorf("relay returned malformed queue task coordinate")
+			}
+			ids = append(ids, id)
 		}
 	}
 	return ids, nil
 }
 
-func (l *RelayLedger) PutQueue(ctx context.Context, queue string, ids []string) (*gonostr.Event, error) {
-	ev := nip34.BuildQueueCollectionEvent(queue, ids, time.Now().UTC())
+func (l *RelayLedger) PutQueue(ctx context.Context, repoAddr, queue string, ids []string) (*gonostr.Event, error) {
+	ev := nip34.BuildQueueCollectionEventForAuthor(repoAddr, queue, ids, l.CanonicalAuthor, time.Now().UTC())
 	return l.publishOne(ctx, ev)
 }
 
@@ -160,6 +191,8 @@ type serveWrappedPublisher func(ctx context.Context, relays []string, outer *gon
 
 type serveErrorReporter func(stage string, err error, event *gonostr.Event)
 
+type serveVerifier func(event *gonostr.Event) bool
+
 type ServeOptions struct {
 	Relays          []string
 	RepoAddrs       []string
@@ -168,13 +201,16 @@ type ServeOptions struct {
 	SyncNIP34Status bool
 	QualityProject  string
 	HealthFile      string
+	Authorization   AuthorizationConfig
+	Audit           AuthzAuditSink
 
-	subscribe       serveSubscriber
-	unwrap          serveUnwrapper
-	wrap            serveWrapper
-	publishWrapped  serveWrappedPublisher
+	subscribe         serveSubscriber
+	unwrap            serveUnwrapper
+	wrap              serveWrapper
+	publishWrapped    serveWrappedPublisher
 	responsePublisher EventPublisher
-	reportError     serveErrorReporter
+	reportError       serveErrorReporter
+	verify            serveVerifier
 }
 
 func Serve(ctx context.Context, opts ServeOptions) error {
@@ -189,26 +225,40 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if opts.Signer == nil {
 		return fmt.Errorf("signer is required")
 	}
-	pubkey := strings.TrimSpace(opts.PubKey)
-	if pubkey == "" {
-		if provider, ok := opts.Signer.(nip34.PublicKeyProvider); ok {
-			pk, err := provider.PublicKey(ctx)
-			if err != nil {
-				return err
-			}
-			pubkey = pk
+	if err := opts.Authorization.Validate(); err != nil {
+		return fmt.Errorf("invalid caller ACL: %w", err)
+	}
+	pubkey := strings.ToLower(strings.TrimSpace(opts.PubKey))
+	if provider, ok := opts.Signer.(nip34.PublicKeyProvider); ok {
+		signerPubKey, err := provider.PublicKey(ctx)
+		if err != nil {
+			return err
 		}
+		signerPubKey = strings.ToLower(strings.TrimSpace(signerPubKey))
+		if pubkey != "" && pubkey != signerPubKey {
+			return fmt.Errorf("serve pubkey does not match signer pubkey")
+		}
+		pubkey = signerPubKey
 	}
 	if pubkey == "" {
 		return fmt.Errorf("serve requires --pubkey when signer cannot provide one")
 	}
+	parsedPubKey, err := gonostr.PubKeyFromHex(pubkey)
+	if err != nil {
+		return fmt.Errorf("serve pubkey must be valid hex")
+	}
+	pubkey = parsedPubKey.Hex()
 	contextSigner, err := contextVMSigner(opts.Signer)
 	if err != nil {
 		return err
 	}
-	ledger := &RelayLedger{Relays: relays, Signer: opts.Signer, SyncNIP34Status: opts.SyncNIP34Status}
+	ledger := &RelayLedger{Relays: relays, Signer: opts.Signer, CanonicalAuthor: strings.ToLower(pubkey), SyncNIP34Status: opts.SyncNIP34Status}
 	quality := &RelayQualitySource{Relays: relays, Project: opts.QualityProject}
-	handler := &Handler{Ledger: ledger, Quality: quality, RepoAddrs: repoAddrs}
+	audit := opts.Audit
+	if audit == nil {
+		audit = NewJSONAuditSink(os.Stderr)
+	}
+	handler := &Handler{Ledger: ledger, Quality: quality, RepoAddrs: repoAddrs, Recipient: pubkey, ACL: opts.Authorization.Callers, ClosePolicy: opts.Authorization.ClosePolicy, Audit: audit}
 	subscribe := opts.subscribe
 	if subscribe == nil {
 		pool := gonostr.NewPool()
@@ -258,6 +308,10 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if reportError == nil {
 		reportError = defaultServeErrorReporter
 	}
+	verify := opts.verify
+	if verify == nil {
+		verify = func(event *gonostr.Event) bool { return casnostr.VerifyEvent((*casnostr.Event)(event)) }
+	}
 	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent), gonostr.Kind(cascadia.NIP59_GIFT_WRAP)}, Tags: gonostr.TagMap{"p": []string{pubkey}}}
 	ch := subscribe(ctx, relays, filter)
 	stopHealth, err := startHealthFile(ctx, opts.HealthFile)
@@ -274,7 +328,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 				return fmt.Errorf("subscription closed")
 			}
 			ev := ie.Event
-			if err := serveRelayEvent(ctx, relays, opts.Signer, contextSigner, handler, unwrap, wrap, publishWrapped, responsePublisher, reportError, &ev); err != nil {
+			if err := serveRelayEvent(ctx, relays, opts.Signer, contextSigner, handler, unwrap, wrap, publishWrapped, responsePublisher, reportError, verify, &ev); err != nil {
 				return err
 			}
 		}
@@ -332,12 +386,19 @@ func allowedMethod(ev *gonostr.Event) bool {
 	}
 }
 
-func serveRelayEvent(ctx context.Context, relays []string, signer nip34.Signer, contextSigner casnostr.Signer, handler *Handler, unwrap serveUnwrapper, wrap serveWrapper, publishWrapped serveWrappedPublisher, responsePublisher EventPublisher, reportError serveErrorReporter, event *gonostr.Event) error {
+func serveRelayEvent(ctx context.Context, relays []string, signer nip34.Signer, contextSigner casnostr.Signer, handler *Handler, unwrap serveUnwrapper, wrap serveWrapper, publishWrapped serveWrappedPublisher, responsePublisher EventPublisher, reportError serveErrorReporter, verify serveVerifier, event *gonostr.Event) error {
 	if event == nil {
 		return nil
 	}
 	inner := event
 	wrapped := event.Kind == gonostr.Kind(cascadia.NIP59_GIFT_WRAP)
+	if verify == nil {
+		verify = func(candidate *gonostr.Event) bool { return casnostr.VerifyEvent((*casnostr.Event)(candidate)) }
+	}
+	if !verify(event) {
+		reportError("verify", fmt.Errorf("invalid event id or signature"), event)
+		return nil
+	}
 	if wrapped {
 		unwrapped, err := unwrap(ctx, contextSigner, event)
 		if err != nil {
@@ -346,7 +407,8 @@ func serveRelayEvent(ctx context.Context, relays []string, signer nip34.Signer, 
 		}
 		inner = unwrapped
 	}
-	if !allowedMethod(inner) {
+	if err := validateIntent(inner, handler.Recipient, verify); err != nil {
+		reportError("validate_intent", err, inner)
 		return nil
 	}
 	resp, err := handler.HandleIntent(ctx, inner, time.Now().UTC())
@@ -371,6 +433,65 @@ func serveRelayEvent(ctx context.Context, relays []string, signer nip34.Signer, 
 		return fmt.Errorf("publish ContextVM response: %w", err)
 	}
 	return nil
+}
+
+func validateIntent(ev *gonostr.Event, recipient string, verify serveVerifier) error {
+	if ev == nil || ev.Kind != gonostr.Kind(nip34.KindContextVMIntent) {
+		return fmt.Errorf("expected ContextVM intent")
+	}
+	if !verify(ev) {
+		return fmt.Errorf("invalid intent id or signature")
+	}
+	recipients := nip34.TagAll(ev, "p")
+	if len(recipients) != 1 || recipients[0] != strings.TrimSpace(recipient) {
+		return fmt.Errorf("intent recipient mismatch")
+	}
+	schemas := nip34.TagAll(ev, "schema")
+	if len(schemas) > 1 || (len(schemas) == 1 && schemas[0] != nip34.TaskIntentSchema) {
+		return fmt.Errorf("invalid intent schema")
+	}
+	var req cascontextvm.Request
+	if err := json.Unmarshal([]byte(ev.Content), &req); err != nil {
+		return fmt.Errorf("decode intent: %w", err)
+	}
+	if !supportedMethod(req.Method) {
+		return fmt.Errorf("unsupported method")
+	}
+	methods := nip34.TagAll(ev, "method")
+	parts := strings.Split(req.Method, "/")
+	domains, ops := nip34.TagAll(ev, "domain"), nip34.TagAll(ev, "op")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid intent method")
+	}
+	if len(methods)+len(domains)+len(ops) > 0 &&
+		(len(methods) != 1 || methods[0] != req.Method || len(domains) != 1 || domains[0] != parts[0] || len(ops) != 1 || ops[0] != parts[1]) {
+		return fmt.Errorf("intent method tags do not match content")
+	}
+	return nil
+}
+
+func eventAfter(a, b *gonostr.Event) bool {
+	at, bt := nip34.EventTime(a), nip34.EventTime(b)
+	if !at.Equal(bt) {
+		return at.After(bt)
+	}
+	return a.ID.Hex() > b.ID.Hex()
+}
+
+func queueIdentifier(repoAddr, queue string) string {
+	return "queue:" + strings.TrimSpace(repoAddr) + ":" + queueName(queue)
+}
+
+func hasMarkedTag(ev *gonostr.Event, name, value, marker string) bool {
+	if ev == nil {
+		return false
+	}
+	for _, tag := range ev.Tags {
+		if len(tag) >= 4 && tag[0] == name && tag[1] == value && tag[3] == marker {
+			return true
+		}
+	}
+	return false
 }
 
 func defaultServeErrorReporter(stage string, err error, event *gonostr.Event) {

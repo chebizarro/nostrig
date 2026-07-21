@@ -11,18 +11,19 @@ import (
 	"strings"
 	"time"
 
+	gonostr "fiatjaf.com/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	gonostr "fiatjaf.com/nostr"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type MigrateOptions struct {
-	OutDir    string
-	Relays    []string
-	Signer    nip34.Signer
-	Publisher EventPublisher
-	DryRun    bool
+	OutDir          string
+	CanonicalAuthor string
+	Relays          []string
+	Signer          nip34.Signer
+	Publisher       EventPublisher
+	DryRun          bool
 }
 
 type MigrateResult struct {
@@ -55,7 +56,7 @@ func Migrate(ctx context.Context, opts MigrateOptions) (*MigrateResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	events, err := nip34.BuildCanonicalEvents(export, time.Now().UTC())
+	events, err := nip34.BuildCanonicalEvents(export, opts.CanonicalAuthor, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}

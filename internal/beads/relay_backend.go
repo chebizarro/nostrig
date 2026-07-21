@@ -130,13 +130,19 @@ func (b *RelayBackend) fetch(ctx context.Context, taskIDs []string) ([]*gonostr.
 	if limit <= 0 {
 		limit = 500
 	}
+	authors := cleanStrings(b.opts.Authors)
+	if len(authors) == 0 {
+		return nil, fmt.Errorf("at least one canonical author is required")
+	}
+	trusted := map[string]struct{}{}
 	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindCanonicalState)}, Limit: limit}
-	if authors := cleanStrings(b.opts.Authors); len(authors) > 0 {
-		for _, author := range authors {
-			if pk, err := gonostr.PubKeyFromHex(author); err == nil {
-				filter.Authors = append(filter.Authors, pk)
-			}
+	for _, author := range authors {
+		pk, err := gonostr.PubKeyFromHex(author)
+		if err != nil {
+			return nil, fmt.Errorf("invalid canonical author %q", author)
 		}
+		filter.Authors = append(filter.Authors, pk)
+		trusted[pk.Hex()] = struct{}{}
 	}
 	tags := gonostr.TagMap{}
 	if repoAddr := strings.TrimSpace(b.opts.RepoAddr); repoAddr != "" {
@@ -159,7 +165,61 @@ func (b *RelayBackend) fetch(ctx context.Context, taskIDs []string) ([]*gonostr.
 	if fetcher == nil {
 		fetcher = nip34.NewClient()
 	}
-	return fetcher.Fetch(ctx, relays, filter)
+	events, err := fetcher.Fetch(ctx, relays, filter)
+	if err != nil {
+		return nil, err
+	}
+	tombstoneFilter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(5)}, Authors: append([]gonostr.PubKey(nil), filter.Authors...), Limit: limit}
+	if ids := cleanTaskIDs(taskIDs); len(ids) > 0 {
+		coords := make([]string, 0, len(ids)*len(authors))
+		for _, author := range authors {
+			for _, id := range ids {
+				coords = append(coords, nip34.Address(nip34.KindCanonicalState, strings.ToLower(author), "task:"+id))
+			}
+		}
+		tombstoneFilter.Tags = gonostr.TagMap{"a": coords}
+	} else {
+		tombstoneFilter.Tags = gonostr.TagMap{"a": []string{strings.TrimSpace(b.opts.RepoAddr)}}
+	}
+	tombstones, err := fetcher.Fetch(ctx, relays, tombstoneFilter)
+	if err != nil {
+		return nil, err
+	}
+	events = append(events, tombstones...)
+	requested := cleanTaskIDs(taskIDs)
+	for _, ev := range events {
+		if ev == nil {
+			return nil, fmt.Errorf("relay returned nil canonical state")
+		}
+		if _, ok := trusted[ev.PubKey.Hex()]; !ok {
+			return nil, fmt.Errorf("relay returned state from untrusted author")
+		}
+		var taskID, eventRepo string
+		switch int(ev.Kind) {
+		case nip34.KindCanonicalState:
+			issue, err := nip34.ParseTaskStateEvent(ev)
+			if err != nil {
+				return nil, fmt.Errorf("invalid canonical state %s: %w", ev.ID.Hex(), err)
+			}
+			taskID = issue.Id
+			eventRepo = issue.GetMetadata().GetCustom()["nip34.repo_addr"]
+		case 5:
+			taskID, err = nip34.ValidateTaskTombstone(ev, ev.PubKey.Hex())
+			if err != nil {
+				return nil, fmt.Errorf("invalid canonical tombstone %s: %w", ev.ID.Hex(), err)
+			}
+			eventRepo = nip34.TaskTombstoneRepo(ev)
+		default:
+			return nil, fmt.Errorf("relay returned unexpected canonical event kind")
+		}
+		if repo := strings.TrimSpace(b.opts.RepoAddr); repo != "" && eventRepo != repo {
+			return nil, fmt.Errorf("relay returned state outside repository selector")
+		}
+		if len(requested) > 0 && !stringContains(requested, taskID) {
+			return nil, fmt.Errorf("relay returned state outside task selector")
+		}
+	}
+	return events, nil
 }
 
 func (b *RelayBackend) buildEvent(issue *pb.Issue) (*gonostr.Event, error) {
@@ -179,7 +239,11 @@ func (b *RelayBackend) buildEvent(issue *pb.Issue) (*gonostr.Event, error) {
 		issue.Created = timestamppb.New(now)
 	}
 	issue.Updated = timestamppb.New(now)
-	return nip34.BuildTaskStateEvent(issue, now)
+	author, err := canonicalBackendAuthor(b.opts.Authors)
+	if err != nil {
+		return nil, err
+	}
+	return nip34.BuildTaskStateEvent(issue, author, now)
 }
 
 func (b *RelayBackend) publish(ctx context.Context, events []*gonostr.Event) error {
@@ -208,9 +272,28 @@ func (b *RelayBackend) now() time.Time {
 }
 
 func ExportFromTaskStateEvents(events []*gonostr.Event) (*pb.Export, error) {
-	latest := map[string]*pb.Issue{}
-	latestTime := map[string]time.Time{}
+	type stateRecord struct {
+		issue *pb.Issue
+		event *gonostr.Event
+	}
+	states := map[string]stateRecord{}
+	tombstones := map[string]*gonostr.Event{}
 	for _, ev := range events {
+		if ev == nil {
+			continue
+		}
+		author := ev.PubKey.Hex()
+		if int(ev.Kind) == 5 {
+			id, err := nip34.ValidateTaskTombstone(ev, author)
+			if err != nil {
+				continue
+			}
+			key := author + "|" + id
+			if tombstones[key] == nil || eventAfter(tombstones[key], ev) {
+				tombstones[key] = ev
+			}
+			continue
+		}
 		issue, err := nip34.ParseTaskStateEvent(ev)
 		if err != nil {
 			continue
@@ -222,7 +305,7 @@ func ExportFromTaskStateEvents(events []*gonostr.Event) (*pb.Export, error) {
 		createdAt := nip34.EventTime(ev)
 		ensureMetadata(issue)
 		issue.Metadata.Custom["nostr.id"] = ev.ID.Hex()
-		issue.Metadata.Custom["nostr.pubkey"] = ev.PubKey.Hex()
+		issue.Metadata.Custom["nostr.pubkey"] = author
 		issue.Metadata.Custom["nostr.kind"] = fmt.Sprintf("%d", ev.Kind)
 		issue.Metadata.Custom["nostrig.source"] = "canonical-task-state"
 		if issue.Updated == nil && !createdAt.IsZero() {
@@ -231,18 +314,35 @@ func ExportFromTaskStateEvents(events []*gonostr.Event) (*pb.Export, error) {
 		if issue.Created == nil && !createdAt.IsZero() {
 			issue.Created = timestamppb.New(createdAt)
 		}
-		prevTime, ok := latestTime[id]
-		if !ok || createdAt.After(prevTime) {
-			latest[id] = issue
-			latestTime[id] = createdAt
+		key := author + "|" + id
+		if previous, ok := states[key]; !ok || eventAfter(previous.event, ev) {
+			states[key] = stateRecord{issue: issue, event: ev}
+		}
+	}
+	latest := map[string]stateRecord{}
+	for key, record := range states {
+		if tombstone := tombstones[key]; tombstone != nil && !eventAfter(tombstone, record.event) {
+			continue
+		}
+		id := record.issue.Id
+		if previous, ok := latest[id]; !ok || eventAfter(previous.event, record.event) {
+			latest[id] = record
 		}
 	}
 	issues := make([]*pb.Issue, 0, len(latest))
-	for _, issue := range latest {
-		issues = append(issues, issue)
+	for _, record := range latest {
+		issues = append(issues, record.issue)
 	}
 	sort.Slice(issues, func(i, j int) bool { return issues[i].Id < issues[j].Id })
 	return &pb.Export{Issues: issues}, nil
+}
+
+func eventAfter(previous, candidate *gonostr.Event) bool {
+	previousTime, candidateTime := nip34.EventTime(previous), nip34.EventTime(candidate)
+	if !candidateTime.Equal(previousTime) {
+		return candidateTime.After(previousTime)
+	}
+	return candidate.ID.Hex() > previous.ID.Hex()
 }
 
 func ensureMetadata(issue *pb.Issue) {
@@ -280,6 +380,27 @@ func cleanTaskIDs(in []string) []string {
 
 func cleanTaskID(id string) string {
 	return strings.TrimPrefix(strings.TrimSpace(id), "task:")
+}
+
+func canonicalBackendAuthor(authors []string) (string, error) {
+	authors = cleanStrings(authors)
+	if len(authors) == 0 {
+		return "", fmt.Errorf("at least one canonical author is required")
+	}
+	author := strings.ToLower(authors[0])
+	if _, err := gonostr.PubKeyFromHex(author); err != nil {
+		return "", fmt.Errorf("invalid canonical author %q", authors[0])
+	}
+	return author, nil
+}
+
+func stringContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func cleanStrings(in []string) []string {

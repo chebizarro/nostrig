@@ -1,9 +1,12 @@
 package nostr
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,8 +17,9 @@ import (
 )
 
 const (
-	TaskStateSchema  = "cascadia.task-state.v1"
-	TaskIntentSchema = "cascadia.task.v1"
+	TaskStateSchema     = "cascadia.task-state.v1"
+	TaskIntentSchema    = "cascadia.task.v1"
+	TaskTombstoneSchema = "cascadia.task-tombstone.v1"
 )
 
 type Signer interface {
@@ -59,16 +63,20 @@ func (p *Publisher) Publish(ctx context.Context, relays []string, signer Signer,
 	return nil
 }
 
-func BuildCanonicalEvents(export *beadspb.Export, now time.Time) ([]*gonostr.Event, error) {
+func BuildCanonicalEvents(export *beadspb.Export, canonicalAuthor string, now time.Time) ([]*gonostr.Event, error) {
 	if export == nil {
 		return nil, fmt.Errorf("export is nil")
+	}
+	canonicalAuthor, err := canonicalPubKey(canonicalAuthor)
+	if err != nil {
+		return nil, err
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
 	events := make([]*gonostr.Event, 0, len(export.Issues)*2+len(export.Epics))
 	for _, issue := range export.Issues {
-		state, err := BuildTaskStateEvent(issue, now)
+		state, err := BuildTaskStateEvent(issue, canonicalAuthor, now)
 		if err != nil {
 			return nil, err
 		}
@@ -78,7 +86,7 @@ func BuildCanonicalEvents(export *beadspb.Export, now time.Time) ([]*gonostr.Eve
 		}
 	}
 	for _, epic := range export.Epics {
-		events = append(events, BuildEpicCollectionEvent(epic, export.Issues, now))
+		events = append(events, BuildEpicCollectionEvent(epic, export.Issues, canonicalAuthor, now))
 	}
 	return events, nil
 }
@@ -98,13 +106,31 @@ type TaskState struct {
 	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
-func BuildTaskStateEvent(issue *beadspb.Issue, now time.Time) (*gonostr.Event, error) {
+func BuildTaskStateEvent(issue *beadspb.Issue, canonicalAuthor string, now time.Time) (*gonostr.Event, error) {
+	canonicalAuthor, err := canonicalPubKey(canonicalAuthor)
+	if err != nil {
+		return nil, err
+	}
 	if issue == nil {
 		return nil, fmt.Errorf("issue is nil")
 	}
 	id := strings.TrimSpace(issue.Id)
 	if id == "" {
 		return nil, fmt.Errorf("issue missing id")
+	}
+	if strings.TrimSpace(issue.Title) == "" {
+		return nil, fmt.Errorf("issue missing title")
+	}
+	if !sameStrings(issue.Labels, issue.Labels) {
+		return nil, fmt.Errorf("issue labels must be unique and non-empty")
+	}
+	if !sameStrings(issue.DependsOn, issue.DependsOn) {
+		return nil, fmt.Errorf("issue dependencies must be unique and non-empty")
+	}
+	for _, dependency := range issue.DependsOn {
+		if strings.HasPrefix(strings.TrimSpace(dependency), "task:") {
+			return nil, fmt.Errorf("issue dependency ids must be unprefixed")
+		}
 	}
 	state := TaskState{ID: id, Title: issue.Title, Description: issue.Description, Status: StatusString(issue.Status), Priority: PriorityString(issue.Priority), Epic: issue.Epic, Assignee: issue.Assignee, Labels: append([]string(nil), issue.Labels...), DependsOn: append([]string(nil), issue.DependsOn...), Metadata: metadataMap(issue.Metadata)}
 	if issue.Created != nil {
@@ -125,11 +151,11 @@ func BuildTaskStateEvent(issue *beadspb.Issue, now time.Time) (*gonostr.Event, e
 		tags = append(tags, gonostr.Tag{"assignee", state.Assignee})
 	}
 	if state.Epic != "" {
-		tags = append(tags, gonostr.Tag{"a", "30000::epic:" + state.Epic}, gonostr.Tag{"epic", state.Epic})
+		tags = append(tags, gonostr.Tag{"a", Address(KindNamedList, canonicalAuthor, "epic:"+state.Epic)}, gonostr.Tag{"epic", state.Epic})
 	}
 	for _, dep := range state.DependsOn {
 		if strings.TrimSpace(dep) != "" {
-			tags = append(tags, gonostr.Tag{"depends-on", "task:" + dep})
+			tags = append(tags, gonostr.Tag{"depends-on", Address(KindCanonicalState, canonicalAuthor, "task:"+dep)})
 		}
 	}
 	for _, label := range state.Labels {
@@ -187,7 +213,7 @@ func BuildNIP34IssueStatusEvent(issue *beadspb.Issue, now time.Time) *gonostr.Ev
 	return &gonostr.Event{Kind: gonostr.Kind(kind), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
 }
 
-func BuildEpicCollectionEvent(epic *beadspb.Epic, issues []*beadspb.Issue, now time.Time) *gonostr.Event {
+func BuildEpicCollectionEvent(epic *beadspb.Epic, issues []*beadspb.Issue, canonicalAuthor string, now time.Time) *gonostr.Event {
 	id, name := "unknown", "unknown"
 	if epic != nil {
 		if strings.TrimSpace(epic.Id) != "" {
@@ -202,24 +228,99 @@ func BuildEpicCollectionEvent(epic *beadspb.Epic, issues []*beadspb.Issue, now t
 	tags := gonostr.Tags{{"d", "epic:" + id}, {"title", name}, {"schema", "cascadia.task-collection.v1"}}
 	for _, issue := range issues {
 		if issue != nil && issue.Epic == id {
-			tags = append(tags, gonostr.Tag{"a", "30900::task:" + issue.Id})
+			tags = append(tags, gonostr.Tag{"a", Address(KindCanonicalState, canonicalAuthor, "task:"+issue.Id)})
 		}
 	}
 	return &gonostr.Event{Kind: gonostr.Kind(KindNamedList), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
 }
 
-func BuildQueueCollectionEvent(queue string, issueIDs []string, now time.Time) *gonostr.Event {
+func BuildQueueCollectionEventForAuthor(repoAddr, queue string, issueIDs []string, canonicalAuthor string, now time.Time) *gonostr.Event {
 	queue = strings.TrimSpace(queue)
 	if queue == "" {
 		queue = "backlog"
 	}
-	tags := gonostr.Tags{{"d", "queue:" + queue}, {"title", queue}, {"schema", "cascadia.task-collection.v1"}}
+	d := "queue:" + strings.TrimSpace(repoAddr) + ":" + queue
+	tags := gonostr.Tags{{"d", d}, {"title", queue}, {"schema", "cascadia.task-collection.v1"}, {"a", strings.TrimSpace(repoAddr), "", "nip34-repo"}}
 	for _, id := range issueIDs {
 		if strings.TrimSpace(id) != "" {
 			tags = append(tags, gonostr.Tag{"a", "30900::task:" + id})
 		}
 	}
 	return &gonostr.Event{Kind: gonostr.Kind(KindNamedList), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
+}
+
+func BuildTaskTombstone(target *gonostr.Event, repoAddr, canonicalAuthor string, now time.Time) (*gonostr.Event, error) {
+	canonicalAuthor, err := canonicalPubKey(canonicalAuthor)
+	if err != nil {
+		return nil, err
+	}
+	if target == nil || target.Kind != gonostr.Kind(KindCanonicalState) {
+		return nil, fmt.Errorf("canonical task state target is required")
+	}
+	if target.PubKey.Hex() != canonicalAuthor {
+		return nil, fmt.Errorf("cannot delete task state authored by another key")
+	}
+	d, err := exactlyOneTag(target, "d")
+	if err != nil || !strings.HasPrefix(d, "task:") {
+		return nil, fmt.Errorf("invalid task state target")
+	}
+	repoAddr = strings.TrimSpace(repoAddr)
+	if repoAddr == "" {
+		return nil, fmt.Errorf("repo addr is required")
+	}
+	tags := gonostr.Tags{
+		{"e", target.ID.Hex()},
+		{"k", fmt.Sprintf("%d", KindCanonicalState)},
+		{"a", Address(KindCanonicalState, canonicalAuthor, d), "", "task"},
+		{"a", repoAddr, "", "nip34-repo"},
+		{"schema", TaskTombstoneSchema},
+	}
+	return &gonostr.Event{Kind: gonostr.Kind(5), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: "delete " + d}, nil
+}
+
+func TaskTombstoneRepo(ev *gonostr.Event) string {
+	return markedTag(ev, "a", "nip34-repo")
+}
+
+func ValidateTaskTombstone(ev *gonostr.Event, canonicalAuthor string) (string, error) {
+	canonicalAuthor, err := canonicalPubKey(canonicalAuthor)
+	if err != nil {
+		return "", err
+	}
+	if ev == nil || ev.Kind != gonostr.Kind(5) || ev.PubKey.Hex() != canonicalAuthor {
+		return "", fmt.Errorf("invalid canonical task tombstone author")
+	}
+	if schema, err := exactlyOneTag(ev, "schema"); err != nil || schema != TaskTombstoneSchema {
+		return "", fmt.Errorf("invalid task tombstone schema")
+	}
+	if kind, err := exactlyOneTag(ev, "k"); err != nil || kind != fmt.Sprintf("%d", KindCanonicalState) {
+		return "", fmt.Errorf("invalid task tombstone kind")
+	}
+	if _, err := exactlyOneTag(ev, "e"); err != nil {
+		return "", fmt.Errorf("task tombstone requires target event")
+	}
+	var taskD string
+	for _, tag := range ev.Tags {
+		if len(tag) >= 4 && tag[0] == "a" && tag[3] == "task" {
+			prefix := fmt.Sprintf("%d:%s:", KindCanonicalState, canonicalAuthor)
+			if taskD != "" || !strings.HasPrefix(tag[1], prefix+"task:") {
+				return "", fmt.Errorf("invalid task tombstone coordinate")
+			}
+			taskD = strings.TrimPrefix(tag[1], prefix)
+		}
+	}
+	if taskD == "" || markedTag(ev, "a", "nip34-repo") == "" {
+		return "", fmt.Errorf("task tombstone missing canonical coordinates")
+	}
+	return strings.TrimPrefix(taskD, "task:"), nil
+}
+
+func canonicalPubKey(author string) (string, error) {
+	author = strings.ToLower(strings.TrimSpace(author))
+	if _, err := gonostr.PubKeyFromHex(author); err != nil {
+		return "", fmt.Errorf("canonical author must be a valid pubkey")
+	}
+	return author, nil
 }
 
 func ParseTaskStateEvent(ev *gonostr.Event) (*beadspb.Issue, error) {
@@ -229,25 +330,186 @@ func ParseTaskStateEvent(ev *gonostr.Event) (*beadspb.Issue, error) {
 	if ev.Kind != KindCanonicalState {
 		return nil, fmt.Errorf("unexpected kind %d", ev.Kind)
 	}
-	d, ok := TagD(ev)
-	if !ok || !strings.HasPrefix(d, "task:") {
-		return nil, fmt.Errorf("task state missing d=task:<id>")
+	d, err := exactlyOneTag(ev, "d")
+	if err != nil || !strings.HasPrefix(d, "task:") || strings.TrimPrefix(d, "task:") == "" {
+		return nil, fmt.Errorf("task state requires exactly one d=task:<id>")
+	}
+	if schema, err := exactlyOneTag(ev, "schema"); err != nil || schema != TaskStateSchema {
+		return nil, fmt.Errorf("unsupported task state schema")
+	}
+	if domain, err := exactlyOneTag(ev, "domain"); err != nil || domain != "task" {
+		return nil, fmt.Errorf("task state requires domain=task")
 	}
 	var state TaskState
-	if err := json.Unmarshal([]byte(ev.Content), &state); err != nil {
+	dec := json.NewDecoder(bytes.NewBufferString(ev.Content))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&state); err != nil {
+		return nil, fmt.Errorf("decode task state: %w", err)
+	}
+	if err := ensureDecoderEOF(dec); err != nil {
 		return nil, err
 	}
-	if state.ID == "" {
-		state.ID = strings.TrimPrefix(d, "task:")
+	id := strings.TrimPrefix(d, "task:")
+	if strings.TrimSpace(state.ID) != state.ID || state.ID == "" || state.ID != id {
+		return nil, fmt.Errorf("task content id does not match d tag")
+	}
+	if strings.TrimSpace(state.Title) == "" {
+		return nil, fmt.Errorf("task title is required")
+	}
+	if !validTaskStatus(state.Status) {
+		return nil, fmt.Errorf("invalid task status")
+	}
+	if state.Priority != "" && ParsePriority(state.Priority) == beadspb.Priority_PRIORITY_UNSPECIFIED {
+		return nil, fmt.Errorf("invalid task priority")
+	}
+	if err := requireOptionalTagAgreement(ev, "status", state.Status); err != nil {
+		return nil, err
+	}
+	if err := requireOptionalTagAgreement(ev, "priority", state.Priority); err != nil {
+		return nil, err
+	}
+	if err := requireOptionalTagAgreement(ev, "assignee", state.Assignee); err != nil {
+		return nil, err
+	}
+	author := ev.PubKey.Hex()
+	if state.Epic == "" {
+		if len(TagAll(ev, "epic")) != 0 {
+			return nil, fmt.Errorf("epic tag does not match content")
+		}
+	} else {
+		if err := requireOptionalTagAgreement(ev, "epic", state.Epic); err != nil {
+			return nil, err
+		}
+		if !hasExactTag(ev, "a", Address(KindNamedList, author, "epic:"+state.Epic)) {
+			return nil, fmt.Errorf("epic coordinate does not identify canonical author")
+		}
+	}
+	if !sameStrings(TagAll(ev, "t"), state.Labels) {
+		return nil, fmt.Errorf("label tags do not match content")
+	}
+	expectedDeps := make([]string, 0, len(state.DependsOn))
+	for _, dep := range state.DependsOn {
+		dep = strings.TrimSpace(dep)
+		if dep == "" || strings.HasPrefix(dep, "task:") {
+			return nil, fmt.Errorf("invalid dependency id")
+		}
+		expectedDeps = append(expectedDeps, Address(KindCanonicalState, author, "task:"+dep))
+	}
+	if !sameStrings(TagAll(ev, "depends-on"), expectedDeps) {
+		return nil, fmt.Errorf("dependency tags do not match content")
+	}
+	if state.Metadata == nil {
+		state.Metadata = map[string]string{}
+	}
+	repoTag := markedTag(ev, "a", "nip34-repo")
+	if strings.TrimSpace(state.Metadata["nip34.repo_addr"]) != repoTag {
+		return nil, fmt.Errorf("repository tag does not match content")
+	}
+	rootTag := markedTag(ev, "e", "nip34-root")
+	if strings.TrimSpace(state.Metadata["nostr.id"]) != rootTag {
+		return nil, fmt.Errorf("NIP-34 root tag does not match content")
 	}
 	issue := &beadspb.Issue{Id: state.ID, Title: state.Title, Description: state.Description, Status: ParseStatus(state.Status), Priority: ParsePriority(state.Priority), Epic: state.Epic, Assignee: state.Assignee, Labels: append([]string(nil), state.Labels...), DependsOn: append([]string(nil), state.DependsOn...), Metadata: &beadspb.Metadata{Custom: state.Metadata}}
-	if created, err := time.Parse(time.RFC3339, strings.TrimSpace(state.Created)); err == nil {
+	if state.Created != "" {
+		created, err := time.Parse(time.RFC3339, state.Created)
+		if err != nil {
+			return nil, fmt.Errorf("invalid created timestamp")
+		}
 		issue.Created = timestamppb.New(created.UTC())
 	}
-	if updated, err := time.Parse(time.RFC3339, strings.TrimSpace(state.Updated)); err == nil {
+	if state.Updated != "" {
+		updated, err := time.Parse(time.RFC3339, state.Updated)
+		if err != nil {
+			return nil, fmt.Errorf("invalid updated timestamp")
+		}
 		issue.Updated = timestamppb.New(updated.UTC())
 	}
 	return issue, nil
+}
+
+func exactlyOneTag(ev *gonostr.Event, name string) (string, error) {
+	values := TagAll(ev, name)
+	if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
+		return "", fmt.Errorf("expected exactly one %s tag", name)
+	}
+	return values[0], nil
+}
+
+func requireOptionalTagAgreement(ev *gonostr.Event, name, expected string) error {
+	values := TagAll(ev, name)
+	if expected == "" {
+		if len(values) != 0 {
+			return fmt.Errorf("%s tag does not match content", name)
+		}
+		return nil
+	}
+	if len(values) != 1 || values[0] != expected {
+		return fmt.Errorf("%s tag does not match content", name)
+	}
+	return nil
+}
+
+func validTaskStatus(status string) bool {
+	switch status {
+	case "open", "in_progress", "blocked", "closed":
+		return true
+	default:
+		return false
+	}
+}
+
+func sameStrings(a, b []string) bool {
+	a, b = append([]string(nil), a...), append([]string(nil), b...)
+	for _, values := range [][]string{a, b} {
+		for i := range values {
+			values[i] = strings.TrimSpace(values[i])
+		}
+		sort.Strings(values)
+		for i, value := range values {
+			if value == "" || (i > 0 && value == values[i-1]) {
+				return false
+			}
+		}
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func hasExactTag(ev *gonostr.Event, name, value string) bool {
+	for _, tag := range ev.Tags {
+		if len(tag) >= 2 && tag[0] == name && tag[1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func markedTag(ev *gonostr.Event, name, marker string) string {
+	var value string
+	for _, tag := range ev.Tags {
+		if len(tag) >= 4 && tag[0] == name && tag[3] == marker {
+			if value != "" {
+				return "__duplicate__"
+			}
+			value = tag[1]
+		}
+	}
+	return value
+}
+
+func ensureDecoderEOF(dec *json.Decoder) error {
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("task state contains trailing JSON")
+	}
+	return nil
 }
 
 func BuildContextVMCommand(method, recipient string, params any, now time.Time) (*gonostr.Event, error) {
@@ -284,15 +546,27 @@ func BuildCloseCommand(taskID, recipient string, now time.Time) (*gonostr.Event,
 }
 
 func BuildQueueEnqueueCommand(queue, taskID, recipient string, now time.Time) (*gonostr.Event, error) {
-	return BuildContextVMCommand("queue/enqueue", recipient, map[string]string{"queue": queue, "task_id": taskID}, now)
+	return BuildQueueEnqueueCommandForRepo("", queue, taskID, recipient, now)
+}
+
+func BuildQueueEnqueueCommandForRepo(repoAddr, queue, taskID, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("queue/enqueue", recipient, map[string]string{"repo_addr": repoAddr, "queue": queue, "task_id": taskID}, now)
 }
 
 func BuildQueueDequeueCommand(queue, recipient string, now time.Time) (*gonostr.Event, error) {
-	return BuildContextVMCommand("queue/dequeue", recipient, map[string]string{"queue": queue}, now)
+	return BuildQueueDequeueCommandForRepo("", queue, recipient, now)
+}
+
+func BuildQueueDequeueCommandForRepo(repoAddr, queue, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("queue/dequeue", recipient, map[string]string{"repo_addr": repoAddr, "queue": queue}, now)
 }
 
 func BuildQueueListCommand(queue, recipient string, now time.Time) (*gonostr.Event, error) {
-	return BuildContextVMCommand("queue/list", recipient, map[string]string{"queue": queue}, now)
+	return BuildQueueListCommandForRepo("", queue, recipient, now)
+}
+
+func BuildQueueListCommandForRepo(repoAddr, queue, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("queue/list", recipient, map[string]string{"repo_addr": repoAddr, "queue": queue}, now)
 }
 
 func StatusString(s beadspb.Status) string {

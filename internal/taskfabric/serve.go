@@ -18,14 +18,18 @@ type Ledger interface {
 	GetTask(ctx context.Context, id string) (*beadspb.Issue, error)
 	PutTask(ctx context.Context, issue *beadspb.Issue) (*gonostr.Event, error)
 	DeleteTask(ctx context.Context, id string) (*gonostr.Event, error)
-	GetQueue(ctx context.Context, queue string) ([]string, error)
-	PutQueue(ctx context.Context, queue string, ids []string) (*gonostr.Event, error)
+	GetQueue(ctx context.Context, repoAddr, queue string) ([]string, error)
+	PutQueue(ctx context.Context, repoAddr, queue string, ids []string) (*gonostr.Event, error)
 }
 
 type Handler struct {
-	Ledger    Ledger
-	Quality   QualityLookup
-	RepoAddrs []string
+	Ledger      Ledger
+	Quality     QualityLookup
+	RepoAddrs   []string
+	Recipient   string
+	ACL         map[string]CallerPolicy
+	ClosePolicy ClosePolicy
+	Audit       AuthzAuditSink
 }
 
 func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.Time) (*gonostr.Event, error) {
@@ -42,7 +46,13 @@ func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.
 	if strings.TrimSpace(req.Method) == "" {
 		req.Method, _ = nip34.TagFirst(ev, "method")
 	}
-	resp := h.registry(ev.PubKey.Hex(), now).Dispatch(ctx, req)
+	if recipient := strings.TrimSpace(h.Recipient); recipient != "" {
+		recipients := nip34.TagAll(ev, "p")
+		if len(recipients) != 1 || recipients[0] != recipient {
+			return nil, fmt.Errorf("intent recipient does not match this service")
+		}
+	}
+	resp := h.registry(ev, now).Dispatch(ctx, req)
 	content, err := json.Marshal(resp)
 	if err != nil {
 		return nil, err
@@ -54,20 +64,21 @@ func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.
 	return &gonostr.Event{Kind: gonostr.Kind(nip34.KindContextVMIntent), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags, Content: string(content)}, nil
 }
 
-func (h *Handler) registry(caller string, now time.Time) *cascontextvm.Registry {
+func (h *Handler) registry(ev *gonostr.Event, now time.Time) *cascontextvm.Registry {
+	caller := ev.PubKey.Hex()
 	r := cascontextvm.NewRegistry()
 	for _, method := range []string{"task/create", "task/claim", "task/assign", "task/update", "task/close", "task/delete", "task/quality-status", "queue/enqueue", "queue/dequeue", "queue/list"} {
 		parts := strings.Split(method, "/")
 		r.Register(parts[0], parts[1], func(method string) cascontextvm.Handler {
 			return func(ctx context.Context, req cascontextvm.Request) (any, error) {
-				return h.dispatch(ctx, method, req.Params, caller, now)
+				return h.dispatch(ctx, ev, method, req.Params, caller, now)
 			}
 		}(method))
 	}
 	return r
 }
 
-func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessage, caller string, now time.Time) (any, error) {
+func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string, raw json.RawMessage, caller string, now time.Time) (any, error) {
 	var p map[string]any
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &p); err != nil {
@@ -79,6 +90,9 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 			return strings.TrimSpace(fmt.Sprint(v))
 		}
 		return ""
+	}
+	if err := h.authorize(ctx, ev, method, p, caller, now); err != nil {
+		return nil, err
 	}
 	if strings.HasPrefix(method, "task/") && method != "task/quality-status" {
 		if err := h.authorizeRepo(ctx, method, get("task_id"), get("repo_addr")); err != nil {
@@ -125,6 +139,9 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		return r, nil
 	case "task/claim":
 		id, claimer := get("task_id"), get("claimer")
+		if policy, ok := h.ACL[strings.ToLower(strings.TrimSpace(caller))]; ok && containsRole(policy.Roles, RoleWorker) {
+			claimer = strings.TrimSpace(policy.WorkerID)
+		}
 		if claimer == "" {
 			claimer = caller
 		}
@@ -228,7 +245,7 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 			ids = append(ids, id)
 		}
 		if q := get("queue"); q != "" && len(ids) == 0 {
-			queueIDs, err := h.Ledger.GetQueue(ctx, queueName(q))
+			queueIDs, err := h.Ledger.GetQueue(ctx, get("repo_addr"), queueName(q))
 			if err != nil {
 				return nil, err
 			}
@@ -248,25 +265,27 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		}
 		return map[string]any{"quality": quality}, nil
 	case "queue/enqueue":
-		q, id := queueName(get("queue")), get("task_id")
+		repo, q, id := get("repo_addr"), queueName(get("queue")), get("task_id")
 		if id == "" {
 			return nil, fmt.Errorf("task_id is required")
 		}
-		ids, err := h.Ledger.GetQueue(ctx, q)
+		ids, err := h.Ledger.GetQueue(ctx, repo, q)
 		if err != nil {
 			return nil, err
 		}
 		if !contains(ids, id) {
 			ids = append(ids, id)
 		}
-		ev, err := h.Ledger.PutQueue(ctx, q, ids)
+		ev, err := h.Ledger.PutQueue(ctx, repo, q, ids)
 		if err != nil {
 			return nil, err
 		}
-		return queueResult(q, ids, ev), nil
+		r := queueResult(q, ids, ev)
+		r["repo_addr"] = repo
+		return r, nil
 	case "queue/dequeue":
-		q := queueName(get("queue"))
-		ids, err := h.Ledger.GetQueue(ctx, q)
+		repo, q := get("repo_addr"), queueName(get("queue"))
+		ids, err := h.Ledger.GetQueue(ctx, repo, q)
 		if err != nil {
 			return nil, err
 		}
@@ -274,20 +293,22 @@ func (h *Handler) dispatch(ctx context.Context, method string, raw json.RawMessa
 		if len(ids) > 0 {
 			id, ids = ids[0], ids[1:]
 		}
-		ev, err := h.Ledger.PutQueue(ctx, q, ids)
+		ev, err := h.Ledger.PutQueue(ctx, repo, q, ids)
 		if err != nil {
 			return nil, err
 		}
 		r := queueResult(q, ids, ev)
+		r["repo_addr"] = repo
 		r["task_id"] = id
 		return r, nil
 	case "queue/list":
-		q := queueName(get("queue"))
-		ids, err := h.Ledger.GetQueue(ctx, q)
+		repo, q := get("repo_addr"), queueName(get("queue"))
+		ids, err := h.Ledger.GetQueue(ctx, repo, q)
 		if err != nil {
 			return nil, err
 		}
 		r := queueResult(q, ids, nil)
+		r["repo_addr"] = repo
 		h.annotateQueueQuality(ctx, r, ids)
 		return r, nil
 	default:
@@ -451,6 +472,15 @@ func queueName(q string) string {
 func contains(xs []string, x string) bool {
 	for _, v := range xs {
 		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+func containsRole(roles []Role, role Role) bool {
+	for _, candidate := range roles {
+		if candidate == role {
 			return true
 		}
 	}

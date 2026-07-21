@@ -108,7 +108,20 @@ func publishWriteBack(ctx context.Context, opts SyncOptions, merged *MergeResult
 		if shouldPublishRecord(rec) {
 			issue := rec.Resolved.ToIssue()
 			now := time.Now().UTC()
-			ev, err := nip34.BuildTaskStateEvent(issue, now)
+			author, err := canonicalAuthor(opts.Authors)
+			if err != nil {
+				return 0, err
+			}
+			if provider, ok := opts.Signer.(nip34.PublicKeyProvider); ok {
+				signerAuthor, err := provider.PublicKey(ctx)
+				if err != nil {
+					return 0, err
+				}
+				if strings.ToLower(strings.TrimSpace(signerAuthor)) != author {
+					return 0, fmt.Errorf("canonical author does not match signer pubkey")
+				}
+			}
+			ev, err := nip34.BuildTaskStateEvent(issue, author, now)
 			if err != nil {
 				return 0, err
 			}
@@ -158,13 +171,19 @@ func FetchTaskStateEvents(ctx context.Context, client *nip34.Client, opts SyncOp
 		limit = 500
 	}
 
+	authors := cleanStrings(opts.Authors)
+	if len(authors) == 0 {
+		return nil, fmt.Errorf("at least one canonical author is required")
+	}
+	trusted := map[string]struct{}{}
 	f := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindCanonicalState)}, Limit: limit}
-	if len(opts.Authors) > 0 {
-		for _, author := range cleanStrings(opts.Authors) {
-			if pk, err := gonostr.PubKeyFromHex(author); err == nil {
-				f.Authors = append(f.Authors, pk)
-			}
+	for _, author := range authors {
+		pk, err := gonostr.PubKeyFromHex(author)
+		if err != nil {
+			return nil, fmt.Errorf("invalid canonical author %q", author)
 		}
+		f.Authors = append(f.Authors, pk)
+		trusted[pk.Hex()] = struct{}{}
 	}
 	tags := gonostr.TagMap{}
 	if repoAddr != "" {
@@ -181,7 +200,67 @@ func FetchTaskStateEvents(ctx context.Context, client *nip34.Client, opts SyncOp
 		f.Tags = tags
 	}
 
-	return client.Fetch(ctx, relays, f)
+	tombstone := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(5)}, Authors: append([]gonostr.PubKey(nil), f.Authors...), Limit: limit}
+	if len(taskIDs) > 0 {
+		coords := make([]string, 0, len(taskIDs)*len(authors))
+		for _, author := range authors {
+			for _, id := range taskIDs {
+				coords = append(coords, nip34.Address(nip34.KindCanonicalState, strings.ToLower(author), "task:"+strings.TrimPrefix(id, "task:")))
+			}
+		}
+		tombstone.Tags = gonostr.TagMap{"a": coords}
+	} else {
+		tombstone.Tags = gonostr.TagMap{"a": []string{repoAddr}}
+	}
+	events, err := client.FetchMany(ctx, relays, []gonostr.Filter{f, tombstone})
+	if err != nil {
+		return nil, err
+	}
+	for _, ev := range events {
+		if ev == nil {
+			return nil, fmt.Errorf("relay returned nil canonical state")
+		}
+		if _, ok := trusted[ev.PubKey.Hex()]; !ok {
+			return nil, fmt.Errorf("relay returned state from untrusted author")
+		}
+		var taskID, eventRepo string
+		switch int(ev.Kind) {
+		case nip34.KindCanonicalState:
+			issue, err := nip34.ParseTaskStateEvent(ev)
+			if err != nil {
+				return nil, fmt.Errorf("invalid canonical state %s: %w", ev.ID.Hex(), err)
+			}
+			taskID = issue.Id
+			eventRepo = issue.GetMetadata().GetCustom()["nip34.repo_addr"]
+		case 5:
+			taskID, err = nip34.ValidateTaskTombstone(ev, ev.PubKey.Hex())
+			if err != nil {
+				return nil, fmt.Errorf("invalid canonical tombstone %s: %w", ev.ID.Hex(), err)
+			}
+			eventRepo = nip34.TaskTombstoneRepo(ev)
+		default:
+			return nil, fmt.Errorf("relay returned unexpected canonical event kind")
+		}
+		if repoAddr != "" && eventRepo != repoAddr {
+			return nil, fmt.Errorf("relay returned state outside repository selector")
+		}
+		if len(taskIDs) > 0 && !contains(cleanTaskIDs(taskIDs), taskID) {
+			return nil, fmt.Errorf("relay returned state outside task selector")
+		}
+	}
+	return events, nil
+}
+
+func canonicalAuthor(authors []string) (string, error) {
+	authors = cleanStrings(authors)
+	if len(authors) == 0 {
+		return "", fmt.Errorf("at least one canonical author is required")
+	}
+	author := strings.ToLower(authors[0])
+	if _, err := gonostr.PubKeyFromHex(author); err != nil {
+		return "", fmt.Errorf("invalid canonical author %q", authors[0])
+	}
+	return author, nil
 }
 
 // ExportFromTaskStateEvents converts canonical 30900 task-state events into a beads export.

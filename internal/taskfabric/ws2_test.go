@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
+	gonostr "fiatjaf.com/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	gonostr "fiatjaf.com/nostr"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -28,13 +28,14 @@ func TestWriteBackPublishesChangedLocalTaskCanonicalState(t *testing.T) {
 	local := &TaskSnapshot{ID: "task-1", Title: "local", Status: "open", Updated: "2026-01-02T00:00:00Z"}
 	merged := &MergeResult{Records: []*CacheRecord{{ID: "task-1", Resolved: local, Local: local, Resolution: ResolutionLocalOnly, LocalRevision: SnapshotRevision(local)}}}
 	pub := &capturePublisher{}
-	count, err := publishWriteBack(context.Background(), SyncOptions{Push: true, Signer: noopSigner{}, Publisher: pub, Relays: []string{"wss://relay.example"}}, merged)
+	count, err := publishWriteBack(context.Background(), SyncOptions{Push: true, Authors: []string{testPubKey(1).Hex()}, Signer: noopSigner{}, Publisher: pub, Relays: []string{"wss://relay.example"}}, merged)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 || len(pub.events) != 1 {
 		t.Fatalf("published count=%d events=%d", count, len(pub.events))
 	}
+	pub.events[0].PubKey = testPubKey(1)
 	issue, err := nip34.ParseTaskStateEvent(pub.events[0])
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +81,7 @@ func TestMigrationLoadsBeadsFixtureAndBuildsRoundTrippableCanonicalEvents(t *tes
 	if err := os.WriteFile(filepath.Join(beadsDir, "epics.jsonl"), []byte(epics), 0644); err != nil {
 		t.Fatal(err)
 	}
-	result, err := Migrate(context.Background(), MigrateOptions{OutDir: dir, DryRun: true})
+	result, err := Migrate(context.Background(), MigrateOptions{OutDir: dir, CanonicalAuthor: testPubKey(1).Hex(), DryRun: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,6 +97,7 @@ func TestMigrationLoadsBeadsFixtureAndBuildsRoundTrippableCanonicalEvents(t *tes
 	if state == nil {
 		t.Fatal("missing canonical task state event")
 	}
+	state.PubKey = testPubKey(1)
 	got, err := nip34.ParseTaskStateEvent(state)
 	if err != nil {
 		t.Fatal(err)
@@ -112,7 +114,7 @@ func TestMigrationPublishUsesCanonicalEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	issue := &beadspb.Issue{Id: "task-2", Title: "Publish me", Status: beadspb.Status_STATUS_OPEN, Updated: timestamppb.New(time.Unix(10, 0))}
-	ev, err := nip34.BuildTaskStateEvent(issue, time.Unix(10, 0))
+	ev, err := nip34.BuildTaskStateEvent(issue, testPubKey(1).Hex(), time.Unix(10, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +127,7 @@ func TestMigrationPublishUsesCanonicalEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	pub := &capturePublisher{}
-	result, err := Migrate(context.Background(), MigrateOptions{OutDir: dir, Relays: []string{"wss://relay.example"}, Signer: noopSigner{}, Publisher: pub})
+	result, err := Migrate(context.Background(), MigrateOptions{OutDir: dir, CanonicalAuthor: testPubKey(1).Hex(), Relays: []string{"wss://relay.example"}, Signer: noopSigner{}, Publisher: pub})
 	if err != nil {
 		t.Fatal(err)
 	}
