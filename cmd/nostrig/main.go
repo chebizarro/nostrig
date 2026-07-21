@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	gonostr "fiatjaf.com/nostr"
@@ -19,7 +22,9 @@ import (
 )
 
 func main() {
-	if err := newRootCmd().Execute(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := newRootCmd().ExecuteContext(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
@@ -735,8 +740,14 @@ func newServeCmd() *cobra.Command {
 	var circuitFailureLimit int
 	var circuitCooldown time.Duration
 	var outboxDrainInterval time.Duration
+	var instanceLockPath string
 	outboxPath := defaultOutboxPath()
 	cmd := &cobra.Command{Use: "serve", Short: "Serve incoming ContextVM task and queue intents", RunE: func(cmd *cobra.Command, args []string) error {
+		instanceLock, err := acquireInstanceLock(instanceLockPath)
+		if err != nil {
+			return err
+		}
+		defer instanceLock.Close()
 		signer, _, err := signerFromOptions(cmd.Context(), signing, true)
 		if err != nil {
 			return err
@@ -779,6 +790,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&aclFile, "acl-file", "", "Caller ACL JSON file; defaults to NOSTRIG_ACL_FILE")
 	cmd.Flags().IntVar(&ackQuorum, "relay-ack-quorum", 0, "Required-relay acknowledgements needed; 0 means all required relays")
 	cmd.Flags().StringVar(&outboxPath, "outbox-path", outboxPath, "Durable outbound spool; defaults to NOSTRIG_OUTBOX_PATH")
+	cmd.Flags().StringVar(&instanceLockPath, "instance-lock", strings.TrimSpace(os.Getenv("NOSTRIG_INSTANCE_LOCK")), "Exclusive local lock file preventing duplicate active instances")
 	cmd.Flags().DurationVar(&publishTimeout, "relay-publish-timeout", 10*time.Second, "Per-relay publication timeout")
 	cmd.Flags().DurationVar(&retryBaseBackoff, "relay-retry-base", time.Second, "Initial relay retry backoff")
 	cmd.Flags().DurationVar(&retryMaxBackoff, "relay-retry-max", time.Minute, "Maximum relay retry backoff")

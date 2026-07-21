@@ -3,7 +3,7 @@ services:
     build:
       context: .
     image: nostrig:local
-    command: ["serve", "--health-file", "/tmp/nostrig/healthy", "--outbox-path", "/var/lib/nostrig/outbox.json"]
+    command: ["serve", "--health-file", "/tmp/nostrig/healthy", "--outbox-path", "/var/lib/nostrig/outbox.json", "--instance-lock", "/var/lib/nostrig/instance.lock"]
     environment:
       NOSTRIG_ENV: production
       NOSTR_RELAY: ${NOSTR_RELAY:-wss://relay.sharegap.net}
@@ -11,9 +11,23 @@ services:
       NOSTRIG_SIGNER_BUNKER_URL: ${NOSTRIG_SIGNER_BUNKER_URL:?set the Signet/NIP-46 bunker URL}
       NOSTRIG_SIGNER_CLIENT_SECRET_KEY_FILE: /run/secrets/nostrig_signer_client_secret_key
     secrets:
-      - nostrig_signer_client_secret_key
+      - source: nostrig_signer_client_secret_key
+        target: nostrig_signer_client_secret_key
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
     volumes:
       - nostrig-state:/var/lib/nostrig
+    read_only: true
+    tmpfs:
+      - /tmp/nostrig:uid=65532,gid=65532,mode=0700
+    user: "65532:65532"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "find /tmp/nostrig/healthy -mmin -2 -type f | grep -q ."]

@@ -23,4 +23,4 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifica
 COPY --from=build /out/nostrig /usr/local/bin/nostrig
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/nostrig"]
-CMD ["serve", "--health-file", "/tmp/nostrig/healthy", "--outbox-path", "/var/lib/nostrig/outbox.json"]
+CMD ["serve", "--health-file", "/tmp/nostrig/healthy", "--outbox-path", "/var/lib/nostrig/outbox.json", "--instance-lock", "/var/lib/nostrig/instance.lock"]

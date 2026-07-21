@@ -4,7 +4,7 @@
 
 ## Fleet placement
 
-Run one active instance on **edge-01**. It is the preferred Cascadia placement because it is an always-on edge service near the fleet relay. Keep **max** as the documented recovery target, but do not run both against the same recipient identity unless duplicate command handling has been explicitly accepted.
+Run one active instance on **edge-01**. It is the preferred Cascadia placement because it is an always-on edge service near the fleet relay. Keep **max** as the cold recovery target. Never run both against the same recipient identity; the failover procedure below requires fencing the old primary first.
 
 The default relay is `wss://relay.sharegap.net`. Scope each instance to one or more canonical repository addresses (`30617:<owner-pubkey>:<repo-id>`). With selectors configured, task creation must name an allowed `repo_addr`; later task mutations are accepted only when the existing `30900` state belongs to an allowed repository.
 
@@ -34,13 +34,15 @@ EOF
 install -d -m 0700 secrets
 umask 077
 printf '%s\n' '<nip46-client-secret-hex>' > secrets/nostrig_signer_client_secret_key
+sudo chown 65532:65532 secrets/nostrig_signer_client_secret_key
+sudo chmod 0400 secrets/nostrig_signer_client_secret_key
 
 docker compose config
 docker compose up -d --build
 docker compose ps
 ```
 
-`docker-compose.yml` sets `NOSTRIG_ENV=production`, uses `restart: unless-stopped`, mounts the client key as a Compose secret, persists the signed-event outbox in the `nostrig-state` volume, and checks the freshness of `/tmp/nostrig/healthy`. Multiple repository addresses may be comma-separated in `NOSTRIG_REPO_ADDRS`.
+`docker-compose.yml` sets `NOSTRIG_ENV=production`, runs as UID/GID 65532 with no capabilities and a read-only root filesystem, mounts the client key mode `0400` as a Compose secret, persists state and the instance lock in the `nostrig-state` volume, and checks the freshness of the tmpfs-backed `/tmp/nostrig/healthy`. Multiple repository addresses may be comma-separated in `NOSTRIG_REPO_ADDRS`.
 
 Useful checks:
 
@@ -90,9 +92,111 @@ nostrig outbox retry --path /var/lib/nostrig-fleet/outbox.json # retry all DLQ e
 
 The service publishes each relay attempt with a bounded timeout, exponential backoff with jitter, and a per-relay circuit breaker. Configure these with the `serve --help` retry, timeout, and circuit flags.
 
+## Image promotion and verification
+
+CI builds an OCI image with SBOM and provenance, scans both the archive and the pushed digest for unfixed high/critical vulnerabilities, and only publishes from `master`. Published images use the commit SHA tag and are signed keylessly with GitHub OIDC:
+
+```text
+ghcr.io/chebizarro/nostrig:<git-sha>@sha256:<digest>
+```
+
+Deploy by digest, not by a mutable tag. Before promotion, verify the signature and attestations against this repository's workflow identity:
+
+```bash
+IMAGE=ghcr.io/chebizarro/nostrig@sha256:<digest>
+cosign verify \
+  --certificate-identity-regexp '^https://github.com/chebizarro/nostrig/.github/workflows/ci.yml@refs/heads/master$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$IMAGE"
+cosign verify-attestation --type spdxjson \
+  --certificate-identity-regexp '^https://github.com/chebizarro/nostrig/.github/workflows/ci.yml@refs/heads/master$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$IMAGE"
+```
+
+## Graceful shutdown and the single-active guard
+
+The CLI handles `SIGINT` and `SIGTERM` through its root context. Cancellation stops the relay subscription, removes the liveness file, closes relay pools, and leaves any unacknowledged signed event in the durable outbox. Compose and systemd allow 30 seconds before forcing termination. Always use `docker compose stop` or `systemctl stop`; do not send `SIGKILL` during normal operations.
+
+Production launchers pass `--instance-lock` inside the persistent state directory. The process takes a non-blocking exclusive lock before connecting to Signet, so a second process sharing that state directory fails closed. This prevents duplicate local instances and accidental Compose/systemd overlap on one host.
+
+The lock is not a cross-host lease. Until the compare-and-set work provides a safe distributed leader/claim primitive, enforce **one enabled host per Signet identity**: edge-01 is enabled and max is stopped/disabled. Never start max until edge-01 is confirmed stopped and its subscription drained. Full automatic leader election remains deferred to the CAS work.
+
+## State inventory, backup, and restore
+
+Keep all host state under one protected state directory. The current server writes `outbox.json`; command-journal and cursor files should use `command-journal.json` and `cursor.json` when those stores are enabled. A sync cache should be placed at `task-cache.jsonl` (pass `nostrig sync --cache <state-dir>/task-cache.jsonl`). Back up the whole directory so journal, cursor, cache, outbox, and instance-lock metadata cannot be accidentally split across generations. The lock file itself has no recovery value.
+
+Create a cold Compose backup on the active host:
+
+```bash
+set -eu
+CONTAINER=$(docker compose ps -q nostrig-serve)
+STATE=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/nostrig"}}{{.Source}}{{end}}{{end}}' "$CONTAINER")
+docker compose stop -t 30 nostrig-serve
+sudo tar --numeric-owner -C "$STATE" \
+  --exclude=instance.lock -czf "nostrig-state-$(date -u +%Y%m%dT%H%M%SZ).tgz" .
+sha256sum nostrig-state-*.tgz
+docker compose up -d nostrig-serve
+```
+
+For systemd, stop `nostrig-serve@fleet`, archive `/var/lib/nostrig-fleet` with the same `tar --numeric-owner` pattern, hash the archive, and restart the unit. Store backups encrypted with the fleet backup service; the state files contain task data but must never contain the Signet client secret. Back up after deployment changes and at least daily. Retain the last seven daily and four weekly archives.
+
+Restore only while the target is stopped:
+
+```bash
+# Compose: derive STATE as above before stopping.
+docker compose stop -t 30 nostrig-serve
+sudo find "$STATE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+sudo tar --numeric-owner -C "$STATE" -xzf nostrig-state-<timestamp>.tgz
+sudo chown -R 65532:65532 "$STATE"
+sudo chmod 0700 "$STATE"
+sudo find "$STATE" -type f -exec chmod 0600 {} +
+test ! -e "$STATE/instance.lock" || sudo rm -f "$STATE/instance.lock"
+nostrig outbox list --path "$STATE/outbox.json"
+docker compose up -d nostrig-serve
+```
+
+For systemd use `/var/lib/nostrig-fleet`, preserve root ownership (the unit's `StateDirectory` ACL/ownership is managed by systemd), then start `nostrig-serve@fleet`. Validate JSON files with `jq empty`, validate each cache JSONL record with `jq -e .`, inspect the outbox, and confirm relay state before accepting commands. If a journal or cursor is absent because that store has not yet been enabled, record that fact in the drill log rather than creating an empty placeholder.
+
+## edge-01 primary and max recovery
+
+Normal state:
+
+- edge-01: `nostrig-serve@fleet` enabled and active, owns the production Signet identity.
+- max: identical binary digest and non-secret configuration installed, unit disabled and stopped.
+- Both hosts: root-owned `/etc/nostrig/fleet.env` mode `0600`; independently provisioned copy of the same Signet client credential at `/etc/nostrig/fleet.signer-client-secret` mode `0600`.
+- Backup archive and its SHA-256 digest available to both hosts through encrypted fleet backup storage.
+
+Planned failover to max:
+
+1. Stop edge-01 with the 30-second grace period and confirm the process is gone.
+2. Confirm edge-01 no longer has a relay subscription and record the last handled event/cursor and outbox status.
+3. Take and hash a final cold backup; transfer it over the approved encrypted channel.
+4. On max, verify the deployed image signature/digest, restore state, validate all state files, and confirm the unit is disabled before the restore.
+5. Start (do not yet enable) `nostrig-serve@fleet` on max. Confirm the local instance lock is held, Signet connects, the outbox drains, and expected relay state is readable.
+6. Exercise one reversible canary command. If successful, enable the max unit and record max as temporary primary in Bahia.
+7. Keep edge-01 stopped until failback completes.
+
+Unplanned edge-01 loss follows the same sequence using the newest verified backup. Before starting max, fence edge-01 at the host/power or network layer so it cannot return and reconnect with the same identity. If fencing cannot be proven, do not start max.
+
+Fail back by stopping and backing up max, fencing max, restoring the final archive to edge-01, verifying the identical image digest/configuration, starting edge-01, executing the canary, updating Bahia, and only then disabling max again.
+
+## Restore and failover drills
+
+Run a restore drill monthly and after any state-schema change:
+
+1. Restore the latest backup into an isolated disposable directory or host with relay publishing blocked.
+2. Verify the archive checksum, ownership/modes, JSON/JSONL parsing, outbox inspection, and expected journal/cursor/cache counts.
+3. Start with a disposable identity and test relay, confirm recovery, then destroy the drill state.
+4. Record backup ID, image digest, start/end time, checks performed, RTO, data-loss window, and follow-up issues.
+
+Run a controlled edge-01 to max failover and failback quarterly using the procedure above. The pass criteria are: only one production identity connection at every point, forced duplicate start rejected by the instance lock, no corrupt state, outbox eventually empty or explicitly accounted for, one successful canary on each promoted host, and Bahia reflecting the active host. Abort and fence both instances if identity overlap is observed.
+
 ## Bahia service registration
 
-Register the chosen Compose project or `nostrig-serve@fleet` unit in Bahia as a managed service. The service record should identify edge-01 as primary, max as the recovery target, the relay and repository selectors as non-secret configuration, the Signet credential owner, the restart action, and the liveness-file check. Bahia should reference the host-managed secret; it must not store or render the client secret or a raw Nostr private key. No Bahia code change is required for this deployment.
+Register with Bahia's signer-first ContextVM convention. `deploy/bahia/service-create.json` is the JSON-RPC content template; publish it as kind `25910`, addressed to the Bahia service pubkey, with `method=service/create`, `service=nostrig`, and an idempotent `d=service-create:nostrig` tag. Require relay `OK` and the correlated success result, then verify the service through Bahia's read model.
+
+After creation, record the edge-01 Compose project or `nostrig-serve@fleet` unit as the active runtime and max as the cold recovery target. Runtime metadata must include the immutable image digest, relay/repository selectors, restart/stop commands, state directory, liveness-file check, and Signet credential owner. Bahia may reference `/etc/nostrig/fleet.signer-client-secret` as host-managed metadata but must never ingest or render its value.
 
 ## Local smoke test
 

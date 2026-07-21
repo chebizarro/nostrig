@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": "service-create:nostrig",
+  "method": "service/create",
+  "params": {
+    "name": "nostrig",
+    "repo_url": "https://github.com/chebizarro/nostrig",
+    "artifact_repo": "ghcr.io/chebizarro/nostrig",
+    "default_branch": "master",
+    "runtime_type": "compose"
+  }
+}
