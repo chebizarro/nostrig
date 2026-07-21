@@ -94,12 +94,82 @@ func Encode(export *beadspb.Export, pubkey string, at time.Time) ([]*gonostr.Eve
 // Decode reconstructs the full beads protobuf. Event tags are indexes and
 // authorization hints; content is the lossless canonical record.
 func Decode(events []*gonostr.Event) (*beadspb.Export, error) {
-	out := &beadspb.Export{}
-	unmarshal := protojson.UnmarshalOptions{DiscardUnknown: false}
+	return decode(events, "", false)
+}
+
+// DecodeVerified reconstructs one author's ledger after validating every
+// accepted event signature. Replaceable task and collection events are reduced
+// latest-wins; kind-5 address tombstones suppress older state. This makes relay
+// replay safe for restart/catch-up and prevents another author deleting state.
+func DecodeVerified(events []*gonostr.Event, pubkey string) (*beadspb.Export, error) {
+	if strings.TrimSpace(pubkey) == "" {
+		return nil, fmt.Errorf("author pubkey is required")
+	}
+	return decode(events, pubkey, true)
+}
+
+func decode(events []*gonostr.Event, pubkey string, verify bool) (*beadspb.Export, error) {
+	latest := make(map[string]*gonostr.Event)
+	tombstones := make(map[string]*gonostr.Event)
 	for _, ev := range events {
-		if ev == nil {
+		if ev == nil || (pubkey != "" && ev.PubKey != pubkey) {
 			continue
 		}
+		if verify {
+			ok, err := ev.CheckSignature()
+			if err != nil || !ok {
+				return nil, fmt.Errorf("invalid event signature %s", ev.ID)
+			}
+		}
+		switch ev.Kind {
+		case fn.KindTaskState, fn.KindNIP51Set:
+			d, ok := fn.TagD(ev)
+			if !ok {
+				return nil, fmt.Errorf("kind %d event %s missing d tag", ev.Kind, ev.ID)
+			}
+			if (ev.Kind == fn.KindTaskState && !strings.HasPrefix(d, "task:")) ||
+				(ev.Kind == fn.KindNIP51Set && !strings.HasPrefix(d, "epic:")) {
+				continue
+			}
+			addr := fmt.Sprintf("%d:%s:%s", ev.Kind, ev.PubKey, d)
+			if newer(ev, latest[addr]) {
+				latest[addr] = ev
+			}
+		case gonostr.KindDeletion:
+			for _, tag := range ev.Tags {
+				if len(tag) < 2 || tag[0] != "a" {
+					continue
+				}
+				parts := strings.SplitN(tag[1], ":", 3)
+				if len(parts) != 3 || parts[1] != ev.PubKey {
+					continue
+				}
+				if newer(ev, tombstones[tag[1]]) {
+					tombstones[tag[1]] = ev
+				}
+			}
+		}
+	}
+
+	reduced := make([]*gonostr.Event, 0, len(latest))
+	for addr, ev := range latest {
+		if tomb := tombstones[addr]; tomb != nil && !newer(ev, tomb) {
+			continue
+		}
+		reduced = append(reduced, ev)
+	}
+	sort.Slice(reduced, func(i, j int) bool {
+		if reduced[i].Kind != reduced[j].Kind {
+			return reduced[i].Kind < reduced[j].Kind
+		}
+		di, _ := fn.TagD(reduced[i])
+		dj, _ := fn.TagD(reduced[j])
+		return di < dj
+	})
+
+	out := &beadspb.Export{}
+	unmarshal := protojson.UnmarshalOptions{DiscardUnknown: false}
+	for _, ev := range reduced {
 		switch ev.Kind {
 		case fn.KindTaskState:
 			d, ok := fn.TagD(ev)
@@ -146,4 +216,14 @@ func Decode(events []*gonostr.Event) (*beadspb.Export, error) {
 	sort.Slice(out.Issues, func(i, j int) bool { return out.Issues[i].Id < out.Issues[j].Id })
 	sort.Slice(out.Epics, func(i, j int) bool { return out.Epics[i].Id < out.Epics[j].Id })
 	return out, nil
+}
+
+func newer(candidate, current *gonostr.Event) bool {
+	if candidate == nil {
+		return false
+	}
+	if current == nil || candidate.CreatedAt != current.CreatedAt {
+		return current == nil || candidate.CreatedAt > current.CreatedAt
+	}
+	return candidate.ID > current.ID
 }

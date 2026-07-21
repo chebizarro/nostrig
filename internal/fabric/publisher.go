@@ -49,6 +49,13 @@ func (p *Publisher) Publish(ctx context.Context, events []*gonostr.Event) ([]*go
 		if ev == nil || ev.ID == "" || ev.Sig == "" {
 			return nil, fmt.Errorf("Signet returned incomplete signed event %s", eventD(unsigned))
 		}
+		if ev.PubKey != pubkey {
+			return nil, fmt.Errorf("Signet returned event for unexpected pubkey %q", ev.PubKey)
+		}
+		ok, err := ev.CheckSignature()
+		if err != nil || !ok {
+			return nil, fmt.Errorf("Signet returned invalid signature for %s", eventD(unsigned))
+		}
 		for _, relay := range p.Relays {
 			if err := relay.Publish(ctx, *ev); err != nil {
 				return nil, fmt.Errorf("publish %s: %w", eventD(ev), err)
