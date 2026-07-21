@@ -41,20 +41,22 @@ make build
 ./bin/nostrig --help
 ```
 
-### Go install
+### Install from a checkout
+
+The pinned Cascadia Go bindings are included as a local source snapshot, so build
+or install from a checkout:
 
 ```bash
-go install github.com/chebizarro/nostrig/cmd/nostrig@latest
+git clone https://github.com/chebizarro/nostrig
+cd nostrig
+go install ./cmd/nostrig
 nostrig --help
 ```
 
-Note: `go install` installs binaries to `$(go env GOPATH)/bin` (or `$GOBIN` if set). Ensure that directory is on your `PATH`.
-
-For local development from the repo root:
-
-```bash
-go install ./cmd/nostrig
-```
+`go install ...@latest` is not supported while the canonical Cascadia module is
+available only from the authenticated ShareGap host. See
+[docs/build.md](./docs/build.md) for dependency provenance, quality gates, and
+release-image artifacts.
 
 ## Usage
 
@@ -250,7 +252,11 @@ go generate ./...
 
 ```bash
 make build
+make check
 ```
+
+See [docs/build.md](./docs/build.md) for the pinned toolchain, standalone Docker
+build, SBOM, provenance, and immutable image digest workflow.
 
 ### Install to GOPATH/bin
 

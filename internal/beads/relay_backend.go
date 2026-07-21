@@ -10,6 +10,7 @@ import (
 	gonostr "fiatjaf.com/nostr"
 	pb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -254,18 +255,10 @@ func ensureMetadata(issue *pb.Issue) {
 }
 
 func cloneIssueForRelay(issue *pb.Issue) *pb.Issue {
-	cp := *issue
-	cp.Labels = append([]string(nil), issue.Labels...)
-	cp.DependsOn = append([]string(nil), issue.DependsOn...)
-	if issue.Metadata != nil {
-		md := *issue.Metadata
-		md.Custom = map[string]string{}
-		for k, v := range issue.Metadata.Custom {
-			md.Custom[k] = v
-		}
-		cp.Metadata = &md
+	if issue == nil {
+		return nil
 	}
-	return &cp
+	return proto.Clone(issue).(*pb.Issue)
 }
 
 func cleanTaskIDs(in []string) []string {
