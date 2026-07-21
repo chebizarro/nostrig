@@ -115,6 +115,17 @@ func Decode(events []*gonostr.Event) (*beadspb.Export, error) {
 	return decodeCurrent(current)
 }
 
+// DecodeVerified is the compatibility surface for callers that only need the
+// current Beads export. ProjectVerified additionally returns retained NIP-09
+// tombstone evidence.
+func DecodeVerified(events []*gonostr.Event, pubkey string) (*beadspb.Export, error) {
+	projection, err := ProjectVerified(events, pubkey)
+	if err != nil {
+		return nil, err
+	}
+	return projection.Export, nil
+}
+
 func decodeCurrent(events []*gonostr.Event) (*beadspb.Export, error) {
 	out := &beadspb.Export{}
 	for _, ev := range events {

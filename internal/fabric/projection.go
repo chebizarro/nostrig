@@ -86,6 +86,11 @@ func (r *Reducer) Apply(ev *gonostr.Event) (bool, error) {
 	if ev.Kind == kindDeletion {
 		return r.applyDeletion(ev)
 	}
+	if ev.Kind == fn.KindTaskState || ev.Kind == fn.KindNIP51Set {
+		if _, ok := fn.TagD(ev); !ok {
+			return false, fmt.Errorf("kind %d event %s missing d tag", ev.Kind, ev.ID)
+		}
+	}
 	coord, recognized, err := stateCoordinate(ev)
 	if err != nil {
 		return false, err
@@ -175,6 +180,9 @@ func ProjectVerified(events []*gonostr.Event, author string) (*Projection, error
 		return nil, err
 	}
 	for _, ev := range events {
+		if ev != nil && ev.PubKey != author {
+			continue
+		}
 		if _, err := r.Apply(ev); err != nil {
 			return nil, err
 		}
