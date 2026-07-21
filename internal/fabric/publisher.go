@@ -3,6 +3,7 @@ package fabric
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	gonostr "github.com/nbd-wtf/go-nostr"
 )
@@ -48,6 +49,12 @@ func (p *Publisher) Publish(ctx context.Context, events []*gonostr.Event) ([]*go
 		}
 		if ev == nil || ev.ID == "" || ev.Sig == "" {
 			return nil, fmt.Errorf("Signet returned incomplete signed event %s", eventD(unsigned))
+		}
+		if ev.PubKey != unsigned.PubKey || ev.CreatedAt != unsigned.CreatedAt || ev.Kind != unsigned.Kind || ev.Content != unsigned.Content || !reflect.DeepEqual(ev.Tags, unsigned.Tags) {
+			return nil, fmt.Errorf("Signet changed unsigned event %s", eventD(unsigned))
+		}
+		if err := ValidateSignedEvent(ev, pubkey); err != nil {
+			return nil, fmt.Errorf("Signet returned invalid event %s: %w", eventD(unsigned), err)
 		}
 		for _, relay := range p.Relays {
 			if err := relay.Publish(ctx, *ev); err != nil {

@@ -61,7 +61,13 @@ func Encode(export *beadspb.Export, pubkey string, at time.Time) ([]*gonostr.Eve
 			tags = append(tags, gonostr.Tag{"a", fmt.Sprintf("%d:%s:task:%s", fn.KindTaskState, pubkey, dep), "depends_on"})
 		}
 		if issue.Assignee != "" {
-			tags = append(tags, gonostr.Tag{"p", issue.Assignee, "assignee"})
+			if validPubkey(issue.Assignee) {
+				tags = append(tags, gonostr.Tag{"p", issue.Assignee, "assignee"})
+			} else {
+				// Beads assignees are commonly names (for example "Strand"),
+				// which must not be emitted as an invalid Nostr p-tag pubkey.
+				tags = append(tags, gonostr.Tag{"assignee", issue.Assignee})
+			}
 		}
 		for _, label := range issue.Labels {
 			tags = append(tags, gonostr.Tag{"t", label})
@@ -92,58 +98,101 @@ func Encode(export *beadspb.Export, pubkey string, at time.Time) ([]*gonostr.Eve
 }
 
 // Decode reconstructs the full beads protobuf. Event tags are indexes and
-// authorization hints; content is the lossless canonical record.
+// authorization hints; content is the lossless canonical record. For relay
+// input use ProjectVerified; Decode intentionally accepts unsigned events so
+// callers can round-trip Encode output before the Signet boundary.
 func Decode(events []*gonostr.Event) (*beadspb.Export, error) {
+	r := newUncheckedReducer()
+	for _, ev := range events {
+		if _, err := r.Apply(ev); err != nil {
+			return nil, err
+		}
+	}
+	current := make([]*gonostr.Event, 0, len(r.current))
+	for _, ev := range r.current {
+		current = append(current, ev)
+	}
+	return decodeCurrent(current)
+}
+
+func decodeCurrent(events []*gonostr.Event) (*beadspb.Export, error) {
 	out := &beadspb.Export{}
-	unmarshal := protojson.UnmarshalOptions{DiscardUnknown: false}
 	for _, ev := range events {
 		if ev == nil {
 			continue
 		}
-		switch ev.Kind {
-		case fn.KindTaskState:
-			d, ok := fn.TagD(ev)
-			if !ok || !strings.HasPrefix(d, "task:") {
-				continue
-			}
-			var env taskEnvelope
-			if err := json.Unmarshal([]byte(ev.Content), &env); err != nil {
-				return nil, fmt.Errorf("decode %s: %w", d, err)
-			}
-			if env.Schema != schema {
-				return nil, fmt.Errorf("decode %s: unsupported schema %q", d, env.Schema)
-			}
-			issue := new(beadspb.Issue)
-			if err := unmarshal.Unmarshal(env.Issue, issue); err != nil {
-				return nil, fmt.Errorf("decode %s: %w", d, err)
-			}
-			if d != "task:"+issue.Id {
-				return nil, fmt.Errorf("task address/id mismatch: %q != %q", d, issue.Id)
-			}
+		issue, epic, recognized, err := decodeStateEvent(ev)
+		if err != nil {
+			return nil, err
+		}
+		if !recognized {
+			continue
+		}
+		if issue != nil {
 			out.Issues = append(out.Issues, issue)
-		case fn.KindNIP51Set:
-			d, ok := fn.TagD(ev)
-			if !ok || !strings.HasPrefix(d, "epic:") {
-				continue
-			}
-			var env epicEnvelope
-			if err := json.Unmarshal([]byte(ev.Content), &env); err != nil {
-				return nil, fmt.Errorf("decode %s: %w", d, err)
-			}
-			if env.Schema != schema {
-				return nil, fmt.Errorf("decode %s: unsupported schema %q", d, env.Schema)
-			}
-			epic := new(beadspb.Epic)
-			if err := unmarshal.Unmarshal(env.Epic, epic); err != nil {
-				return nil, fmt.Errorf("decode %s: %w", d, err)
-			}
-			if d != "epic:"+epic.Id {
-				return nil, fmt.Errorf("epic address/id mismatch: %q != %q", d, epic.Id)
-			}
+		}
+		if epic != nil {
 			out.Epics = append(out.Epics, epic)
 		}
 	}
 	sort.Slice(out.Issues, func(i, j int) bool { return out.Issues[i].Id < out.Issues[j].Id })
 	sort.Slice(out.Epics, func(i, j int) bool { return out.Epics[i].Id < out.Epics[j].Id })
 	return out, nil
+}
+
+func decodeStateEvent(ev *gonostr.Event) (*beadspb.Issue, *beadspb.Epic, bool, error) {
+	if ev == nil {
+		return nil, nil, false, nil
+	}
+	unmarshal := protojson.UnmarshalOptions{DiscardUnknown: false}
+	switch ev.Kind {
+	case fn.KindTaskState:
+		d, ok := fn.TagD(ev)
+		if !ok || !strings.HasPrefix(d, "task:") {
+			return nil, nil, false, nil
+		}
+		var env taskEnvelope
+		if err := json.Unmarshal([]byte(ev.Content), &env); err != nil {
+			return nil, nil, true, fmt.Errorf("decode %s: %w", d, err)
+		}
+		if env.Schema != schema {
+			return nil, nil, true, fmt.Errorf("decode %s: unsupported schema %q", d, env.Schema)
+		}
+		if len(env.Issue) == 0 || string(env.Issue) == "null" {
+			return nil, nil, true, fmt.Errorf("decode %s: issue is required", d)
+		}
+		issue := new(beadspb.Issue)
+		if err := unmarshal.Unmarshal(env.Issue, issue); err != nil {
+			return nil, nil, true, fmt.Errorf("decode %s: %w", d, err)
+		}
+		if d != "task:"+issue.Id {
+			return nil, nil, true, fmt.Errorf("task address/id mismatch: %q != %q", d, issue.Id)
+		}
+		return issue, nil, true, nil
+	case fn.KindNIP51Set:
+		d, ok := fn.TagD(ev)
+		if !ok || !strings.HasPrefix(d, "epic:") {
+			return nil, nil, false, nil
+		}
+		var env epicEnvelope
+		if err := json.Unmarshal([]byte(ev.Content), &env); err != nil {
+			return nil, nil, true, fmt.Errorf("decode %s: %w", d, err)
+		}
+		if env.Schema != schema {
+			return nil, nil, true, fmt.Errorf("decode %s: unsupported schema %q", d, env.Schema)
+		}
+		if len(env.Epic) == 0 || string(env.Epic) == "null" {
+			return nil, nil, true, fmt.Errorf("decode %s: epic is required", d)
+		}
+		epic := new(beadspb.Epic)
+		if err := unmarshal.Unmarshal(env.Epic, epic); err != nil {
+			return nil, nil, true, fmt.Errorf("decode %s: %w", d, err)
+		}
+		if d != "epic:"+epic.Id {
+			return nil, nil, true, fmt.Errorf("epic address/id mismatch: %q != %q", d, epic.Id)
+		}
+		return nil, epic, true, nil
+	default:
+		return nil, nil, false, nil
+	}
 }
