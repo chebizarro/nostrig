@@ -46,7 +46,7 @@ func TestCreateDryRunPrintsFullTaskCreateEvent(t *testing.T) {
 
 func TestClaimDryRunPrintsTaskClaimEvent(t *testing.T) {
 	cmd := newRootCmd()
-	cmd.SetArgs([]string{"claim", "--task-id", "task-1", "--claimer", "agent-a", "--recipient", "recipient-pubkey", "--dry-run"})
+	cmd.SetArgs([]string{"claim", "--task-id", "task-1", "--claimer", "agent-a", "--base-event-id", "base-1", "--recipient", "recipient-pubkey", "--dry-run"})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
@@ -63,7 +63,7 @@ func TestClaimDryRunPrintsTaskClaimEvent(t *testing.T) {
 
 func TestAssignDryRunPrintsTaskAssignEvent(t *testing.T) {
 	cmd := newRootCmd()
-	cmd.SetArgs([]string{"assign", "--task-id", "task-1", "--assignee", "agent-b", "--recipient", "recipient-pubkey", "--dry-run"})
+	cmd.SetArgs([]string{"assign", "--task-id", "task-1", "--assignee", "agent-b", "--base-event-id", "base-1", "--recipient", "recipient-pubkey", "--dry-run"})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
@@ -80,7 +80,7 @@ func TestAssignDryRunPrintsTaskAssignEvent(t *testing.T) {
 
 func TestUpdateDryRunPrintsTaskUpdateEvent(t *testing.T) {
 	cmd := newRootCmd()
-	cmd.SetArgs([]string{"update", "--task-id", "task-1", "--recipient", "recipient-pubkey", "--status", "in_progress", "--priority", "P0", "--set-label", "urgent", "--add-dep", "task-0", "--dry-run"})
+	cmd.SetArgs([]string{"update", "--task-id", "task-1", "--base-event-id", "base-1", "--recipient", "recipient-pubkey", "--status", "in_progress", "--priority", "P0", "--set-label", "urgent", "--add-dep", "task-0", "--dry-run"})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
@@ -97,7 +97,7 @@ func TestUpdateDryRunPrintsTaskUpdateEvent(t *testing.T) {
 
 func TestDeleteDryRunPrintsTaskDeleteEvent(t *testing.T) {
 	cmd := newRootCmd()
-	cmd.SetArgs([]string{"delete", "--task-id", "task-1", "--recipient", "recipient-pubkey", "--dry-run"})
+	cmd.SetArgs([]string{"delete", "--task-id", "task-1", "--base-event-id", "base-1", "--recipient", "recipient-pubkey", "--dry-run"})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)

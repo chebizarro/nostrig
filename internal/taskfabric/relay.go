@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	gonostr "fiatjaf.com/nostr"
@@ -26,12 +27,30 @@ type RelayLedger struct {
 	SyncNIP34Status bool
 }
 
+var relayMutationLocks sync.Map
+
+func relayMutationLock(key string) *sync.Mutex {
+	lock, _ := relayMutationLocks.LoadOrStore(key, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
 func (l *RelayLedger) GetTask(ctx context.Context, id string) (*beadspb.Issue, error) {
+	record, err := l.getTaskRecord(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if record == nil || record.Issue == nil {
+		return nil, fmt.Errorf("task %s not found", strings.TrimPrefix(strings.TrimSpace(id), "task:"))
+	}
+	return cloneIssue(record.Issue), nil
+}
+
+func (l *RelayLedger) getTaskRecord(ctx context.Context, id string) (*TaskRecord, error) {
 	id = strings.TrimPrefix(strings.TrimSpace(id), "task:")
 	if id == "" {
 		return nil, fmt.Errorf("task id is required")
 	}
-	events, err := FetchTaskStateEvents(ctx, l.client(), SyncOptions{Relays: l.Relays, TaskIDs: []string{id}, Authors: []string{l.CanonicalAuthor}, Limit: 10})
+	events, err := FetchTaskStateEvents(ctx, l.client(), SyncOptions{Relays: l.Relays, TaskIDs: []string{id}, Authors: []string{l.CanonicalAuthor}, Limit: 20})
 	if err != nil {
 		return nil, err
 	}
@@ -39,70 +58,90 @@ func (l *RelayLedger) GetTask(ctx context.Context, id string) (*beadspb.Issue, e
 	if err != nil {
 		return nil, err
 	}
-	for _, issue := range export.Issues {
-		if issue.Id == id {
-			return issue, nil
+	var issue *beadspb.Issue
+	for _, candidate := range export.Issues {
+		if candidate.Id == id {
+			issue = candidate
+			break
 		}
 	}
-	return nil, fmt.Errorf("task %s not found", id)
-}
-
-func (l *RelayLedger) PutTask(ctx context.Context, issue *beadspb.Issue) (*gonostr.Event, error) {
-	now := time.Now().UTC()
-	ev, err := nip34.BuildTaskStateEvent(issue, l.CanonicalAuthor, now)
-	if err != nil {
-		return nil, err
-	}
-	events := []*gonostr.Event{ev}
-	if l.SyncNIP34Status {
-		if status := nip34.BuildNIP34IssueStatusEvent(issue, now); status != nil {
-			events = append(events, status)
-		}
-	}
-	return l.publishEvents(ctx, events)
-}
-
-func (l *RelayLedger) DeleteTask(ctx context.Context, id string) (*gonostr.Event, error) {
-	id = strings.TrimPrefix(strings.TrimSpace(id), "task:")
-	if id == "" {
-		return nil, fmt.Errorf("task id is required")
-	}
-	events, err := FetchTaskStateEvents(ctx, l.client(), SyncOptions{Relays: l.Relays, TaskIDs: []string{id}, Authors: []string{l.CanonicalAuthor}, Limit: 10})
-	if err != nil {
-		return nil, err
+	if issue == nil {
+		return nil, nil
 	}
 	var latest *gonostr.Event
+	author := strings.ToLower(strings.TrimSpace(l.CanonicalAuthor))
 	for _, candidate := range events {
+		if candidate == nil || candidate.Kind != gonostr.Kind(nip34.KindCanonicalState) || candidate.PubKey.Hex() != author {
+			continue
+		}
 		d, _ := nip34.TagD(candidate)
-		if d != "task:"+id {
-			continue
-		}
-		if candidate.PubKey.Hex() != strings.ToLower(strings.TrimSpace(l.CanonicalAuthor)) {
-			continue
-		}
-		if latest == nil || eventAfter(candidate, latest) {
+		if d == "task:"+id && (latest == nil || eventAfter(candidate, latest)) {
 			latest = candidate
 		}
 	}
 	if latest == nil {
-		// NIP-09 deletion is idempotent. A relay may stop returning the target
-		// immediately after accepting the first request, so at-least-once
-		// command replay must treat an already-absent task as success.
-		return nil, nil
+		return nil, fmt.Errorf("canonical task %s has no state event", id)
 	}
-	issue, err := nip34.ParseTaskStateEvent(latest)
-	if err != nil {
-		return nil, err
-	}
-	repoAddr := issue.GetMetadata().GetCustom()["nip34.repo_addr"]
-	ev, err := nip34.BuildTaskTombstone(latest, repoAddr, l.CanonicalAuthor, time.Now().UTC())
-	if err != nil {
-		return nil, err
-	}
-	return l.publishOne(ctx, ev)
+	return &TaskRecord{Issue: cloneIssue(issue), EventID: latest.ID.Hex(), CreatedAt: nip34.EventTime(latest), event: latest}, nil
 }
 
-func (l *RelayLedger) GetQueue(ctx context.Context, repoAddr, queue string) ([]string, error) {
+func (l *RelayLedger) MutateTask(ctx context.Context, id string, mutate TaskMutation) (*TaskRecord, error) {
+	id = strings.TrimPrefix(strings.TrimSpace(id), "task:")
+	if id == "" || mutate == nil {
+		return nil, fmt.Errorf("task id and mutation are required")
+	}
+	lock := relayMutationLock(strings.ToLower(strings.TrimSpace(l.CanonicalAuthor)) + "|task|" + id)
+	lock.Lock()
+	defer lock.Unlock()
+
+	current, err := l.getTaskRecord(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	decision, err := mutate(cloneTaskRecord(current))
+	if err != nil {
+		return nil, err
+	}
+	if decision.Unchanged {
+		return cloneTaskRecord(current), nil
+	}
+	now := time.Now().UTC()
+	if decision.Delete {
+		if current == nil || current.event == nil {
+			return nil, nil
+		}
+		repoAddr := current.Issue.GetMetadata().GetCustom()["nip34.repo_addr"]
+		tombstone, err := nip34.BuildTaskTombstone(current.event, repoAddr, l.CanonicalAuthor, now)
+		if err != nil {
+			return nil, err
+		}
+		ev, err := l.publishOne(ctx, tombstone)
+		if err != nil {
+			return nil, err
+		}
+		return &TaskRecord{EventID: eventID(ev), CreatedAt: now}, nil
+	}
+	if decision.Issue == nil || decision.Issue.Id != id {
+		return nil, fmt.Errorf("task mutation returned invalid state")
+	}
+	state, err := nip34.BuildTaskStateEvent(decision.Issue, l.CanonicalAuthor, now)
+	if err != nil {
+		return nil, err
+	}
+	eventsToPublish := []*gonostr.Event{state}
+	if l.SyncNIP34Status {
+		if status := nip34.BuildNIP34IssueStatusEvent(decision.Issue, now); status != nil {
+			eventsToPublish = append(eventsToPublish, status)
+		}
+	}
+	ev, err := l.publishEvents(ctx, eventsToPublish)
+	if err != nil {
+		return nil, err
+	}
+	return &TaskRecord{Issue: cloneIssue(decision.Issue), EventID: eventID(ev), CreatedAt: now, event: ev}, nil
+}
+
+func (l *RelayLedger) GetQueue(ctx context.Context, repoAddr, queue string) (*QueueRecord, error) {
 	repoAddr = strings.TrimSpace(repoAddr)
 	if repoAddr == "" {
 		return nil, fmt.Errorf("repo addr is required")
@@ -123,8 +162,9 @@ func (l *RelayLedger) GetQueue(ctx context.Context, repoAddr, queue string) ([]s
 	}
 	var latest *gonostr.Event
 	expectedD := queueIdentifier(repoAddr, queue)
+	canonicalAuthor := strings.ToLower(strings.TrimSpace(l.CanonicalAuthor))
 	for _, ev := range events {
-		if ev == nil || ev.PubKey.Hex() != strings.ToLower(strings.TrimSpace(l.CanonicalAuthor)) {
+		if ev == nil || ev.PubKey.Hex() != canonicalAuthor {
 			continue
 		}
 		d, _ := nip34.TagD(ev)
@@ -139,23 +179,63 @@ func (l *RelayLedger) GetQueue(ctx context.Context, repoAddr, queue string) ([]s
 	if latest == nil {
 		return nil, nil
 	}
-	prefix := nip34.Address(nip34.KindCanonicalState, strings.ToLower(strings.TrimSpace(l.CanonicalAuthor)), "task:")
-	ids := []string{}
+	record := &QueueRecord{EventID: latest.ID.Hex(), CreatedAt: nip34.EventTime(latest)}
+	prefix := nip34.Address(nip34.KindCanonicalState, canonicalAuthor, "task:")
 	for _, tag := range latest.Tags {
-		if len(tag) >= 2 && tag[0] == "a" && strings.HasPrefix(tag[1], prefix) {
+		switch {
+		case len(tag) >= 2 && tag[0] == "a" && strings.HasPrefix(tag[1], prefix):
 			id := strings.TrimPrefix(tag[1], prefix)
 			if id == "" {
 				return nil, fmt.Errorf("relay returned malformed queue task coordinate")
 			}
-			ids = append(ids, id)
+			record.TaskIDs = append(record.TaskIDs, id)
+		case len(tag) == 5 && tag[0] == "lease":
+			expiresAt, err := time.Parse(time.RFC3339Nano, tag[3])
+			if err != nil || tag[1] == "" || tag[2] == "" || tag[4] == "" {
+				return nil, fmt.Errorf("relay returned malformed queue lease")
+			}
+			record.Leases = append(record.Leases, QueueLease{TaskID: tag[1], Worker: tag[2], ExpiresAt: expiresAt, LeaseID: tag[4]})
 		}
 	}
-	return ids, nil
+	return record, nil
 }
 
-func (l *RelayLedger) PutQueue(ctx context.Context, repoAddr, queue string, ids []string) (*gonostr.Event, error) {
-	ev := nip34.BuildQueueCollectionEventForAuthor(repoAddr, queue, ids, l.CanonicalAuthor, time.Now().UTC())
-	return l.publishOne(ctx, ev)
+func (l *RelayLedger) MutateQueue(ctx context.Context, repoAddr, queue string, mutate QueueMutation) (*QueueRecord, error) {
+	repoAddr, queue = strings.TrimSpace(repoAddr), queueName(queue)
+	if repoAddr == "" || mutate == nil {
+		return nil, fmt.Errorf("repo addr and queue mutation are required")
+	}
+	lock := relayMutationLock(strings.ToLower(strings.TrimSpace(l.CanonicalAuthor)) + "|queue|" + repoAddr + "|" + queue)
+	lock.Lock()
+	defer lock.Unlock()
+
+	current, err := l.GetQueue(ctx, repoAddr, queue)
+	if err != nil {
+		return nil, err
+	}
+	decision, err := mutate(cloneQueueRecord(current))
+	if err != nil {
+		return nil, err
+	}
+	if decision.Unchanged {
+		return cloneQueueRecord(current), nil
+	}
+	if decision.Queue == nil {
+		return nil, fmt.Errorf("queue mutation returned invalid state")
+	}
+	reservations := make([]nip34.QueueReservation, 0, len(decision.Queue.Leases))
+	for _, lease := range decision.Queue.Leases {
+		reservations = append(reservations, nip34.QueueReservation{TaskID: lease.TaskID, Worker: lease.Worker, LeaseID: lease.LeaseID, ExpiresAt: lease.ExpiresAt})
+	}
+	now := time.Now().UTC()
+	ev := nip34.BuildQueueCollectionEventWithReservations(repoAddr, queue, decision.Queue.TaskIDs, reservations, l.CanonicalAuthor, now)
+	published, err := l.publishOne(ctx, ev)
+	if err != nil {
+		return nil, err
+	}
+	out := cloneQueueRecord(decision.Queue)
+	out.EventID, out.CreatedAt = eventID(published), now
+	return out, nil
 }
 
 func (l *RelayLedger) publishOne(ctx context.Context, ev *gonostr.Event) (*gonostr.Event, error) {

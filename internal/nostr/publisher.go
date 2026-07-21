@@ -234,17 +234,35 @@ func BuildEpicCollectionEvent(epic *beadspb.Epic, issues []*beadspb.Issue, canon
 	return &gonostr.Event{Kind: gonostr.Kind(KindNamedList), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
 }
 
+type QueueReservation struct {
+	TaskID    string
+	Worker    string
+	LeaseID   string
+	ExpiresAt time.Time
+}
+
 func BuildQueueCollectionEventForAuthor(repoAddr, queue string, issueIDs []string, canonicalAuthor string, now time.Time) *gonostr.Event {
+	return BuildQueueCollectionEventWithReservations(repoAddr, queue, issueIDs, nil, canonicalAuthor, now)
+}
+
+func BuildQueueCollectionEventWithReservations(repoAddr, queue string, issueIDs []string, reservations []QueueReservation, canonicalAuthor string, now time.Time) *gonostr.Event {
 	queue = strings.TrimSpace(queue)
 	if queue == "" {
 		queue = "backlog"
 	}
+	author := strings.ToLower(strings.TrimSpace(canonicalAuthor))
 	d := "queue:" + strings.TrimSpace(repoAddr) + ":" + queue
 	tags := gonostr.Tags{{"d", d}, {"title", queue}, {"schema", "cascadia.task-collection.v1"}, {"a", strings.TrimSpace(repoAddr), "", "nip34-repo"}}
 	for _, id := range issueIDs {
-		if strings.TrimSpace(id) != "" {
-			tags = append(tags, gonostr.Tag{"a", "30900::task:" + id})
+		if id = strings.TrimSpace(id); id != "" {
+			tags = append(tags, gonostr.Tag{"a", Address(KindCanonicalState, author, "task:"+id)})
 		}
+	}
+	for _, reservation := range reservations {
+		if reservation.TaskID == "" || reservation.Worker == "" || reservation.LeaseID == "" || reservation.ExpiresAt.IsZero() {
+			continue
+		}
+		tags = append(tags, gonostr.Tag{"lease", reservation.TaskID, reservation.Worker, reservation.ExpiresAt.UTC().Format(time.RFC3339Nano), reservation.LeaseID})
 	}
 	return &gonostr.Event{Kind: gonostr.Kind(KindNamedList), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
 }
@@ -534,15 +552,27 @@ func BuildContextVMCommand(method, recipient string, params any, now time.Time) 
 }
 
 func BuildClaimDispatch(taskID, claimer, recipient string, now time.Time) (*gonostr.Event, error) {
-	return BuildContextVMCommand("task/claim", recipient, map[string]string{"task_id": taskID, "claimer": claimer, "dispatch": "fleet-worker"}, now)
+	return BuildClaimDispatchAtRevision(taskID, claimer, "", recipient, now)
+}
+
+func BuildClaimDispatchAtRevision(taskID, claimer, baseEventID, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("task/claim", recipient, map[string]string{"task_id": taskID, "claimer": claimer, "base_event_id": baseEventID, "dispatch": "fleet-worker"}, now)
 }
 
 func BuildAssignCommand(taskID, assignee, recipient string, now time.Time) (*gonostr.Event, error) {
-	return BuildContextVMCommand("task/assign", recipient, map[string]string{"task_id": taskID, "assignee": assignee}, now)
+	return BuildAssignCommandAtRevision(taskID, assignee, "", recipient, now)
+}
+
+func BuildAssignCommandAtRevision(taskID, assignee, baseEventID, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("task/assign", recipient, map[string]string{"task_id": taskID, "assignee": assignee, "base_event_id": baseEventID}, now)
 }
 
 func BuildCloseCommand(taskID, recipient string, now time.Time) (*gonostr.Event, error) {
-	return BuildContextVMCommand("task/close", recipient, map[string]string{"task_id": taskID}, now)
+	return BuildCloseCommandAtRevision(taskID, "", recipient, now)
+}
+
+func BuildCloseCommandAtRevision(taskID, baseEventID, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("task/close", recipient, map[string]string{"task_id": taskID, "base_event_id": baseEventID}, now)
 }
 
 func BuildQueueEnqueueCommand(queue, taskID, recipient string, now time.Time) (*gonostr.Event, error) {
@@ -550,7 +580,11 @@ func BuildQueueEnqueueCommand(queue, taskID, recipient string, now time.Time) (*
 }
 
 func BuildQueueEnqueueCommandForRepo(repoAddr, queue, taskID, recipient string, now time.Time) (*gonostr.Event, error) {
-	return BuildContextVMCommand("queue/enqueue", recipient, map[string]string{"repo_addr": repoAddr, "queue": queue, "task_id": taskID}, now)
+	return BuildQueueEnqueueCommandAtRevision(repoAddr, queue, taskID, "", recipient, now)
+}
+
+func BuildQueueEnqueueCommandAtRevision(repoAddr, queue, taskID, baseEventID, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("queue/enqueue", recipient, map[string]string{"repo_addr": repoAddr, "queue": queue, "task_id": taskID, "base_event_id": baseEventID}, now)
 }
 
 func BuildQueueDequeueCommand(queue, recipient string, now time.Time) (*gonostr.Event, error) {
@@ -558,7 +592,11 @@ func BuildQueueDequeueCommand(queue, recipient string, now time.Time) (*gonostr.
 }
 
 func BuildQueueDequeueCommandForRepo(repoAddr, queue, recipient string, now time.Time) (*gonostr.Event, error) {
-	return BuildContextVMCommand("queue/dequeue", recipient, map[string]string{"repo_addr": repoAddr, "queue": queue}, now)
+	return BuildQueueDequeueCommandAtRevision(repoAddr, queue, "", recipient, now)
+}
+
+func BuildQueueDequeueCommandAtRevision(repoAddr, queue, baseEventID, recipient string, now time.Time) (*gonostr.Event, error) {
+	return BuildContextVMCommand("queue/dequeue", recipient, map[string]string{"repo_addr": repoAddr, "queue": queue, "base_event_id": baseEventID}, now)
 }
 
 func BuildQueueListCommand(queue, recipient string, now time.Time) (*gonostr.Event, error) {

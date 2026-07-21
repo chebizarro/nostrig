@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,11 +29,15 @@ func testPubKey(n byte) gonostr.PubKey {
 }
 
 type memoryLedger struct {
+	mu            sync.Mutex
 	tasks         map[string]*beadspb.Issue
+	taskEventIDs  map[string]string
 	queues        map[string][]string
+	queueRecords  map[string]*QueueRecord
 	lastTaskEvent *gonostr.Event
 	getTaskErr    error
 	deleteCalls   int
+	nextEvent     byte
 }
 
 type testServeSigner struct{}
@@ -68,33 +73,115 @@ func (p errPublisher) Publish(ctx context.Context, relays []string, signer nip34
 	return p.err
 }
 
+func (m *memoryLedger) nextIDLocked() gonostr.ID {
+	m.nextEvent++
+	if m.nextEvent == 0 {
+		m.nextEvent++
+	}
+	return testID(m.nextEvent)
+}
+
 func (m *memoryLedger) GetTask(ctx context.Context, id string) (*beadspb.Issue, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.getTaskErr != nil {
 		return nil, m.getTaskErr
 	}
-	return m.tasks[id], nil
+	return cloneIssue(m.tasks[id]), nil
 }
-func (m *memoryLedger) PutTask(ctx context.Context, issue *beadspb.Issue) (*gonostr.Event, error) {
-	m.tasks[issue.Id] = issue
+
+func (m *memoryLedger) MutateTask(ctx context.Context, id string, mutate TaskMutation) (*TaskRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.getTaskErr != nil {
+		return nil, m.getTaskErr
+	}
+	if m.taskEventIDs == nil {
+		m.taskEventIDs = map[string]string{}
+	}
+	var current *TaskRecord
+	if issue := m.tasks[id]; issue != nil {
+		current = &TaskRecord{Issue: cloneIssue(issue), EventID: m.taskEventIDs[id]}
+	}
+	decision, err := mutate(cloneTaskRecord(current))
+	if err != nil {
+		return nil, err
+	}
+	if decision.Unchanged {
+		return cloneTaskRecord(current), nil
+	}
+	eventID := m.nextIDLocked()
+	if decision.Delete {
+		m.deleteCalls++
+		delete(m.tasks, id)
+		delete(m.taskEventIDs, id)
+		return &TaskRecord{EventID: eventID.Hex()}, nil
+	}
+	issue := cloneIssue(decision.Issue)
+	m.tasks[id] = issue
+	m.taskEventIDs[id] = eventID.Hex()
 	ev, err := nip34.BuildTaskStateEvent(issue, testPubKey(1).Hex(), time.Unix(10, 0))
 	if err != nil {
 		return nil, err
 	}
-	ev.PubKey = testPubKey(1)
+	ev.ID, ev.PubKey = eventID, testPubKey(1)
 	m.lastTaskEvent = ev
-	return ev, nil
+	return &TaskRecord{Issue: cloneIssue(issue), EventID: eventID.Hex(), event: ev}, nil
 }
-func (m *memoryLedger) DeleteTask(ctx context.Context, id string) (*gonostr.Event, error) {
-	m.deleteCalls++
-	delete(m.tasks, id)
-	return &gonostr.Event{ID: testID(12), Kind: gonostr.Kind(5)}, nil
+
+func (m *memoryLedger) GetQueue(ctx context.Context, repoAddr, queue string) (*QueueRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := repoAddr + "|" + queue
+	if record := m.queueRecords[key]; record != nil {
+		return cloneQueueRecord(record), nil
+	}
+	if ids, ok := m.queues[key]; ok {
+		return &QueueRecord{TaskIDs: append([]string(nil), ids...)}, nil
+	}
+	return nil, nil
 }
-func (m *memoryLedger) GetQueue(ctx context.Context, repoAddr, queue string) ([]string, error) {
-	return append([]string(nil), m.queues[repoAddr+"|"+queue]...), nil
+
+func (m *memoryLedger) taskRevision(id string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.taskEventIDs[id]
 }
-func (m *memoryLedger) PutQueue(ctx context.Context, repoAddr, queue string, ids []string) (*gonostr.Event, error) {
-	m.queues[repoAddr+"|"+queue] = append([]string(nil), ids...)
-	return &gonostr.Event{ID: testID(11)}, nil
+
+func (m *memoryLedger) queueRevision(repoAddr, queue string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if record := m.queueRecords[repoAddr+"|"+queue]; record != nil {
+		return record.EventID
+	}
+	return ""
+}
+
+func (m *memoryLedger) MutateQueue(ctx context.Context, repoAddr, queue string, mutate QueueMutation) (*QueueRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.queueRecords == nil {
+		m.queueRecords = map[string]*QueueRecord{}
+	}
+	key := repoAddr + "|" + queue
+	current := cloneQueueRecord(m.queueRecords[key])
+	if current == nil {
+		if ids, ok := m.queues[key]; ok {
+			current = &QueueRecord{TaskIDs: append([]string(nil), ids...)}
+		}
+	}
+	decision, err := mutate(cloneQueueRecord(current))
+	if err != nil {
+		return nil, err
+	}
+	if decision.Unchanged {
+		return cloneQueueRecord(current), nil
+	}
+	out := cloneQueueRecord(decision.Queue)
+	out.EventID = m.nextIDLocked().Hex()
+	m.queueRecords[key] = cloneQueueRecord(out)
+	m.queues[key] = append([]string(nil), out.TaskIDs...)
+	return out, nil
 }
 
 type discardAudit struct{}
@@ -143,7 +230,7 @@ func TestTaskCreateUpdateDeleteIntentRoundTrip(t *testing.T) {
 	}
 
 	update, _ := nip34.BuildContextVMCommand("task/update", "server", map[string]any{
-		"task_id": "task-1", "priority": "P0", "set_labels": []string{"urgent"},
+		"task_id": "task-1", "base_event_id": ledger.taskRevision("task-1"), "priority": "P0", "set_labels": []string{"urgent"},
 		"add_dependencies": []string{"task-2"}, "remove_dependencies": []string{"task-0"}, "epic": "",
 	}, time.Unix(3, 0))
 	update.ID, update.PubKey = testID(2), testPubKey(1)
@@ -155,7 +242,7 @@ func TestTaskCreateUpdateDeleteIntentRoundTrip(t *testing.T) {
 		t.Fatalf("task not fully updated: %#v", got)
 	}
 
-	remove, _ := nip34.BuildContextVMCommand("task/delete", "server", map[string]string{"task_id": "task-1"}, time.Unix(5, 0))
+	remove, _ := nip34.BuildContextVMCommand("task/delete", "server", map[string]string{"task_id": "task-1", "base_event_id": ledger.taskRevision("task-1")}, time.Unix(5, 0))
 	remove.ID, remove.PubKey = testID(3), testPubKey(1)
 	if _, err := h.HandleIntent(context.Background(), remove, time.Unix(6, 0)); err != nil {
 		t.Fatal(err)
@@ -168,14 +255,14 @@ func TestTaskCreateUpdateDeleteIntentRoundTrip(t *testing.T) {
 func TestTaskClaimIntentUpdatesTaskStateAndReturnsResult(t *testing.T) {
 	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{"task-1": {Id: "task-1", Title: "claim me", Status: beadspb.Status_STATUS_OPEN}}, queues: map[string][]string{}}
 	h := testHandler(ledger)
-	req, _ := nip34.BuildContextVMCommand("task/claim", "server", map[string]string{"task_id": "task-1", "claimer": "agent-a"}, time.Unix(1, 0))
+	req, _ := nip34.BuildContextVMCommand("task/claim", "server", map[string]string{"task_id": "task-1", "claimer": "agent-a", "base_event_id": ""}, time.Unix(1, 0))
 	req.ID, req.PubKey = testID(1), testPubKey(1)
 	resp, err := h.HandleIntent(context.Background(), req, time.Unix(2, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := ledger.tasks["task-1"]; got.Status != beadspb.Status_STATUS_IN_PROGRESS || got.Assignee != "agent-a" {
-		t.Fatalf("task not claimed: %#v", got)
+		t.Fatalf("task not claimed: %#v response=%s", got, resp.Content)
 	}
 	var body struct {
 		Result map[string]any `json:"result"`
@@ -191,7 +278,7 @@ func TestTaskClaimIntentUpdatesTaskStateAndReturnsResult(t *testing.T) {
 func TestTaskCloseIntentClosesTask(t *testing.T) {
 	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{"task-1": {Id: "task-1", Title: "close me", Status: beadspb.Status_STATUS_IN_PROGRESS}}, queues: map[string][]string{}}
 	h := testHandler(ledger)
-	req, _ := nip34.BuildCloseCommand("task-1", "server", time.Unix(1, 0))
+	req, _ := nip34.BuildCloseCommandAtRevision("task-1", "", "server", time.Unix(1, 0))
 	req.ID, req.PubKey = testID(1), testPubKey(1)
 	if _, err := h.HandleIntent(context.Background(), req, time.Unix(2, 0)); err != nil {
 		t.Fatal(err)
@@ -204,12 +291,12 @@ func TestTaskCloseIntentClosesTask(t *testing.T) {
 func TestQueueEnqueueDequeueRoundTrip(t *testing.T) {
 	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{"task-1": {Id: "task-1", Title: "queued", Metadata: &beadspb.Metadata{Custom: map[string]string{"nip34.repo_addr": "30617:owner:repo"}}}}, queues: map[string][]string{}}
 	h := testHandler(ledger)
-	enq, _ := nip34.BuildQueueEnqueueCommandForRepo("30617:owner:repo", "backlog", "task-1", "server", time.Unix(1, 0))
+	enq, _ := nip34.BuildQueueEnqueueCommandAtRevision("30617:owner:repo", "backlog", "task-1", "", "server", time.Unix(1, 0))
 	enq.ID, enq.PubKey = testID(2), testPubKey(1)
 	if _, err := h.HandleIntent(context.Background(), enq, time.Unix(2, 0)); err != nil {
 		t.Fatal(err)
 	}
-	deq, _ := nip34.BuildQueueDequeueCommandForRepo("30617:owner:repo", "backlog", "server", time.Unix(3, 0))
+	deq, _ := nip34.BuildQueueDequeueCommandAtRevision("30617:owner:repo", "backlog", ledger.queueRevision("30617:owner:repo", "backlog"), "server", time.Unix(3, 0))
 	deq.ID, deq.PubKey = testID(3), testPubKey(1)
 	resp, err := h.HandleIntent(context.Background(), deq, time.Unix(4, 0))
 	if err != nil {
@@ -221,8 +308,8 @@ func TestQueueEnqueueDequeueRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(resp.Content), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Result["task_id"] != "task-1" || len(ledger.queues["30617:owner:repo|backlog"]) != 0 {
-		t.Fatalf("unexpected dequeue result=%s queue=%#v", resp.Content, ledger.queues["30617:owner:repo|backlog"])
+	if body.Result["task_id"] != "task-1" || len(ledger.queueRecords["30617:owner:repo|backlog"].Leases) != 1 {
+		t.Fatalf("unexpected reservation result=%s queue=%#v", resp.Content, ledger.queueRecords["30617:owner:repo|backlog"])
 	}
 }
 

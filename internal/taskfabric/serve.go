@@ -3,7 +3,9 @@ package taskfabric
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,14 +15,6 @@ import (
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
-
-type Ledger interface {
-	GetTask(ctx context.Context, id string) (*beadspb.Issue, error)
-	PutTask(ctx context.Context, issue *beadspb.Issue) (*gonostr.Event, error)
-	DeleteTask(ctx context.Context, id string) (*gonostr.Event, error)
-	GetQueue(ctx context.Context, repoAddr, queue string) ([]string, error)
-	PutQueue(ctx context.Context, repoAddr, queue string, ids []string) (*gonostr.Event, error)
-}
 
 type Handler struct {
 	Ledger      Ledger
@@ -52,7 +46,25 @@ func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.
 			return nil, fmt.Errorf("intent recipient does not match this service")
 		}
 	}
-	resp := h.registry(ev, now).Dispatch(ctx, req)
+	var resp cascontextvm.Response
+	switch {
+	case req.JSONRPC != cascontextvm.JSONRPCVersion || strings.TrimSpace(req.Method) == "":
+		resp = cascontextvm.NewErrorResponse(req.ID, cascontextvm.InvalidRequestCode, "invalid request")
+	case !supportedMethod(req.Method):
+		resp = cascontextvm.NewErrorResponse(req.ID, cascontextvm.MethodNotFoundCode, "method not found")
+	default:
+		result, dispatchErr := h.dispatch(ctx, ev, req.Method, req.Params, ev.PubKey.Hex(), now)
+		if dispatchErr == nil {
+			resp = cascontextvm.NewResponse(req.ID, result)
+		} else {
+			var conflict *ConflictError
+			if errors.As(dispatchErr, &conflict) {
+				resp = cascontextvm.Response{JSONRPC: cascontextvm.JSONRPCVersion, ID: req.IDOrNull(), Error: &cascontextvm.Error{Code: conflictErrorCode, Message: conflict.Error(), Data: conflict.responseData()}}
+			} else {
+				resp = cascontextvm.NewErrorResponse(req.ID, cascontextvm.InternalErrorCode, dispatchErr.Error())
+			}
+		}
+	}
 	content, err := json.Marshal(resp)
 	if err != nil {
 		return nil, err
@@ -130,113 +142,177 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 			Updated:     timestamppb.New(now),
 			Metadata:    metadata,
 		}
-		ev, err := h.Ledger.PutTask(ctx, issue)
+		record, err := h.Ledger.MutateTask(ctx, id, func(current *TaskRecord) (TaskMutationResult, error) {
+			if current != nil {
+				return TaskMutationResult{}, &ConflictError{Resource: "task", Reason: "already_exists", ActualEventID: current.EventID, Assignee: current.Issue.Assignee, Status: statusString(current.Issue)}
+			}
+			return TaskMutationResult{Issue: issue}, nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		r := taskResult(issue, ev)
-		h.annotateQuality(ctx, r, []string{issue.Id})
+		r := taskResult(record.Issue, record.EventID)
+		h.annotateQuality(ctx, r, []string{record.Issue.Id})
 		return r, nil
 	case "task/claim":
-		id, claimer := get("task_id"), get("claimer")
+		id, claimer := strings.TrimPrefix(get("task_id"), "task:"), get("claimer")
 		if policy, ok := h.ACL[strings.ToLower(strings.TrimSpace(caller))]; ok && containsRole(policy.Roles, RoleWorker) {
 			claimer = strings.TrimSpace(policy.WorkerID)
 		}
 		if claimer == "" {
 			claimer = caller
 		}
-		issue, err := h.task(ctx, id)
+		base, err := requireBaseParam(p)
 		if err != nil {
 			return nil, err
 		}
-		issue.Assignee, issue.Status, issue.Updated = claimer, beadspb.Status_STATUS_IN_PROGRESS, timestamppb.New(now)
-		ev, err := h.Ledger.PutTask(ctx, issue)
+		record, err := h.Ledger.MutateTask(ctx, id, func(current *TaskRecord) (TaskMutationResult, error) {
+			if current == nil || current.Issue == nil {
+				return TaskMutationResult{}, fmt.Errorf("task %s not found", id)
+			}
+			if current.Issue.Assignee == claimer && current.Issue.Status == beadspb.Status_STATUS_IN_PROGRESS {
+				return TaskMutationResult{Unchanged: true}, nil
+			}
+			if current.Issue.Assignee != "" {
+				return TaskMutationResult{}, &ConflictError{Resource: "task", Reason: "already_claimed", ExpectedEventID: base, ActualEventID: current.EventID, Assignee: current.Issue.Assignee, Status: statusString(current.Issue)}
+			}
+			if current.Issue.Status != beadspb.Status_STATUS_OPEN {
+				return TaskMutationResult{}, &ConflictError{Resource: "task", Reason: "not_claimable", ExpectedEventID: base, ActualEventID: current.EventID, Status: statusString(current.Issue)}
+			}
+			if err := checkTaskBase(current, base); err != nil {
+				return TaskMutationResult{}, err
+			}
+			issue := cloneIssue(current.Issue)
+			issue.Assignee, issue.Status, issue.Updated = claimer, beadspb.Status_STATUS_IN_PROGRESS, timestamppb.New(now)
+			return TaskMutationResult{Issue: issue}, nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		r := taskResult(issue, ev)
-		h.annotateQuality(ctx, r, []string{issue.Id})
+		r := taskResult(record.Issue, record.EventID)
+		h.annotateQuality(ctx, r, []string{record.Issue.Id})
 		return r, nil
 	case "task/assign":
-		id, assignee := get("task_id"), get("assignee")
+		id, assignee := strings.TrimPrefix(get("task_id"), "task:"), get("assignee")
 		if assignee == "" {
 			return nil, fmt.Errorf("assignee is required")
 		}
-		issue, err := h.task(ctx, id)
+		base, err := requireBaseParam(p)
 		if err != nil {
 			return nil, err
 		}
-		issue.Assignee, issue.Updated = assignee, timestamppb.New(now)
-		ev, err := h.Ledger.PutTask(ctx, issue)
+		record, err := h.Ledger.MutateTask(ctx, id, func(current *TaskRecord) (TaskMutationResult, error) {
+			if current == nil || current.Issue == nil {
+				return TaskMutationResult{}, fmt.Errorf("task %s not found", id)
+			}
+			if err := checkTaskBase(current, base); err != nil {
+				return TaskMutationResult{}, err
+			}
+			issue := cloneIssue(current.Issue)
+			issue.Assignee, issue.Updated = assignee, timestamppb.New(now)
+			return TaskMutationResult{Issue: issue}, nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		r := taskResult(issue, ev)
-		h.annotateQuality(ctx, r, []string{issue.Id})
+		r := taskResult(record.Issue, record.EventID)
+		h.annotateQuality(ctx, r, []string{record.Issue.Id})
 		return r, nil
 	case "task/update":
-		issue, err := h.task(ctx, get("task_id"))
+		id := strings.TrimPrefix(get("task_id"), "task:")
+		base, err := requireBaseParam(p)
 		if err != nil {
 			return nil, err
 		}
-		if v := get("status"); v != "" {
-			issue.Status = nip34.ParseStatus(v)
-		}
-		if _, ok := p["assignee"]; ok {
-			issue.Assignee = get("assignee")
-		}
-		if _, ok := p["title"]; ok {
-			issue.Title = get("title")
-		}
-		if _, ok := p["description"]; ok {
-			issue.Description = get("description")
-		}
-		if _, ok := p["priority"]; ok {
-			issue.Priority = parsePriorityParam(get("priority"))
-		}
-		if _, ok := p["epic"]; ok {
-			issue.Epic = get("epic")
-		}
-		if _, ok := p["set_labels"]; ok {
-			issue.Labels = cleanStrings(paramList(p, "set_labels"))
-		}
-		issue.Labels = addStrings(issue.Labels, paramList(p, "add_labels"))
-		issue.Labels = removeStrings(issue.Labels, paramList(p, "remove_labels"))
-		issue.DependsOn = addStrings(issue.DependsOn, cleanTaskIDs(paramList(p, "add_dependencies")))
-		issue.DependsOn = removeStrings(issue.DependsOn, cleanTaskIDs(paramList(p, "remove_dependencies")))
-		issue.Updated = timestamppb.New(now)
-		ev, err := h.Ledger.PutTask(ctx, issue)
+		record, err := h.Ledger.MutateTask(ctx, id, func(current *TaskRecord) (TaskMutationResult, error) {
+			if current == nil || current.Issue == nil {
+				return TaskMutationResult{}, fmt.Errorf("task %s not found", id)
+			}
+			if err := checkTaskBase(current, base); err != nil {
+				return TaskMutationResult{}, err
+			}
+			issue := cloneIssue(current.Issue)
+			if v := get("status"); v != "" {
+				issue.Status = nip34.ParseStatus(v)
+			}
+			if _, ok := p["assignee"]; ok {
+				issue.Assignee = get("assignee")
+			}
+			if _, ok := p["title"]; ok {
+				issue.Title = get("title")
+			}
+			if _, ok := p["description"]; ok {
+				issue.Description = get("description")
+			}
+			if _, ok := p["priority"]; ok {
+				issue.Priority = parsePriorityParam(get("priority"))
+			}
+			if _, ok := p["epic"]; ok {
+				issue.Epic = get("epic")
+			}
+			if _, ok := p["set_labels"]; ok {
+				issue.Labels = cleanStrings(paramList(p, "set_labels"))
+			}
+			issue.Labels = addStrings(issue.Labels, paramList(p, "add_labels"))
+			issue.Labels = removeStrings(issue.Labels, paramList(p, "remove_labels"))
+			issue.DependsOn = addStrings(issue.DependsOn, cleanTaskIDs(paramList(p, "add_dependencies")))
+			issue.DependsOn = removeStrings(issue.DependsOn, cleanTaskIDs(paramList(p, "remove_dependencies")))
+			issue.Updated = timestamppb.New(now)
+			return TaskMutationResult{Issue: issue}, nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		r := taskResult(issue, ev)
-		h.annotateQuality(ctx, r, []string{issue.Id})
+		r := taskResult(record.Issue, record.EventID)
+		h.annotateQuality(ctx, r, []string{record.Issue.Id})
 		return r, nil
 	case "task/close":
-		issue, err := h.task(ctx, get("task_id"))
+		id := strings.TrimPrefix(get("task_id"), "task:")
+		base, err := requireBaseParam(p)
 		if err != nil {
 			return nil, err
 		}
-		issue.Status, issue.Updated = beadspb.Status_STATUS_CLOSED, timestamppb.New(now)
-		ev, err := h.Ledger.PutTask(ctx, issue)
+		record, err := h.Ledger.MutateTask(ctx, id, func(current *TaskRecord) (TaskMutationResult, error) {
+			if current == nil || current.Issue == nil {
+				return TaskMutationResult{}, fmt.Errorf("task %s not found", id)
+			}
+			if err := checkTaskBase(current, base); err != nil {
+				return TaskMutationResult{}, err
+			}
+			issue := cloneIssue(current.Issue)
+			issue.Status, issue.Updated = beadspb.Status_STATUS_CLOSED, timestamppb.New(now)
+			return TaskMutationResult{Issue: issue}, nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		r := taskResult(issue, ev)
-		h.annotateQuality(ctx, r, []string{issue.Id})
+		r := taskResult(record.Issue, record.EventID)
+		h.annotateQuality(ctx, r, []string{record.Issue.Id})
 		return r, nil
 	case "task/delete":
 		id := strings.TrimPrefix(get("task_id"), "task:")
 		if id == "" {
 			return nil, fmt.Errorf("task_id is required")
 		}
-		ev, err := h.Ledger.DeleteTask(ctx, id)
+		base, err := requireBaseParam(p)
+		if err != nil {
+			return nil, err
+		}
+		record, err := h.Ledger.MutateTask(ctx, id, func(current *TaskRecord) (TaskMutationResult, error) {
+			if err := checkTaskBase(current, base); err != nil {
+				return TaskMutationResult{}, err
+			}
+			if current == nil {
+				return TaskMutationResult{Unchanged: true}, nil
+			}
+			return TaskMutationResult{Delete: true}, nil
+		})
 		if err != nil {
 			return nil, err
 		}
 		r := map[string]any{"task_id": id, "deleted": true}
-		if ev != nil {
-			r["event_id"] = ev.ID
+		if record != nil && record.EventID != "" {
+			r["event_id"] = record.EventID
 		}
 		return r, nil
 	case "task/quality-status":
@@ -245,11 +321,13 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 			ids = append(ids, id)
 		}
 		if q := get("queue"); q != "" && len(ids) == 0 {
-			queueIDs, err := h.Ledger.GetQueue(ctx, get("repo_addr"), queueName(q))
+			queueRecord, err := h.Ledger.GetQueue(ctx, get("repo_addr"), queueName(q))
 			if err != nil {
 				return nil, err
 			}
-			ids = append(ids, queueIDs...)
+			if queueRecord != nil {
+				ids = append(ids, availableQueueIDs(queueRecord, now)...)
+			}
 		}
 		ids = cleanStrings(ids)
 		if len(ids) == 0 {
@@ -269,47 +347,89 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 		if id == "" {
 			return nil, fmt.Errorf("task_id is required")
 		}
-		ids, err := h.Ledger.GetQueue(ctx, repo, q)
+		base, err := requireBaseParam(p)
 		if err != nil {
 			return nil, err
 		}
-		if !contains(ids, id) {
-			ids = append(ids, id)
-		}
-		ev, err := h.Ledger.PutQueue(ctx, repo, q, ids)
+		record, err := h.Ledger.MutateQueue(ctx, repo, q, func(current *QueueRecord) (QueueMutationResult, error) {
+			if err := checkQueueBase(current, base); err != nil {
+				return QueueMutationResult{}, err
+			}
+			if current == nil {
+				current = &QueueRecord{}
+			}
+			if contains(current.TaskIDs, id) {
+				return QueueMutationResult{Unchanged: true}, nil
+			}
+			current.TaskIDs = append(current.TaskIDs, id)
+			return QueueMutationResult{Queue: current}, nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		r := queueResult(q, ids, ev)
+		r := queueResult(q, record, now)
 		r["repo_addr"] = repo
 		return r, nil
 	case "queue/dequeue":
 		repo, q := get("repo_addr"), queueName(get("queue"))
-		ids, err := h.Ledger.GetQueue(ctx, repo, q)
+		base, err := requireBaseParam(p)
 		if err != nil {
 			return nil, err
 		}
-		var id string
-		if len(ids) > 0 {
-			id, ids = ids[0], ids[1:]
+		worker := caller
+		if policy, ok := h.ACL[strings.ToLower(strings.TrimSpace(caller))]; ok && strings.TrimSpace(policy.WorkerID) != "" {
+			worker = strings.TrimSpace(policy.WorkerID)
 		}
-		ev, err := h.Ledger.PutQueue(ctx, repo, q, ids)
+		leaseSeconds := 300
+		if value := get("lease_seconds"); value != "" {
+			parsed, parseErr := strconv.Atoi(value)
+			if parseErr != nil || parsed < 1 || parsed > 3600 {
+				return nil, fmt.Errorf("lease_seconds must be between 1 and 3600")
+			}
+			leaseSeconds = parsed
+		}
+		var reservation QueueLease
+		record, err := h.Ledger.MutateQueue(ctx, repo, q, func(current *QueueRecord) (QueueMutationResult, error) {
+			for _, lease := range activeQueueLeases(current, now) {
+				if lease.Worker == worker {
+					reservation = lease
+					return QueueMutationResult{Unchanged: true}, nil
+				}
+			}
+			if err := checkQueueBase(current, base); err != nil {
+				return QueueMutationResult{}, err
+			}
+			if current == nil {
+				current = &QueueRecord{}
+			}
+			available := availableQueueIDs(current, now)
+			if len(available) == 0 {
+				return QueueMutationResult{Unchanged: true}, nil
+			}
+			reservation = QueueLease{TaskID: available[0], Worker: worker, LeaseID: ev.ID.Hex(), ExpiresAt: now.Add(time.Duration(leaseSeconds) * time.Second)}
+			current.Leases = append(activeQueueLeases(current, now), reservation)
+			return QueueMutationResult{Queue: current}, nil
+		})
 		if err != nil {
 			return nil, err
 		}
-		r := queueResult(q, ids, ev)
+		r := queueResult(q, record, now)
 		r["repo_addr"] = repo
-		r["task_id"] = id
+		r["task_id"] = reservation.TaskID
+		if reservation.TaskID != "" {
+			r["lease_id"] = reservation.LeaseID
+			r["lease_expires_at"] = reservation.ExpiresAt.UTC().Format(time.RFC3339Nano)
+		}
 		return r, nil
 	case "queue/list":
 		repo, q := get("repo_addr"), queueName(get("queue"))
-		ids, err := h.Ledger.GetQueue(ctx, repo, q)
+		record, err := h.Ledger.GetQueue(ctx, repo, q)
 		if err != nil {
 			return nil, err
 		}
-		r := queueResult(q, ids, nil)
+		r := queueResult(q, record, now)
 		r["repo_addr"] = repo
-		h.annotateQueueQuality(ctx, r, ids)
+		h.annotateQueueQuality(ctx, r, availableQueueIDs(record, now))
 		return r, nil
 	default:
 		return nil, fmt.Errorf("unsupported method %q", method)
@@ -331,10 +451,11 @@ func (h *Handler) task(ctx context.Context, id string) (*beadspb.Issue, error) {
 	return issue, nil
 }
 
-func taskResult(i *beadspb.Issue, ev *gonostr.Event) map[string]any {
+func taskResult(i *beadspb.Issue, eventID string) map[string]any {
 	r := map[string]any{"task_id": i.Id, "status": nip34.StatusString(i.Status), "assignee": i.Assignee}
-	if ev != nil {
-		r["event_id"] = ev.ID
+	if eventID != "" {
+		r["event_id"] = eventID
+		r["revision"] = eventID
 	}
 	return r
 }
@@ -369,10 +490,14 @@ func (h *Handler) annotateQueueQuality(ctx context.Context, r map[string]any, id
 	r["quality"] = quality
 }
 
-func queueResult(q string, ids []string, ev *gonostr.Event) map[string]any {
-	r := map[string]any{"queue": q, "task_ids": append([]string(nil), ids...)}
-	if ev != nil {
-		r["event_id"] = ev.ID
+func queueResult(q string, record *QueueRecord, now time.Time) map[string]any {
+	r := map[string]any{"queue": q, "task_ids": availableQueueIDs(record, now)}
+	if record != nil {
+		if record.EventID != "" {
+			r["event_id"] = record.EventID
+			r["revision"] = record.EventID
+		}
+		r["leases"] = activeQueueLeases(record, now)
 	}
 	return r
 }

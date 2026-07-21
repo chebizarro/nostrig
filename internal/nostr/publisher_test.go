@@ -179,6 +179,31 @@ func TestCanonicalTombstoneRequiresMatchingAuthorAndCoordinate(t *testing.T) {
 	}
 }
 
+func TestQueueCollectionPersistsCanonicalReservation(t *testing.T) {
+	author := fmt.Sprintf("%064x", 1)
+	expires := time.Unix(100, 123).UTC()
+	ev := BuildQueueCollectionEventWithReservations(
+		"30617:owner:repo",
+		"backlog",
+		[]string{"task-1"},
+		[]QueueReservation{{TaskID: "task-1", Worker: "worker-a", LeaseID: "command-event", ExpiresAt: expires}},
+		author,
+		time.Unix(10, 0),
+	)
+	if !hasExactTag(ev, "a", Address(KindCanonicalState, author, "task:task-1")) {
+		t.Fatalf("queue omitted canonical task coordinate: %#v", ev.Tags)
+	}
+	foundLease := false
+	for _, tag := range ev.Tags {
+		if len(tag) == 5 && tag[0] == "lease" && tag[1] == "task-1" && tag[2] == "worker-a" && tag[3] == expires.Format(time.RFC3339Nano) && tag[4] == "command-event" {
+			foundLease = true
+		}
+	}
+	if !foundLease {
+		t.Fatalf("queue omitted durable reservation: %#v", ev.Tags)
+	}
+}
+
 func TestBuildContextVMCommand(t *testing.T) {
 	ev, err := BuildClaimDispatch("task-1", "agent-a", "recipient-pubkey", time.Unix(1, 0))
 	if err != nil {
