@@ -32,6 +32,10 @@ type Source interface {
 	Intents(context.Context, string) ([]*gonostr.Event, error)
 }
 
+type IntentSubscriber interface {
+	SubscribeIntents(context.Context, string) (<-chan *gonostr.Event, error)
+}
+
 type Service struct {
 	Store     Store
 	Source    Source
@@ -110,32 +114,14 @@ func (s *Service) SyncOnce(ctx context.Context) error {
 		}
 		return intents[i].ID < intents[j].ID
 	})
+	appliedIntentIDs := make([]string, 0, len(intents))
 	for _, intent := range intents {
-		if intent == nil || intent.ID == "" {
-			continue
-		}
-		seen, err := s.Store.Seen(ctx, intent.ID)
+		applied, err := s.applyIntent(ctx, local, intent)
 		if err != nil {
 			return err
 		}
-		if seen {
-			continue
-		}
-		var taskID string
-		local, taskID, err = ApplyIntent(local, intent, s.PubKey)
-		if err != nil {
-			return fmt.Errorf("apply intent %s: %w", intent.ID, err)
-		}
-		issue := findIssue(local, taskID)
-		projection, err := Encode(&beadspb.Export{Issues: []*beadspb.Issue{issue}}, s.PubKey, time.Now().UTC())
-		if err != nil {
-			return err
-		}
-		if _, err := s.Publisher.Publish(ctx, projection); err != nil {
-			return err
-		}
-		if err := s.Store.MarkSeen(ctx, intent.ID); err != nil {
-			return err
+		if applied {
+			appliedIntentIDs = append(appliedIntentIDs, intent.ID)
 		}
 	}
 	if err := s.Store.Save(ctx, local); err != nil {
@@ -143,6 +129,14 @@ func (s *Service) SyncOnce(ctx context.Context) error {
 	}
 	if err := s.Store.SetOutboundDigest(ctx, modelDigest(local)); err != nil {
 		return err
+	}
+	// Save the materialized ledger before acknowledging intents. A crash in
+	// between may replay an idempotent replaceable projection, but can never mark
+	// an unapplied mutation as seen and lose it permanently.
+	for _, id := range appliedIntentIDs {
+		if err := s.Store.MarkSeen(ctx, id); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -168,6 +162,16 @@ func (s *Service) Run(ctx context.Context) error {
 	if interval <= 0 {
 		interval = 15 * time.Second
 	}
+	var live <-chan *gonostr.Event
+	if subscriber, ok := s.Source.(IntentSubscriber); ok {
+		var err error
+		live, err = subscriber.SubscribeIntents(ctx, s.PubKey)
+		if err != nil {
+			return fmt.Errorf("subscribe ContextVM intents: %w", err)
+		}
+	}
+	// Subscribe before catch-up so an ephemeral 25910 intent cannot land in the
+	// gap between the initial query and live subscription establishment.
 	if err := s.SyncOnce(ctx); err != nil {
 		return err
 	}
@@ -177,12 +181,59 @@ func (s *Service) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case intent, ok := <-live:
+			if !ok {
+				return fmt.Errorf("ContextVM intent subscription closed")
+			}
+			ledger, err := s.Store.Load(ctx)
+			if err != nil {
+				return err
+			}
+			applied, err := s.applyIntent(ctx, ledger, intent)
+			if err != nil {
+				return err
+			}
+			if !applied {
+				continue
+			}
+			if err := s.Store.Save(ctx, ledger); err != nil {
+				return err
+			}
+			if err := s.Store.SetOutboundDigest(ctx, modelDigest(ledger)); err != nil {
+				return err
+			}
+			if err := s.Store.MarkSeen(ctx, intent.ID); err != nil {
+				return err
+			}
 		case <-ticker.C:
 			if err := s.SyncOnce(ctx); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func (s *Service) applyIntent(ctx context.Context, ledger *beadspb.Export, intent *gonostr.Event) (bool, error) {
+	if intent == nil || intent.ID == "" {
+		return false, nil
+	}
+	seen, err := s.Store.Seen(ctx, intent.ID)
+	if err != nil || seen {
+		return false, err
+	}
+	updated, taskID, err := ApplyIntent(ledger, intent, s.PubKey)
+	if err != nil {
+		return false, fmt.Errorf("apply intent %s: %w", intent.ID, err)
+	}
+	issue := findIssue(updated, taskID)
+	projection, err := Encode(&beadspb.Export{Issues: []*beadspb.Issue{issue}}, s.PubKey, time.Now().UTC())
+	if err != nil {
+		return false, err
+	}
+	if _, err := s.Publisher.Publish(ctx, projection); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func modelDigest(export *beadspb.Export) string {

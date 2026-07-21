@@ -68,9 +68,8 @@ func (c *Client) FetchMany(ctx context.Context, relays []string, filters []gonos
 		out = append(out, ev)
 	}
 
-	// Don't treat timeout as error if we got some results
-	if ctx.Err() != nil && len(out) == 0 {
-		return out, ctx.Err()
+	if err := queryCtx.Err(); err != nil {
+		return out, fmt.Errorf("relay catch-up incomplete before EOSE: %w", err)
 	}
 	return out, nil
 }
