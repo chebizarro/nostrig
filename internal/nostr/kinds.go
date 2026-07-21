@@ -5,6 +5,8 @@ const (
 	// KindTaskState is the fleet-canonical, addressable task projection. Its d tag
 	// is always task:<beads-id>.
 	KindTaskState = 30900
+	// KindIntent is the fleet ContextVM JSON-RPC command transport.
+	KindIntent = 25910
 	// KindNIP51Set is the NIP-51 general-purpose set used for queues and epics.
 	KindNIP51Set = 30000
 
