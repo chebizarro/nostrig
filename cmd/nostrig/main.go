@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -33,7 +34,7 @@ func newRootCmd() *cobra.Command {
 
 func newServeCmd() *cobra.Command {
 	var relays []string
-	var bunkerURL, statePath string
+	var bunkerURL, connectSecretFile, storeKind, beadsDir, statePath, bdBinary, actor string
 	var interval time.Duration
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -45,10 +46,26 @@ func newServeCmd() *cobra.Command {
 			if bunkerURL == "" {
 				return fmt.Errorf("--signet-bunker is required (raw keys are not supported)")
 			}
-			if statePath == "" {
-				return fmt.Errorf("--state is required")
+			var store fabric.Store
+			switch storeKind {
+			case "bd":
+				if beadsDir == "" {
+					return fmt.Errorf("--beads-dir is required with --store=bd")
+				}
+				store = &fabric.BeadsStore{Directory: beadsDir, Binary: bdBinary, Actor: actor}
+			case "json":
+				if statePath == "" {
+					return fmt.Errorf("--state is required with --store=json")
+				}
+				store = &fabric.JSONStore{Path: statePath}
+			default:
+				return fmt.Errorf("--store must be explicitly set to bd or json")
 			}
-			signer, err := fabric.NewBunkerSigner(cmd.Context(), bunkerURL)
+			preparedBunkerURL, err := bunkerURLWithSecretFile(bunkerURL, connectSecretFile)
+			if err != nil {
+				return err
+			}
+			signer, err := fabric.NewBunkerSigner(cmd.Context(), preparedBunkerURL)
 			if err != nil {
 				return err
 			}
@@ -61,7 +78,7 @@ func newServeCmd() *cobra.Command {
 				relayPublishers = append(relayPublishers, fabric.WebsocketRelay{URL: url})
 			}
 			service := &fabric.Service{
-				Store:     &fabric.JSONStore{Path: statePath},
+				Store:     store,
 				Source:    &fabric.RelaySource{Relays: relays},
 				Publisher: &fabric.Publisher{Signer: signer, Relays: relayPublishers},
 				PubKey:    pubkey, Interval: interval,
@@ -71,9 +88,46 @@ func newServeCmd() *cobra.Command {
 	}
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s)")
 	cmd.Flags().StringVar(&bunkerURL, "signet-bunker", "", "Signet NIP-46 bunker URL")
-	cmd.Flags().StringVar(&statePath, "state", ".beads/fabric-state.json", "Durable protobuf-JSON ledger path")
+	cmd.Flags().StringVar(&connectSecretFile, "signet-connect-secret-file", "", "0600 file containing the NIP-46 connect secret (never pass it in the URL)")
+	cmd.Flags().StringVar(&storeKind, "store", "", "Required ledger backend: bd (production) or json (development/test)")
+	cmd.Flags().StringVar(&beadsDir, "beads-dir", "", "Beads workspace used by bd export/import")
+	cmd.Flags().StringVar(&bdBinary, "bd-bin", "bd", "bd executable")
+	cmd.Flags().StringVar(&actor, "actor", "nostrig", "Beads audit actor")
+	cmd.Flags().StringVar(&statePath, "state", "", "Development JSON-store path (only with --store=json)")
 	cmd.Flags().DurationVar(&interval, "interval", 15*time.Second, "Relay reconciliation interval")
 	return cmd
+}
+
+func bunkerURLWithSecretFile(input, secretFile string) (string, error) {
+	parsed, err := url.Parse(input)
+	if err != nil || parsed.Scheme != "bunker" {
+		return "", fmt.Errorf("invalid Signet bunker URL")
+	}
+	query := parsed.Query()
+	if query.Has("secret") {
+		return "", fmt.Errorf("inline NIP-46 secret is forbidden; use --signet-connect-secret-file")
+	}
+	if secretFile == "" {
+		return input, nil
+	}
+	info, err := os.Stat(secretFile)
+	if err != nil {
+		return "", fmt.Errorf("read NIP-46 connect secret file: %w", err)
+	}
+	if info.Mode().Perm()&0077 != 0 {
+		return "", fmt.Errorf("NIP-46 connect secret file must not be accessible by group or others")
+	}
+	secret, err := os.ReadFile(secretFile)
+	if err != nil {
+		return "", fmt.Errorf("read NIP-46 connect secret file: %w", err)
+	}
+	value := strings.TrimSpace(string(secret))
+	if value == "" {
+		return "", fmt.Errorf("NIP-46 connect secret file is empty")
+	}
+	query.Set("secret", value)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
 }
 
 func newFetchCmd() *cobra.Command {
