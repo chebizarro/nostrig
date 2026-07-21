@@ -32,6 +32,10 @@ type Source interface {
 	Intents(context.Context, string) ([]*gonostr.Event, error)
 }
 
+type IntentSubscriber interface {
+	SubscribeIntents(context.Context, string) (<-chan *gonostr.Event, error)
+}
+
 type Service struct {
 	Store     Store
 	Source    Source
@@ -95,30 +99,7 @@ func (s *Service) SyncOnce(ctx context.Context) error {
 		return intents[i].ID < intents[j].ID
 	})
 	for _, intent := range intents {
-		if intent == nil || intent.ID == "" {
-			continue
-		}
-		seen, err := s.Store.Seen(ctx, intent.ID)
-		if err != nil {
-			return err
-		}
-		if seen {
-			continue
-		}
-		var taskID string
-		local, taskID, err = ApplyIntent(local, intent, s.PubKey)
-		if err != nil {
-			return fmt.Errorf("apply intent %s: %w", intent.ID, err)
-		}
-		issue := findIssue(local, taskID)
-		projection, err := Encode(&beadspb.Export{Issues: []*beadspb.Issue{issue}}, s.PubKey, time.Now().UTC())
-		if err != nil {
-			return err
-		}
-		if _, err := s.Publisher.Publish(ctx, projection); err != nil {
-			return err
-		}
-		if err := s.Store.MarkSeen(ctx, intent.ID); err != nil {
+		if err := s.applyIntent(ctx, local, intent); err != nil {
 			return err
 		}
 	}
@@ -139,18 +120,66 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.SyncOnce(ctx); err != nil {
 		return err
 	}
+	var live <-chan *gonostr.Event
+	if subscriber, ok := s.Source.(IntentSubscriber); ok {
+		var err error
+		live, err = subscriber.SubscribeIntents(ctx, s.PubKey)
+		if err != nil {
+			return fmt.Errorf("subscribe ContextVM intents: %w", err)
+		}
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case intent, ok := <-live:
+			if !ok {
+				return fmt.Errorf("ContextVM intent subscription closed")
+			}
+			ledger, err := s.Store.Load(ctx)
+			if err != nil {
+				return err
+			}
+			if err := s.applyIntent(ctx, ledger, intent); err != nil {
+				return err
+			}
+			if err := s.Store.Save(ctx, ledger); err != nil {
+				return err
+			}
+			if err := s.Store.SetOutboundDigest(ctx, modelDigest(ledger)); err != nil {
+				return err
+			}
 		case <-ticker.C:
 			if err := s.SyncOnce(ctx); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func (s *Service) applyIntent(ctx context.Context, ledger *beadspb.Export, intent *gonostr.Event) error {
+	if intent == nil || intent.ID == "" {
+		return nil
+	}
+	seen, err := s.Store.Seen(ctx, intent.ID)
+	if err != nil || seen {
+		return err
+	}
+	updated, taskID, err := ApplyIntent(ledger, intent, s.PubKey)
+	if err != nil {
+		return fmt.Errorf("apply intent %s: %w", intent.ID, err)
+	}
+	issue := findIssue(updated, taskID)
+	projection, err := Encode(&beadspb.Export{Issues: []*beadspb.Issue{issue}}, s.PubKey, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	if _, err := s.Publisher.Publish(ctx, projection); err != nil {
+		return err
+	}
+	return s.Store.MarkSeen(ctx, intent.ID)
 }
 
 func modelDigest(export *beadspb.Export) string {
