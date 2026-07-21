@@ -42,6 +42,30 @@ func (s *RelaySource) Intents(ctx context.Context, recipient string) ([]*gonostr
 	return client.Fetch(ctx, s.Relays, gonostr.Filter{Kinds: []int{fn.KindIntent}, Tags: gonostr.TagMap{"p": []string{recipient}}})
 }
 
+func (s *RelaySource) SubscribeIntents(ctx context.Context, recipient string) (<-chan *gonostr.Event, error) {
+	if s == nil || len(s.Relays) == 0 {
+		return nil, fmt.Errorf("relay source is not configured")
+	}
+	pool := gonostr.NewSimplePool(ctx)
+	now := gonostr.Now()
+	stream := pool.SubMany(ctx, s.Relays, gonostr.Filters{{Kinds: []int{fn.KindIntent}, Tags: gonostr.TagMap{"p": []string{recipient}}, Since: &now}})
+	out := make(chan *gonostr.Event)
+	go func() {
+		defer close(out)
+		for item := range stream {
+			if item.Event == nil {
+				continue
+			}
+			select {
+			case out <- item.Event:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, nil
+}
+
 type WebsocketRelay struct{ URL string }
 
 func (r WebsocketRelay) Publish(ctx context.Context, event gonostr.Event) error {
