@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
@@ -66,4 +67,11 @@ func defaultOutboxPath() string {
 		return path
 	}
 	return ".nostrig/outbox.json"
+}
+
+func defaultCommandJournalPath(outboxPath string) string {
+	if path := strings.TrimSpace(os.Getenv("NOSTRIG_COMMAND_JOURNAL_PATH")); path != "" {
+		return path
+	}
+	return filepath.Join(filepath.Dir(outboxPath), "commands.json")
 }

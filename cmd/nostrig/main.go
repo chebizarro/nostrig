@@ -773,6 +773,8 @@ func newServeCmd() *cobra.Command {
 	var circuitCooldown time.Duration
 	var outboxDrainInterval time.Duration
 	var instanceLockPath string
+	var commandJournalPath string
+	var commandRetention time.Duration
 	outboxPath := defaultOutboxPath()
 	cmd := &cobra.Command{Use: "serve", Short: "Serve incoming ContextVM task and queue intents", RunE: func(cmd *cobra.Command, args []string) error {
 		instanceLock, err := acquireInstanceLock(instanceLockPath)
@@ -809,7 +811,15 @@ func newServeCmd() *cobra.Command {
 			MaxAttempts: retryMaxAttempts, CircuitFailureLimit: circuitFailureLimit, CircuitCooldown: circuitCooldown,
 			DrainInterval: outboxDrainInterval,
 		}
-		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{Relays: relaysWithEnv(relays), RepoAddrs: repoAddrsWithEnv(repoAddrs), Signer: signer, PubKey: pubkey, SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject, HealthFile: healthFile, Authorization: authz, Publication: publication})
+		journalPath := strings.TrimSpace(commandJournalPath)
+		if journalPath == "" {
+			journalPath = defaultCommandJournalPath(outboxPath)
+		}
+		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{
+			Relays: relaysWithEnv(relays), RepoAddrs: repoAddrsWithEnv(repoAddrs), Signer: signer, PubKey: pubkey,
+			SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject, HealthFile: healthFile,
+			Authorization: authz, Publication: publication, CommandJournalPath: journalPath, CommandRetention: commandRetention,
+		})
 	}}
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to subscribe/publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
 	cmd.Flags().StringSliceVar(&ledgerRelays, "ledger-relay", nil, "Required ledger relay(s), repeatable; defaults to --relay or NOSTRIG_LEDGER_RELAYS")
@@ -822,6 +832,8 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&aclFile, "acl-file", "", "Caller ACL JSON file; defaults to NOSTRIG_ACL_FILE")
 	cmd.Flags().IntVar(&ackQuorum, "relay-ack-quorum", 0, "Required-relay acknowledgements needed; 0 means all required relays")
 	cmd.Flags().StringVar(&outboxPath, "outbox-path", outboxPath, "Durable outbound spool; defaults to NOSTRIG_OUTBOX_PATH")
+	cmd.Flags().StringVar(&commandJournalPath, "command-journal-path", strings.TrimSpace(os.Getenv("NOSTRIG_COMMAND_JOURNAL_PATH")), "Durable command ledger; defaults beside the outbox")
+	cmd.Flags().DurationVar(&commandRetention, "command-retention", 30*24*time.Hour, "Completed-command response retention and replay age limit")
 	cmd.Flags().StringVar(&instanceLockPath, "instance-lock", strings.TrimSpace(os.Getenv("NOSTRIG_INSTANCE_LOCK")), "Exclusive local lock file preventing duplicate active instances")
 	cmd.Flags().DurationVar(&publishTimeout, "relay-publish-timeout", 10*time.Second, "Per-relay publication timeout")
 	cmd.Flags().DurationVar(&retryBaseBackoff, "relay-retry-base", time.Second, "Initial relay retry backoff")

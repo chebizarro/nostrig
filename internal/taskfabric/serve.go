@@ -65,6 +65,10 @@ func (h *Handler) HandleIntent(ctx context.Context, ev *gonostr.Event, now time.
 			}
 		}
 	}
+	return newContextVMResponseEvent(ev, req, resp, now)
+}
+
+func newContextVMResponseEvent(ev *gonostr.Event, req cascontextvm.Request, resp cascontextvm.Response, now time.Time) (*gonostr.Event, error) {
 	content, err := json.Marshal(resp)
 	if err != nil {
 		return nil, err

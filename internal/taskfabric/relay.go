@@ -50,7 +50,7 @@ func (l *RelayLedger) getTaskRecord(ctx context.Context, id string) (*TaskRecord
 	if id == "" {
 		return nil, fmt.Errorf("task id is required")
 	}
-	events, err := FetchTaskStateEvents(ctx, l.client(), SyncOptions{Relays: l.Relays, TaskIDs: []string{id}, Authors: []string{l.CanonicalAuthor}, Limit: 20})
+	events, err := FetchTaskStateEvents(ctx, l.client(), SyncOptions{Relays: l.Relays, TaskIDs: []string{id}, Authors: []string{l.CanonicalAuthor}})
 	if err != nil {
 		return nil, err
 	}
@@ -268,6 +268,8 @@ func (l *RelayLedger) client() *nip34.Client {
 
 type serveSubscriber func(ctx context.Context, relays []string, filter gonostr.Filter) <-chan gonostr.RelayEvent
 
+type serveBackfill func(ctx context.Context, relays []string, filter gonostr.Filter) ([]*gonostr.Event, error)
+
 type serveUnwrapper func(ctx context.Context, signer casnostr.Signer, outer *gonostr.Event) (*gonostr.Event, error)
 
 type serveWrapper func(ctx context.Context, signer casnostr.Signer, recipientPubkey string, payload json.RawMessage) (*gonostr.Event, error)
@@ -279,18 +281,24 @@ type serveErrorReporter func(stage string, err error, event *gonostr.Event)
 type serveVerifier func(event *gonostr.Event) bool
 
 type ServeOptions struct {
-	Relays          []string
-	RepoAddrs       []string
-	Signer          nip34.Signer
-	PubKey          string
-	SyncNIP34Status bool
-	QualityProject  string
-	HealthFile      string
-	Authorization   AuthorizationConfig
-	Audit           AuthzAuditSink
-	Publication     nip34.ReliablePublisherOptions
+	Relays             []string
+	RepoAddrs          []string
+	Signer             nip34.Signer
+	PubKey             string
+	SyncNIP34Status    bool
+	QualityProject     string
+	HealthFile         string
+	Authorization      AuthorizationConfig
+	Audit              AuthzAuditSink
+	Publication        nip34.ReliablePublisherOptions
+	CommandJournalPath string
+	CommandRetention   time.Duration
 
 	subscribe         serveSubscriber
+	backfill          serveBackfill
+	ledger            Ledger
+	quality           QualityLookup
+	now               func() time.Time
 	unwrap            serveUnwrapper
 	wrap              serveWrapper
 	publishWrapped    serveWrappedPublisher
@@ -373,8 +381,14 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			}
 		}()
 	}
-	ledger := &RelayLedger{Relays: requiredRelays, Signer: opts.Signer, Publisher: eventPublisher, CanonicalAuthor: strings.ToLower(pubkey), SyncNIP34Status: opts.SyncNIP34Status}
-	quality := &RelayQualitySource{Relays: requiredRelays, Project: opts.QualityProject}
+	var ledger Ledger = &RelayLedger{Relays: requiredRelays, Signer: opts.Signer, Publisher: eventPublisher, CanonicalAuthor: strings.ToLower(pubkey), SyncNIP34Status: opts.SyncNIP34Status}
+	if opts.ledger != nil {
+		ledger = opts.ledger
+	}
+	var quality QualityLookup = &RelayQualitySource{Relays: requiredRelays, Project: opts.QualityProject}
+	if opts.quality != nil {
+		quality = opts.quality
+	}
 	handler := &Handler{Ledger: ledger, Quality: quality, RepoAddrs: repoAddrs, Recipient: pubkey, ACL: opts.Authorization.Callers, ClosePolicy: opts.Authorization.ClosePolicy, Audit: audit}
 	subscribe := opts.subscribe
 	if subscribe == nil {
@@ -429,7 +443,56 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if verify == nil {
 		verify = func(event *gonostr.Event) bool { return casnostr.VerifyEvent((*casnostr.Event)(event)) }
 	}
+	publishPlain := func(ctx context.Context, response *gonostr.Event) error {
+		if reliablePublisher != nil {
+			_, err := reliablePublisher.PublishSigned(ctx, response)
+			return err
+		}
+		return responsePublisher.Publish(ctx, relays, opts.Signer, []*gonostr.Event{response})
+	}
+	var journal *CommandJournal
+	if path := strings.TrimSpace(opts.CommandJournalPath); path != "" {
+		journal, err = OpenCommandJournal(path, opts.CommandRetention)
+		if err != nil {
+			return fmt.Errorf("open command journal: %w", err)
+		}
+	}
+	processor := &commandProcessor{
+		journal: journal, handler: handler, signer: opts.Signer, contextSigner: contextSigner, relays: relays,
+		unwrap: unwrap, wrap: wrap, publishWrapped: publishWrapped, publishPlain: publishPlain,
+		reportError: reportError, verify: verify, now: opts.now,
+	}
 	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent), gonostr.Kind(cascadia.NIP59_GIFT_WRAP)}, Tags: gonostr.TagMap{"p": []string{pubkey}}}
+	if journal != nil {
+		if err := repairPendingCommands(ctx, processor, journal); err != nil {
+			return fmt.Errorf("repair pending commands: %w", err)
+		}
+		cursor, err := journal.Cursor()
+		if err != nil {
+			return fmt.Errorf("load command cursor: %w", err)
+		}
+		backfillFilter := filter
+		backfillFilter.Since = cursor.CreatedAt
+		backfill := opts.backfill
+		if backfill == nil {
+			client := nip34.NewClient()
+			backfill = func(ctx context.Context, relayURLs []string, filter gonostr.Filter) ([]*gonostr.Event, error) {
+				return client.Fetch(ctx, relayURLs, filter)
+			}
+		}
+		historical, err := backfill(ctx, relays, backfillFilter)
+		if err != nil {
+			return fmt.Errorf("backfill command journal: %w", err)
+		}
+		if err := processCommandBackfill(ctx, processor, journal, historical); err != nil {
+			return fmt.Errorf("process command backfill: %w", err)
+		}
+		cursor, err = journal.Cursor()
+		if err != nil {
+			return fmt.Errorf("reload command cursor: %w", err)
+		}
+		filter.Since = cursor.CreatedAt
+	}
 	ch := subscribe(ctx, relays, filter)
 	stopHealth, err := startHealthFile(ctx, opts.HealthFile)
 	if err != nil {
@@ -448,8 +511,13 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 				return fmt.Errorf("subscription closed")
 			}
 			ev := ie.Event
-			if err := serveRelayEvent(ctx, relays, opts.Signer, contextSigner, handler, unwrap, wrap, publishWrapped, responsePublisher, reportError, verify, &ev); err != nil {
+			if err := processor.Process(ctx, &ev); err != nil {
 				return err
+			}
+			if journal != nil {
+				if err := journal.AdvanceCursor(&ev); err != nil {
+					return fmt.Errorf("advance command cursor: %w", err)
+				}
 			}
 		}
 	}

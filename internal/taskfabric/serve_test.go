@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -365,6 +366,40 @@ func TestServeRequiresRepoAddrInProduction(t *testing.T) {
 	err := Serve(context.Background(), ServeOptions{Relays: []string{"wss://relay.example"}})
 	if err == nil || err.Error() != "at least one repo addr is required in production serve mode" {
 		t.Fatalf("expected production repo-addr guard, got %v", err)
+	}
+}
+
+func TestServeBackfillsBeforeStartingReadySubscription(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backfilled := false
+	subscribed := false
+	err := Serve(ctx, ServeOptions{
+		Relays:             []string{"wss://relay.example"},
+		Signer:             testServeSigner{},
+		PubKey:             fmt.Sprintf("%064x", 1),
+		Authorization:      testAuthorization(),
+		CommandJournalPath: filepath.Join(t.TempDir(), "commands.json"),
+		backfill: func(context.Context, []string, gonostr.Filter) ([]*gonostr.Event, error) {
+			backfilled = true
+			return nil, nil
+		},
+		subscribe: func(context.Context, []string, gonostr.Filter) <-chan gonostr.RelayEvent {
+			if !backfilled {
+				t.Fatal("live subscription started before durable backfill completed")
+			}
+			subscribed = true
+			ch := make(chan gonostr.RelayEvent)
+			close(ch)
+			return ch
+		},
+		verify: func(*gonostr.Event) bool { return true },
+	})
+	if !subscribed {
+		t.Fatal("serve never entered ready subscription state")
+	}
+	if err == nil || (err.Error() != "subscription closed" && !errors.Is(err, context.Canceled)) {
+		t.Fatalf("unexpected serve result: %v", err)
 	}
 }
 
