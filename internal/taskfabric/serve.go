@@ -13,6 +13,7 @@ import (
 	cascontextvm "git.sharegap.net/cascadia/cascadia-go/contextvm"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
+	"github.com/chebizarro/nostrig/internal/taskmodel"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -187,7 +188,10 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 				return TaskMutationResult{}, err
 			}
 			issue := cloneIssue(current.Issue)
-			issue.Assignee, issue.Status, issue.Updated = claimer, beadspb.Status_STATUS_IN_PROGRESS, timestamppb.New(now)
+			issue.Assignee, issue.Status, issue.Updated, issue.ClaimedAt = claimer, beadspb.Status_STATUS_IN_PROGRESS, timestamppb.New(now), timestamppb.New(now)
+			if issue.StartedAt == nil {
+				issue.StartedAt = timestamppb.New(now)
+			}
 			return TaskMutationResult{Issue: issue}, nil
 		})
 		if err != nil {
@@ -238,6 +242,9 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 			issue := cloneIssue(current.Issue)
 			if v := get("status"); v != "" {
 				issue.Status = nip34.ParseStatus(v)
+				if issue.Status == beadspb.Status_STATUS_BLOCKED {
+					issue.BlockedAt = timestamppb.New(now)
+				}
 			}
 			if _, ok := p["assignee"]; ok {
 				issue.Assignee = get("assignee")
@@ -261,6 +268,40 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 			issue.Labels = removeStrings(issue.Labels, paramList(p, "remove_labels"))
 			issue.DependsOn = addStrings(issue.DependsOn, cleanTaskIDs(paramList(p, "add_dependencies")))
 			issue.DependsOn = removeStrings(issue.DependsOn, cleanTaskIDs(paramList(p, "remove_dependencies")))
+			if _, ok := p["status_reason"]; ok {
+				issue.StatusReason = get("status_reason")
+			}
+			if _, ok := p["blocker_description"]; ok {
+				if issue.Status != beadspb.Status_STATUS_BLOCKED {
+					return TaskMutationResult{}, fmt.Errorf("blocker_description requires blocked status")
+				}
+				issue.BlockerDescription = get("blocker_description")
+			}
+			if _, ok := p["notes"]; ok {
+				issue.Notes = get("notes")
+			}
+			evidence := artifactReferences(paramList(p, "evidence_ids"), "evidence")
+			issue.Evidence = appendUniqueArtifacts(issue.Evidence, evidence...)
+			if summary := get("checkpoint_summary"); summary != "" {
+				checkpointID := get("checkpoint_id")
+				if checkpointID == "" {
+					checkpointID = "checkpoint:" + ev.ID.Hex()
+				}
+				checkpointEvidence := artifactReferences(paramList(p, "checkpoint_evidence_ids"), "evidence")
+				issue.Checkpoints = append(issue.Checkpoints, &beadspb.Checkpoint{
+					Id: checkpointID, Actor: caller, Status: get("checkpoint_status"), Summary: summary,
+					CreatedAt: timestamppb.New(now), Evidence: checkpointEvidence,
+				})
+			}
+			if strings.EqualFold(get("request_validation"), "true") {
+				if issue.Review == nil {
+					issue.Review = &beadspb.Review{}
+				}
+				issue.Review.Required = true
+				issue.Review.State = "requested"
+				issue.Review.Reviewer = get("reviewer")
+				issue.Review.Requirements = cleanStrings(paramList(p, "review_requirements"))
+			}
 			issue.Updated = timestamppb.New(now)
 			return TaskMutationResult{Issue: issue}, nil
 		})
@@ -284,7 +325,11 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 				return TaskMutationResult{}, err
 			}
 			issue := cloneIssue(current.Issue)
-			issue.Status, issue.Updated = beadspb.Status_STATUS_CLOSED, timestamppb.New(now)
+			issue.Status, issue.Updated, issue.ClosedAt = beadspb.Status_STATUS_CLOSED, timestamppb.New(now), timestamppb.New(now)
+			if _, ok := p["close_reason"]; ok {
+				issue.CloseReason = get("close_reason")
+			}
+			issue.Evidence = appendUniqueArtifacts(issue.Evidence, artifactReferences(paramList(p, "acceptance_evidence_ids"), "acceptance")...)
 			return TaskMutationResult{Issue: issue}, nil
 		})
 		if err != nil {
@@ -456,7 +501,10 @@ func (h *Handler) task(ctx context.Context, id string) (*beadspb.Issue, error) {
 }
 
 func taskResult(i *beadspb.Issue, eventID string) map[string]any {
-	r := map[string]any{"task_id": i.Id, "status": nip34.StatusString(i.Status), "assignee": i.Assignee}
+	r := map[string]any{"task_id": i.Id, "status": nip34.StatusString(i.Status), "assignee": i.Assignee, "evidence_ids": artifactEvidenceIDs(i)}
+	if task, err := taskmodel.FromProto(i); err == nil {
+		r["task"] = task
+	}
 	if eventID != "" {
 		r["event_id"] = eventID
 		r["revision"] = eventID
@@ -523,6 +571,51 @@ func paramList(p map[string]any, key string) []string {
 	default:
 		return []string{strings.TrimSpace(fmt.Sprint(x))}
 	}
+}
+
+func artifactReferences(ids []string, kind string) []*beadspb.ArtifactReference {
+	ids = cleanStrings(ids)
+	out := make([]*beadspb.ArtifactReference, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, &beadspb.ArtifactReference{Kind: kind, Reference: id})
+	}
+	return out
+}
+
+func appendUniqueArtifacts(base []*beadspb.ArtifactReference, values ...*beadspb.ArtifactReference) []*beadspb.ArtifactReference {
+	seen := map[string]struct{}{}
+	out := make([]*beadspb.ArtifactReference, 0, len(base)+len(values))
+	for _, ref := range append(append([]*beadspb.ArtifactReference(nil), base...), values...) {
+		if ref == nil {
+			continue
+		}
+		key := strings.Join([]string{ref.Kind, ref.Reference, ref.Sha256, ref.Url}, "|")
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, ref)
+	}
+	return out
+}
+
+func artifactEvidenceIDs(issue *beadspb.Issue) []string {
+	if issue == nil {
+		return []string{}
+	}
+	ids := make([]string, 0, len(issue.Evidence))
+	for _, ref := range issue.Evidence {
+		if ref == nil {
+			continue
+		}
+		for _, value := range []string{ref.Reference, ref.Sha256, ref.Url} {
+			if value = strings.TrimSpace(value); value != "" {
+				ids = append(ids, value)
+				break
+			}
+		}
+	}
+	return cleanStrings(ids)
 }
 
 func (h *Handler) authorizeRepo(ctx context.Context, method, taskID, repoAddr string) error {

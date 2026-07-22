@@ -14,6 +14,9 @@ import (
 
 const conflictErrorCode = -32009
 
+// ConflictErrorCode is the stable JSON-RPC code returned for CAS and lease conflicts.
+const ConflictErrorCode = conflictErrorCode
+
 // TaskRecord is the current canonical task plus the event that established it.
 type TaskRecord struct {
 	Issue     *beadspb.Issue

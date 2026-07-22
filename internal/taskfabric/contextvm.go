@@ -5,20 +5,52 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	gonostr "fiatjaf.com/nostr"
+	casnostr "git.sharegap.net/cascadia/cascadia-go/nostr"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 )
 
 type ContextVMResponse struct {
-	Event  *gonostr.Event   `json:"event,omitempty"`
-	ID     string           `json:"id,omitempty"`
-	Result *json.RawMessage `json:"result,omitempty"`
-	Error  string           `json:"error,omitempty"`
+	Event     *gonostr.Event   `json:"event,omitempty"`
+	ID        string           `json:"id,omitempty"`
+	Result    *json.RawMessage `json:"result,omitempty"`
+	Error     string           `json:"error,omitempty"`
+	ErrorCode int              `json:"error_code,omitempty"`
+	ErrorData json.RawMessage  `json:"error_data,omitempty"`
 }
 
-func WaitForContextVMResponse(ctx context.Context, relays []string, command *gonostr.Event, timeout time.Duration) (*ContextVMResponse, error) {
+type ContextVMResponseSource interface {
+	FetchMany(ctx context.Context, relays []string, filters []gonostr.Filter) ([]*gonostr.Event, error)
+	Subscribe(ctx context.Context, relays []string, filter gonostr.Filter) (<-chan gonostr.RelayEvent, error)
+}
+
+// ContextVMResponseWaiter owns subscribe-before-publish response observation.
+// PrepareContextVMResponseWait must be called before publishing the command.
+type ContextVMResponseWaiter struct {
+	ctx            context.Context
+	cancel         context.CancelFunc
+	source         ContextVMResponseSource
+	relays         []string
+	filters        []gonostr.Filter
+	command        *gonostr.Event
+	expectedAuthor string
+	preflight      []*gonostr.Event
+	live           <-chan gonostr.RelayEvent
+	closed         <-chan struct{}
+	once           sync.Once
+}
+
+// PrepareContextVMResponseWait subscribes to every correlation filter before
+// publication, performs a bounded EOSE preflight, and pins the expected server
+// author. Wait then reconciles stored responses with the live subscriptions.
+func PrepareContextVMResponseWait(ctx context.Context, relays []string, command *gonostr.Event, expectedAuthor string, timeout time.Duration) (*ContextVMResponseWaiter, error) {
+	return prepareContextVMResponseWaitWithSource(ctx, relays, command, expectedAuthor, timeout, nip34.NewClient())
+}
+
+func prepareContextVMResponseWaitWithSource(ctx context.Context, relays []string, command *gonostr.Event, expectedAuthor string, timeout time.Duration, source ContextVMResponseSource) (*ContextVMResponseWaiter, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("context is nil")
 	}
@@ -32,53 +64,178 @@ func WaitForContextVMResponse(ctx context.Context, relays []string, command *gon
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-
-	since := command.CreatedAt
-	filters := responseFilters(command, since)
-	client := nip34.NewClient()
-	if events, err := client.FetchMany(ctx, relays, filters); err == nil || nip34.IsPartialFetch(err) {
-		for _, ev := range events {
-			if resp, ok := MatchContextVMResponse(command, ev); ok {
-				return resp, nil
-			}
+	expectedAuthor = strings.ToLower(strings.TrimSpace(expectedAuthor))
+	var expectedKey gonostr.PubKey
+	if expectedAuthor != "" {
+		var err error
+		expectedKey, err = gonostr.PubKeyFromHex(expectedAuthor)
+		if err != nil {
+			return nil, fmt.Errorf("invalid expected ContextVM responder pubkey: %w", err)
 		}
-		if err != nil && ctx.Err() != nil {
+		expectedAuthor = expectedKey.Hex()
+	}
+
+	if source == nil {
+		return nil, fmt.Errorf("ContextVM response source is nil")
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	filters := responseFilters(command, command.CreatedAt)
+	if expectedAuthor != "" {
+		for i := range filters {
+			filters[i].Authors = []gonostr.PubKey{expectedKey}
+		}
+	}
+	subscriptions := make([]<-chan gonostr.RelayEvent, 0, len(filters))
+	for _, filter := range filters {
+		ch, err := source.Subscribe(waitCtx, relays, filter)
+		if err != nil {
+			cancel()
 			return nil, err
 		}
-	} else if ctx.Err() != nil {
+		subscriptions = append(subscriptions, ch)
+	}
+	live, closed := mergeContextVMResponseSubscriptions(waitCtx, subscriptions...)
+	preflight, err := source.FetchMany(waitCtx, relays, filters)
+	if err != nil && !nip34.IsPartialFetch(err) {
+		cancel()
 		return nil, err
 	}
+	if waitCtx.Err() != nil {
+		cancel()
+		return nil, fmt.Errorf("prepare ContextVM response wait: %w", waitCtx.Err())
+	}
+	return &ContextVMResponseWaiter{
+		ctx: waitCtx, cancel: cancel, source: source, relays: append([]string(nil), relays...), filters: filters,
+		command: command, expectedAuthor: expectedAuthor, preflight: preflight, live: live, closed: closed,
+	}, nil
+}
 
-	watchCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	pool := gonostr.NewPool()
-	defer pool.Close("contextvm wait complete")
-	ch := make(chan gonostr.RelayEvent)
-	go func() {
-		defer close(ch)
-		for _, filter := range filters {
-			for ev := range pool.SubscribeMany(watchCtx, relays, filter, gonostr.SubscriptionOptions{}) {
-				ch <- ev
-			}
+func (w *ContextVMResponseWaiter) Close() {
+	if w == nil {
+		return
+	}
+	w.once.Do(func() {
+		if w.cancel != nil {
+			w.cancel()
 		}
-	}()
-	for {
-		select {
-		case ie, ok := <-ch:
-			if !ok {
-				if err := watchCtx.Err(); err != nil {
-					return nil, fmt.Errorf("wait for ContextVM response: %w", err)
-				}
-				return nil, fmt.Errorf("subscription closed before ContextVM response")
-			}
-			ev := ie.Event
-			if resp, ok := MatchContextVMResponse(command, &ev); ok {
-				return resp, nil
-			}
-		case <-watchCtx.Done():
-			return nil, fmt.Errorf("wait for ContextVM response: %w", watchCtx.Err())
+	})
+}
+
+func (w *ContextVMResponseWaiter) Wait() (*ContextVMResponse, error) {
+	if w == nil || w.ctx == nil || w.source == nil || w.command == nil {
+		return nil, fmt.Errorf("ContextVM response waiter is not initialized")
+	}
+	defer w.Close()
+	for _, event := range w.preflight {
+		if response, ok := matchAuthenticatedContextVMResponse(w.command, event, w.expectedAuthor); ok {
+			return response, nil
 		}
 	}
+	type fetchResult struct {
+		events []*gonostr.Event
+		err    error
+	}
+	reconciled := make(chan fetchResult, 1)
+	go func() {
+		events, err := w.source.FetchMany(w.ctx, w.relays, w.filters)
+		reconciled <- fetchResult{events: events, err: err}
+	}()
+	live, closed := w.live, w.closed
+	for {
+		select {
+		case <-w.ctx.Done():
+			return nil, fmt.Errorf("wait for ContextVM response: %w", w.ctx.Err())
+		case <-closed:
+			closed = nil
+			live = nil
+			if reconciled == nil {
+				return nil, fmt.Errorf("subscription closed before ContextVM response")
+			}
+		case result := <-reconciled:
+			reconciled = nil
+			for _, event := range result.events {
+				if response, ok := matchAuthenticatedContextVMResponse(w.command, event, w.expectedAuthor); ok {
+					return response, nil
+				}
+			}
+			if result.err != nil && !nip34.IsPartialFetch(result.err) {
+				return nil, result.err
+			}
+			if live == nil {
+				return nil, fmt.Errorf("subscription closed before ContextVM response")
+			}
+		case relayEvent, ok := <-live:
+			if !ok {
+				live = nil
+				if reconciled == nil {
+					return nil, fmt.Errorf("subscription closed before ContextVM response")
+				}
+				continue
+			}
+			event := relayEvent.Event
+			if response, ok := matchAuthenticatedContextVMResponse(w.command, &event, w.expectedAuthor); ok {
+				return response, nil
+			}
+		}
+	}
+}
+
+func WaitForContextVMResponseFrom(ctx context.Context, relays []string, command *gonostr.Event, expectedAuthor string, timeout time.Duration) (*ContextVMResponse, error) {
+	waiter, err := PrepareContextVMResponseWait(ctx, relays, command, expectedAuthor, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return waiter.Wait()
+}
+
+func WaitForContextVMResponse(ctx context.Context, relays []string, command *gonostr.Event, timeout time.Duration) (*ContextVMResponse, error) {
+	return WaitForContextVMResponseFrom(ctx, relays, command, "", timeout)
+}
+
+func matchAuthenticatedContextVMResponse(command, candidate *gonostr.Event, expectedAuthor string) (*ContextVMResponse, bool) {
+	if candidate == nil || !casnostr.VerifyEvent((*casnostr.Event)(candidate)) {
+		return nil, false
+	}
+	if expectedAuthor != "" && candidate.PubKey.Hex() != expectedAuthor {
+		return nil, false
+	}
+	return MatchContextVMResponse(command, candidate)
+}
+
+func mergeContextVMResponseSubscriptions(ctx context.Context, inputs ...<-chan gonostr.RelayEvent) (<-chan gonostr.RelayEvent, <-chan struct{}) {
+	out := make(chan gonostr.RelayEvent, 64)
+	closed := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	wg.Add(len(inputs))
+	for _, input := range inputs {
+		go func(ch <-chan gonostr.RelayEvent) {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case event, ok := <-ch:
+					if !ok {
+						select {
+						case closed <- struct{}{}:
+						default:
+						}
+						return
+					}
+					select {
+					case out <- event:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}(input)
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out, closed
 }
 
 func MatchContextVMResponse(command, candidate *gonostr.Event) (*ContextVMResponse, bool) {
@@ -93,12 +250,12 @@ func MatchContextVMResponse(command, candidate *gonostr.Event) (*ContextVMRespon
 		JSONRPC string          `json:"jsonrpc"`
 		ID      json.RawMessage `json:"id"`
 		Result  json.RawMessage `json:"result"`
-		Error   any             `json:"error"`
+		Error   json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(candidate.Content), &body); err != nil {
 		return nil, false
 	}
-	if len(body.Result) == 0 && body.Error == nil {
+	if len(body.Result) == 0 && (len(body.Error) == 0 || string(body.Error) == "null") {
 		return nil, false
 	}
 	resp := &ContextVMResponse{Event: candidate, ID: rawIDString(body.ID)}
@@ -106,13 +263,17 @@ func MatchContextVMResponse(command, candidate *gonostr.Event) (*ContextVMRespon
 		result := append(json.RawMessage(nil), body.Result...)
 		resp.Result = &result
 	}
-	if body.Error != nil {
-		switch v := body.Error.(type) {
-		case string:
-			resp.Error = v
-		default:
-			encoded, _ := json.Marshal(v)
-			resp.Error = string(encoded)
+	if len(body.Error) > 0 && string(body.Error) != "null" {
+		var structured struct {
+			Code    int             `json:"code"`
+			Message string          `json:"message"`
+			Data    json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(body.Error, &structured); err == nil && structured.Message != "" {
+			resp.Error, resp.ErrorCode = structured.Message, structured.Code
+			resp.ErrorData = append(json.RawMessage(nil), structured.Data...)
+		} else if err := json.Unmarshal(body.Error, &resp.Error); err != nil {
+			resp.Error = string(body.Error)
 		}
 	}
 	return resp, true

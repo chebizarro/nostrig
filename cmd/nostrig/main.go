@@ -24,19 +24,23 @@ import (
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := newRootCmd().ExecuteContext(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
+	if err := newRootCmd().ExecuteContext(ctx); err != nil {
+		if !errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, err.Error())
+		}
+		os.Exit(commandErrorExitCode(err))
 	}
 }
 
 func newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "nostrig",
-		Short: "Relay-backed NIP-34 to beads task-fabric bridge",
+		Use:           "nostrig",
+		Short:         "Relay-backed NIP-34 to beads task-fabric bridge",
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
 
-	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newMigrateCmd(), newImportCmd(), newCreateCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newDeleteCmd(), newQueueCmd(), newServeCmd(), newOutboxCmd())
+	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newMigrateCmd(), newImportCmd(), newTaskCmd(), newCreateCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newDeleteCmd(), newQueueCmd(), newServeCmd(), newOutboxCmd())
 	return cmd
 }
 
@@ -656,7 +660,7 @@ func newDeleteCmd() *cobra.Command {
 
 func newQueueCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "queue", Short: "Publish ContextVM queue commands"}
-	cmd.AddCommand(newQueueEnqueueCmd(), newQueueDequeueCmd(), newQueueListCmd())
+	cmd.AddCommand(newQueueEnqueueCmd(), newQueueDequeueCmd(), newAgentQueueListCmd(), newQueueClaimNextCmd())
 	return cmd
 }
 
