@@ -74,9 +74,11 @@ func (s *RelayQualitySource) GetQuality(ctx context.Context, taskIDs []string) (
 	return out, nil
 }
 
-// FetchQualityEvents fetches PSTF quality/audit events, optionally scoped to a
-// project tag. It is a pull projection used by command handlers; relays remain
-// the source of truth.
+// FetchQualityEvents fetches PSTF quality/audit events for the configured trusted
+// authors. Project scoping is applied locally by ProjectQualityState because
+// NIP-01 relay tag filters are interoperable only for single-letter tag names;
+// relying on a non-standard #project filter silently omits events on strict relays.
+// It is a pull projection used by command handlers; relays remain the source of truth.
 func (s *RelayQualitySource) FetchQualityEvents(ctx context.Context) ([]*gonostr.Event, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("context is nil")
@@ -98,7 +100,6 @@ func (s *RelayQualitySource) FetchQualityEvents(ctx context.Context) ([]*gonostr
 		return nil, err
 	}
 	filter := gonostr.Filter{Kinds: []gonostr.Kind{KindPSTFGateStatus, KindPSTFAudit}, Authors: authors, Limit: limit}
-	filter.Tags = gonostr.TagMap{"project": []string{project}}
 	client := s.Client
 	if client == nil {
 		client = nip34.NewClient()

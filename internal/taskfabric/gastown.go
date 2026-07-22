@@ -157,13 +157,23 @@ func recordDispatch(issue *beadspb.Issue, commandID gonostr.ID, agent, status st
 		if attempt == nil || attempt.Id != attemptID {
 			continue
 		}
-		if attempt.Agent != agent || attempt.AgentSession != sessionID || attempt.Branch != branch || attempt.Status != status {
+		if attempt.Agent != agent || attempt.AgentSession != sessionID || attempt.Branch != branch {
 			return "", "", fmt.Errorf("execution attempt %s already exists with different dispatch data", attemptID)
 		}
 		if isTerminalAttemptStatus(attempt.Status) {
 			return "", "", fmt.Errorf("execution attempt %s is already terminal", attemptID)
 		}
-		return attemptID, sessionID, nil
+		if attempt.Status == status {
+			return attemptID, sessionID, nil
+		}
+		// Claiming an existing assignment is the acknowledgement boundary for
+		// its durable dispatch: preserve the attempt identity and advance it
+		// atomically with the task claim.
+		if attempt.Status == "dispatched" && status == "running" {
+			attempt.Status = status
+			return attemptID, sessionID, nil
+		}
+		return "", "", fmt.Errorf("execution attempt %s cannot transition from %s to %s", attemptID, attempt.Status, status)
 	}
 	if active := activeExecutionAttempt(issue); active != nil {
 		return "", "", fmt.Errorf("execution attempt %s is still active", active.Id)

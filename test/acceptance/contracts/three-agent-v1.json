@@ -124,8 +124,30 @@
       "expected": "service and one relay restart mid-flow without duplicate mutation or divergence",
       "evidence": [
         "pre/post event ids",
-        "replay journal state",
+        "durable journal and outbox state",
         "relay recovery report"
+      ]
+    },
+    {
+      "id": 13,
+      "actor": "stew",
+      "operation": "replay_all_commands",
+      "expected": "every original signed command replays through the durable journal without another mutation",
+      "evidence": [
+        "journal command count",
+        "cached response event ids",
+        "unchanged audit count"
+      ]
+    },
+    {
+      "id": 14,
+      "actor": "gus",
+      "operation": "verify_nonduplicated_evidence",
+      "expected": "final state, history, queue, responses, and audit evidence are correct and non-duplicated",
+      "evidence": [
+        "final state digest",
+        "unique checkpoint and execution history",
+        "unique response and audit ids"
       ]
     }
   ]

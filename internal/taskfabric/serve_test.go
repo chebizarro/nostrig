@@ -306,6 +306,50 @@ func TestTaskClaimIntentUpdatesTaskStateAndReturnsResult(t *testing.T) {
 	}
 }
 
+func TestAssignedWorkerClaimsExistingDispatchAttempt(t *testing.T) {
+	ledger := &memoryLedger{
+		tasks: map[string]*beadspb.Issue{
+			"task-1": {
+				Id: "task-1", Title: "assigned work", Status: beadspb.Status_STATUS_OPEN,
+				Metadata: &beadspb.Metadata{Custom: map[string]string{"nip34.repo_addr": "30617:owner:repo"}},
+			},
+		},
+		queues: map[string][]string{},
+	}
+	h := testHandler(ledger)
+
+	assign, _ := nip34.BuildContextVMCommand("task/assign", "server", map[string]any{
+		"task_id": "task-1", "assignee": "agent-a", "base_event_id": "",
+		"execution_attempt_id": "attempt-1", "agent_session_id": "session-1", "branch": "work/task-1",
+	}, time.Unix(1, 0))
+	assign.ID, assign.PubKey = testID(1), testPubKey(1)
+	if _, err := h.HandleIntent(context.Background(), assign, time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	assignedRevision := ledger.taskRevision("task-1")
+	assigned := ledger.tasks["task-1"]
+	if assigned.Assignee != "agent-a" || assigned.Status != beadspb.Status_STATUS_OPEN ||
+		len(assigned.ExecutionAttempts) != 1 || assigned.ExecutionAttempts[0].Status != "dispatched" {
+		t.Fatalf("unexpected assigned state: %#v", assigned)
+	}
+
+	claim, _ := nip34.BuildContextVMCommand("task/claim", "server", map[string]any{
+		"task_id": "task-1", "claimer": "agent-a", "base_event_id": assignedRevision,
+		"execution_attempt_id": "attempt-1", "agent_session_id": "session-1", "branch": "work/task-1",
+	}, time.Unix(3, 0))
+	claim.ID, claim.PubKey = testID(2), testPubKey(1)
+	resp, err := h.HandleIntent(context.Background(), claim, time.Unix(4, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := ledger.tasks["task-1"]
+	if claimed.Assignee != "agent-a" || claimed.Status != beadspb.Status_STATUS_IN_PROGRESS ||
+		len(claimed.ExecutionAttempts) != 1 || claimed.ExecutionAttempts[0].Id != "attempt-1" ||
+		claimed.ExecutionAttempts[0].Status != "running" {
+		t.Fatalf("assigned claim did not advance the existing dispatch: task=%#v response=%s", claimed, resp.Content)
+	}
+}
+
 func TestTaskCloseIntentClosesTask(t *testing.T) {
 	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{"task-1": {Id: "task-1", Title: "close me", Status: beadspb.Status_STATUS_IN_PROGRESS}}, queues: map[string][]string{}}
 	h := testHandler(ledger)

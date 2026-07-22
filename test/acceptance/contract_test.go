@@ -40,8 +40,8 @@ func TestThreeAgentAcceptanceContract(t *testing.T) {
 			t.Errorf("contract omits actor %s", actor)
 		}
 	}
-	if len(contract.Steps) != 12 {
-		t.Fatalf("steps=%d, want 12", len(contract.Steps))
+	if len(contract.Steps) != 14 {
+		t.Fatalf("steps=%d, want 14", len(contract.Steps))
 	}
 	required := map[string]bool{
 		"create_and_assign":             false,
@@ -56,6 +56,8 @@ func TestThreeAgentAcceptanceContract(t *testing.T) {
 		"authorized_close":              false,
 		"independent_state_convergence": false,
 		"restart_service_and_relay":     false,
+		"replay_all_commands":           false,
+		"verify_nonduplicated_evidence": false,
 	}
 	for i, step := range contract.Steps {
 		if step.ID != i+1 {

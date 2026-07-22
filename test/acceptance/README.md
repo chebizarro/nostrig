@@ -3,7 +3,7 @@
 This directory contains two deliberately separate artifacts:
 
 - `contracts/three-agent-v1.json` is the executable contract scaffold for bead
-  `nostrig-crm`. Its untagged test validates the required twelve-step ceremony,
+  `nostrig-crm`. Its untagged test validates the required fourteen-step ceremony,
   but does **not** claim that the live ceremony ran.
 - `compose.yaml` plus `live_test.go` is a manual, skipped-by-default harness
   for three disposable relays and a real Signet/NIP-46 signer.
@@ -54,7 +54,27 @@ and signs again. `make acceptance-smoke` only compiles the tagged harness and
 skips when these variables are absent; CI does not report that skip as a live
 acceptance pass.
 
-Cleanup:
+## Run the unattended final three-agent ceremony
+
+The final acceptance owns a clean three-relay lifecycle and uses four
+throwaway, in-memory local test signers: one canonical Nostrig service identity
+plus Stew, Netward, and Gus. It runs the real service loop, relay ledger,
+two-of-three reliable publisher/outbox, durable command journal, ACL/audit
+policy, and trusted PSTF relay projection. It intentionally does not start
+Signet; the separate live checks above retain Signet coverage.
+
+```sh
+make acceptance-three-agent
+```
+
+The target starts only `relay-1`, `relay-2`, and `relay-3`, restarts the
+service in-process, stops and restarts `relay-3` mid-flow, rewinds the durable
+journal cursor to replay every original signed command, and removes the
+containers and volumes on exit. Verbose evidence is retained at
+`build/nostrig-crm-acceptance.log` (override with
+`NOSTRIG_ACCEPTANCE_LOG`).
+
+Cleanup for the manually managed Signet harness:
 
 ```sh
 docker compose -f test/acceptance/compose.yaml down -v

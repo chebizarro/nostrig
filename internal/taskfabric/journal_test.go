@@ -121,6 +121,40 @@ func TestDuplicateRequestIDWithSameContentReturnsCachedResponse(t *testing.T) {
 	}
 }
 
+func TestExactMultiRelayDuplicateIsIgnoredButRestartAndExplicitReplayReturnCachedResponse(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	journal := openTestJournal(t, filepath.Join(t.TempDir(), "commands.json"), 24*time.Hour)
+	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{}, queues: map[string][]string{}}
+	capture := &responseCapture{}
+	processor := testCommandProcessor(journal, ledger, capture, now)
+	command := buildJournalCommand(t, "task/create", map[string]any{
+		"task_id": "task-1", "title": "created", "repo_addr": "30617:owner:repo",
+	}, now, 7)
+
+	if err := processor.Process(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	if err := processor.Process(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	if ledger.nextEvent != 1 || len(capture.contents()) != 1 {
+		t.Fatalf("exact relay duplicate was not ignored: mutations=%d responses=%d", ledger.nextEvent, len(capture.contents()))
+	}
+	restarted := testCommandProcessor(journal, ledger, capture, now.Add(time.Second))
+	if err := restarted.Process(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	if ledger.nextEvent != 1 || len(capture.contents()) != 2 {
+		t.Fatalf("post-restart replay did not return cached response: mutations=%d responses=%d", ledger.nextEvent, len(capture.contents()))
+	}
+	if err := processor.Replay(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	if ledger.nextEvent != 1 || len(capture.contents()) != 3 {
+		t.Fatalf("explicit replay did not return cached response: mutations=%d responses=%d", ledger.nextEvent, len(capture.contents()))
+	}
+}
+
 func TestConflictingRequestIDPublishesErrorWithoutMutation(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	journal := openTestJournal(t, filepath.Join(t.TempDir(), "commands.json"), 24*time.Hour)
@@ -185,8 +219,12 @@ func TestReplayCreateUpdateDeleteHundredTimesMutatesOnce(t *testing.T) {
 	create := buildJournalCommand(t, "task/create", map[string]any{
 		"task_id": "task-1", "title": "created", "repo_addr": "30617:owner:repo",
 	}, now, 10)
-	for range 100 {
-		if err := processor.Process(context.Background(), create); err != nil {
+	for i := range 100 {
+		process := processor.Replay
+		if i == 0 {
+			process = processor.Process
+		}
+		if err := process(context.Background(), create); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -197,8 +235,12 @@ func TestReplayCreateUpdateDeleteHundredTimesMutatesOnce(t *testing.T) {
 	update := buildJournalCommand(t, "task/update", map[string]any{
 		"task_id": "task-1", "base_event_id": ledger.taskRevision("task-1"), "title": "updated",
 	}, now.Add(time.Second), 11)
-	for range 100 {
-		if err := processor.Process(context.Background(), update); err != nil {
+	for i := range 100 {
+		process := processor.Replay
+		if i == 0 {
+			process = processor.Process
+		}
+		if err := process(context.Background(), update); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -209,8 +251,12 @@ func TestReplayCreateUpdateDeleteHundredTimesMutatesOnce(t *testing.T) {
 	remove := buildJournalCommand(t, "task/delete", map[string]any{
 		"task_id": "task-1", "base_event_id": ledger.taskRevision("task-1"),
 	}, now.Add(2*time.Second), 12)
-	for range 100 {
-		if err := processor.Process(context.Background(), remove); err != nil {
+	for i := range 100 {
+		process := processor.Replay
+		if i == 0 {
+			process = processor.Process
+		}
+		if err := process(context.Background(), remove); err != nil {
 			t.Fatal(err)
 		}
 	}

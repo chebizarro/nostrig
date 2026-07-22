@@ -37,6 +37,7 @@ Thumbs.db
 
 # Output artifacts
 .beads/
+build/
 
 # Beads / Dolt files (added by bd init)
 .dolt/

@@ -19,7 +19,7 @@ IMAGE_METADATA ?= $(BUILD_DIR)/image-metadata.json
 IMAGE_DIGEST ?= $(BUILD_DIR)/image-digest.txt
 SBOM_GENERATOR ?= docker/buildkit-syft-scanner:stable-1@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
 
-.PHONY: proto build install test vet race fuzz-smoke acceptance-contract acceptance-smoke acceptance-live test-full check image release-image sbom clean
+.PHONY: proto build install test vet race fuzz-smoke acceptance-contract acceptance-smoke acceptance-live acceptance-three-agent test-full check image release-image sbom clean
 
 proto:
 	$(GO_CMD) generate ./...
@@ -59,6 +59,29 @@ acceptance-live:
 	@test -n "$$NOSTRIG_ACCEPTANCE_BUNKER_URL" || (echo "NOSTRIG_ACCEPTANCE_BUNKER_URL is required" >&2; exit 2)
 	@test -n "$$NOSTRIG_ACCEPTANCE_CLIENT_SECRET" || (echo "NOSTRIG_ACCEPTANCE_CLIENT_SECRET is required" >&2; exit 2)
 	$(GO_CMD) test -mod=readonly -tags=nostrig_acceptance -run='^TestLive' -v ./test/acceptance
+# Owns a clean three-relay lifecycle and captures the verbose ceremony log.
+# Signet is intentionally not started: all four identities are ephemeral local
+# test signers, which keeps the final scenario unattended and disposable.
+acceptance-three-agent:
+	@set -eu; \
+	compose="$${NOSTRIG_ACCEPTANCE_COMPOSE_FILE:-$(CURDIR)/test/acceptance/compose.yaml}"; \
+	log="$${NOSTRIG_ACCEPTANCE_LOG:-$(CURDIR)/build/nostrig-crm-acceptance.log}"; \
+	export SIGNET_DB_KEY="$${SIGNET_DB_KEY:-0000000000000000000000000000000000000000000000000000000000000000}"; \
+	export SIGNET_BUNKER_NSEC="$${SIGNET_BUNKER_NSEC:-unused-by-three-agent-acceptance}"; \
+	mkdir -p "$$(dirname "$$log")"; \
+	docker compose -f "$$compose" down -v --remove-orphans >/dev/null 2>&1 || true; \
+	cleanup() { docker compose -f "$$compose" down -v --remove-orphans >/dev/null 2>&1 || true; }; \
+	trap cleanup EXIT INT TERM; \
+	docker compose -f "$$compose" up -d relay-1 relay-2 relay-3; \
+	if NOSTRIG_ACCEPTANCE_CONTROL_DOCKER=1 \
+		NOSTRIG_ACCEPTANCE_RELAYS="ws://127.0.0.1:17001,ws://127.0.0.1:17002,ws://127.0.0.1:17003" \
+		NOSTRIG_ACCEPTANCE_COMPOSE_FILE="$$compose" \
+		$(GO_CMD) test -mod=readonly -count=1 -tags=nostrig_acceptance \
+			-run='^TestFinalThreeAgentLiveAcceptance$$' -v ./test/acceptance >"$$log" 2>&1; then \
+		cat "$$log"; \
+	else \
+		status=$$?; cat "$$log"; exit $$status; \
+	fi
 
 check: test vet race
 

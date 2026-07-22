@@ -219,7 +219,7 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 			if current.Issue.Assignee == claimer && current.Issue.Status == beadspb.Status_STATUS_IN_PROGRESS {
 				return TaskMutationResult{Unchanged: true}, nil
 			}
-			if current.Issue.Assignee != "" {
+			if current.Issue.Assignee != "" && current.Issue.Assignee != claimer {
 				return TaskMutationResult{}, &ConflictError{Resource: "task", Reason: "already_claimed", ExpectedEventID: base, ActualEventID: current.EventID, Assignee: current.Issue.Assignee, Status: statusString(current.Issue)}
 			}
 			if current.Issue.Status != beadspb.Status_STATUS_OPEN {

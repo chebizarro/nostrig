@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	requestIDConflictCode = -32010
-	replayExpiredCode     = -32011
+	requestIDConflictCode   = -32010
+	replayExpiredCode       = -32011
+	recentCommandDedupLimit = 4096
 )
 
 type commandProcessor struct {
@@ -39,12 +40,44 @@ type commandProcessor struct {
 	replayHook     func()
 	processHook    func(*gonostr.Event, time.Duration)
 
-	mu sync.Mutex
+	mu             sync.Mutex
+	processed      map[string]struct{}
+	processedOrder []string
 }
 
-func (p *commandProcessor) Process(ctx context.Context, source *gonostr.Event) (processErr error) {
+func (p *commandProcessor) Process(ctx context.Context, source *gonostr.Event) error {
+	return p.process(ctx, source, false)
+}
+
+func (p *commandProcessor) Replay(ctx context.Context, source *gonostr.Event) error {
+	return p.process(ctx, source, true)
+}
+
+func (p *commandProcessor) process(ctx context.Context, source *gonostr.Event, replay bool) (processErr error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if !replay && source != nil {
+		if p.processed == nil {
+			p.processed = make(map[string]struct{})
+		}
+		eventID := source.ID.Hex()
+		if _, duplicate := p.processed[eventID]; duplicate {
+			return nil
+		}
+		if len(p.processedOrder) >= recentCommandDedupLimit {
+			delete(p.processed, p.processedOrder[0])
+			copy(p.processedOrder, p.processedOrder[1:])
+			p.processedOrder = p.processedOrder[:len(p.processedOrder)-1]
+		}
+		p.processed[eventID] = struct{}{}
+		p.processedOrder = append(p.processedOrder, eventID)
+		defer func() {
+			if processErr != nil {
+				delete(p.processed, eventID)
+				p.processedOrder = p.processedOrder[:len(p.processedOrder)-1]
+			}
+		}()
+	}
 	started := time.Now()
 	defer func() {
 		if processErr == nil && source != nil && p.processHook != nil {
@@ -279,7 +312,7 @@ func processCommandBackfill(ctx context.Context, processor *commandProcessor, jo
 		if event == nil || !cursor.Before(event) {
 			continue
 		}
-		if err := processor.Process(ctx, event); err != nil {
+		if err := processor.Replay(ctx, event); err != nil {
 			return err
 		}
 		if err := journal.AdvanceCursor(event); err != nil {
