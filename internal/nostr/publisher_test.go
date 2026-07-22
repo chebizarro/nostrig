@@ -33,8 +33,12 @@ func TestTaskStateRoundTripLossless(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !proto.Equal(got, issue) {
-		t.Fatalf("round trip mismatch:\ngot  %#v\nwant %#v", got, issue)
+	want, err := MigrateTaskStateV1(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(got, want) {
+		t.Fatalf("round trip mismatch:\ngot  %#v\nwant %#v", got, want)
 	}
 }
 
@@ -68,8 +72,12 @@ func TestCanonicalExportRoundTripIncludesEpicCollection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !proto.Equal(got, export.Issues[0]) {
-		t.Fatalf("export task state was not lossless:\ngot  %#v\nwant %#v", got, export.Issues[0])
+	want, err := MigrateTaskStateV1(export.Issues[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(got, want) {
+		t.Fatalf("export task state was not lossless:\ngot  %#v\nwant %#v", got, want)
 	}
 	if epic == nil {
 		t.Fatal("missing NIP-51 epic collection")
@@ -132,7 +140,7 @@ func TestParseTaskStateRejectsMalformedTagContentCombinations(t *testing.T) {
 		{"schema version", func(ev *gonostr.Event) {
 			for _, tag := range ev.Tags {
 				if len(tag) >= 2 && tag[0] == "schema" {
-					tag[1] = "cascadia.task-state.v2"
+					tag[1] = "cascadia.task-state.v3"
 				}
 			}
 		}},
@@ -154,6 +162,76 @@ func TestParseTaskStateRejectsMalformedTagContentCombinations(t *testing.T) {
 				t.Fatal("expected malformed state rejection")
 			}
 		})
+	}
+}
+
+func TestTaskStateV2CoversFleetFieldsAndTypedDependencies(t *testing.T) {
+	now := time.Unix(2000, 0).UTC()
+	author := fmt.Sprintf("%064x", 1)
+	hash := fmt.Sprintf("%064x", 42)
+	depCount, commentCount := int32(2), int32(1)
+	issue := &beadspb.Issue{
+		Id: "task-2", Title: "complete", Status: beadspb.Status_STATUS_BLOCKED,
+		Priority: beadspb.Priority_PRIORITY_P9, IssueType: "feature", Owner: "Stew", CreatedBy: "Gus",
+		Assignee: "Netward", Project: "nostrig", Queue: "p0", Repository: "30617:owner:repo",
+		StatusReason: "waiting", BlockerDescription: "blocked by task-1",
+		Dependencies: []*beadspb.Dependency{
+			{IssueId: "task-2", DependsOnId: "task-1", Type: "blocked-by"},
+			{IssueId: "task-2", DependsOnId: "task-1", Type: "discovered-from"},
+		},
+		Comments:        []*beadspb.Comment{{Id: "comment-1", IssueId: "task-2", Author: "Gus", Text: "checkpoint"}},
+		DependencyCount: &depCount, CommentCount: &commentCount,
+		Evidence:          []*beadspb.ArtifactReference{{Kind: "evidence", Url: "https://blossom.example/" + hash, Sha256: hash}},
+		Review:            &beadspb.Review{Required: true, Reviewer: "Gus", State: "approved"},
+		QualityGate:       &beadspb.QualityGate{Required: true, State: "pass", Source: "pstf"},
+		ExecutionAttempts: []*beadspb.ExecutionAttempt{{Id: "attempt-1", AgentSession: "session-1", Status: "complete"}},
+		AgentSessions:     []*beadspb.AgentSessionReference{{Id: "session-1", Agent: "Netward", Status: "complete"}},
+	}
+	ev, err := BuildTaskStateEvent(issue, author, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk, _ := gonostr.PubKeyFromHex(author)
+	ev.PubKey = pk
+	if schema, _ := TagFirst(ev, "schema"); schema != TaskStateSchemaV2 {
+		t.Fatalf("schema=%q", schema)
+	}
+	if !hasTag(ev, "priority", "P9") {
+		t.Fatalf("missing P9 tag: %#v", ev.Tags)
+	}
+	foundTyped := false
+	for _, tag := range ev.Tags {
+		if len(tag) == 3 && tag[0] == "dependency" && tag[2] == "blocked-by" {
+			foundTyped = true
+		}
+	}
+	if !foundTyped {
+		t.Fatalf("missing typed dependency tag: %#v", ev.Tags)
+	}
+	got, version, err := ParseTaskStateEventVersioned(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != TaskStateVersionV2 || got.Priority != beadspb.Priority_PRIORITY_P9 || got.Owner != "Stew" || len(got.ExecutionAttempts) != 1 || len(got.Dependencies) != 2 {
+		t.Fatalf("v2 fields lost: version=%d issue=%#v", version, got)
+	}
+}
+
+func TestTaskStateV1DecodesThroughExplicitMigration(t *testing.T) {
+	author := fmt.Sprintf("%064x", 1)
+	legacy := &beadspb.Issue{Id: "task-legacy", Title: "legacy", Status: beadspb.Status_STATUS_OPEN, DependsOn: []string{"task-old"}, Metadata: &beadspb.Metadata{Custom: map[string]string{"nip34.repo_addr": "30617:owner:repo"}}}
+	ev, err := BuildTaskStateEventV1(legacy, author, time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk, _ := gonostr.PubKeyFromHex(author)
+	ev.PubKey = pk
+	got, version, err := ParseTaskStateEventVersioned(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != TaskStateVersionV1 || got.Repository != "30617:owner:repo" || len(got.Dependencies) != 1 || got.Dependencies[0].Type != "blocks" {
+		t.Fatalf("v1 migration failed: version=%d issue=%#v", version, got)
 	}
 }
 

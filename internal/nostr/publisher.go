@@ -17,7 +17,9 @@ import (
 )
 
 const (
-	TaskStateSchema     = "cascadia.task-state.v1"
+	TaskStateSchemaV1   = "cascadia.task-state.v1"
+	TaskStateSchemaV2   = "cascadia.task-state.v2"
+	TaskStateSchema     = TaskStateSchemaV2
 	TaskIntentSchema    = "cascadia.task.v1"
 	TaskTombstoneSchema = "cascadia.task-tombstone.v1"
 )
@@ -91,6 +93,7 @@ func BuildCanonicalEvents(export *beadspb.Export, canonicalAuthor string, now ti
 	return events, nil
 }
 
+// TaskState is the legacy v1 payload. It remains exported for source compatibility.
 type TaskState struct {
 	ID          string            `json:"id"`
 	Title       string            `json:"title"`
@@ -106,7 +109,7 @@ type TaskState struct {
 	Metadata    map[string]string `json:"metadata,omitempty"`
 }
 
-func BuildTaskStateEvent(issue *beadspb.Issue, canonicalAuthor string, now time.Time) (*gonostr.Event, error) {
+func BuildTaskStateEventV1(issue *beadspb.Issue, canonicalAuthor string, now time.Time) (*gonostr.Event, error) {
 	canonicalAuthor, err := canonicalPubKey(canonicalAuthor)
 	if err != nil {
 		return nil, err
@@ -143,7 +146,7 @@ func BuildTaskStateEvent(issue *beadspb.Issue, canonicalAuthor string, now time.
 	if err != nil {
 		return nil, err
 	}
-	tags := gonostr.Tags{{"d", "task:" + id}, {"domain", "task"}, {"schema", TaskStateSchema}, {"status", state.Status}}
+	tags := gonostr.Tags{{"d", "task:" + id}, {"domain", "task"}, {"schema", TaskStateSchemaV1}, {"status", state.Status}}
 	if state.Priority != "" {
 		tags = append(tags, gonostr.Tag{"priority", state.Priority})
 	}
@@ -341,7 +344,7 @@ func canonicalPubKey(author string) (string, error) {
 	return author, nil
 }
 
-func ParseTaskStateEvent(ev *gonostr.Event) (*beadspb.Issue, error) {
+func parseTaskStateEventV1(ev *gonostr.Event) (*beadspb.Issue, error) {
 	if ev == nil {
 		return nil, fmt.Errorf("event is nil")
 	}
@@ -352,7 +355,7 @@ func ParseTaskStateEvent(ev *gonostr.Event) (*beadspb.Issue, error) {
 	if err != nil || !strings.HasPrefix(d, "task:") || strings.TrimPrefix(d, "task:") == "" {
 		return nil, fmt.Errorf("task state requires exactly one d=task:<id>")
 	}
-	if schema, err := exactlyOneTag(ev, "schema"); err != nil || schema != TaskStateSchema {
+	if schema, err := exactlyOneTag(ev, "schema"); err != nil || schema != TaskStateSchemaV1 {
 		return nil, fmt.Errorf("unsupported task state schema")
 	}
 	if domain, err := exactlyOneTag(ev, "domain"); err != nil || domain != "task" {
@@ -469,7 +472,7 @@ func requireOptionalTagAgreement(ev *gonostr.Event, name, expected string) error
 
 func validTaskStatus(status string) bool {
 	switch status {
-	case "open", "in_progress", "blocked", "closed":
+	case "open", "in_progress", "blocked", "closed", "deferred":
 		return true
 	default:
 		return false
@@ -615,6 +618,8 @@ func StatusString(s beadspb.Status) string {
 		return "blocked"
 	case beadspb.Status_STATUS_CLOSED:
 		return "closed"
+	case beadspb.Status_STATUS_DEFERRED:
+		return "deferred"
 	default:
 		return "open"
 	}
@@ -627,6 +632,8 @@ func ParseStatus(s string) beadspb.Status {
 		return beadspb.Status_STATUS_BLOCKED
 	case "closed":
 		return beadspb.Status_STATUS_CLOSED
+	case "deferred":
+		return beadspb.Status_STATUS_DEFERRED
 	default:
 		return beadspb.Status_STATUS_OPEN
 	}
@@ -643,6 +650,8 @@ func PriorityString(p beadspb.Priority) string {
 		return "P3"
 	case beadspb.Priority_PRIORITY_P4:
 		return "P4"
+	case beadspb.Priority_PRIORITY_P9:
+		return "P9"
 	default:
 		return ""
 	}
@@ -659,6 +668,8 @@ func ParsePriority(s string) beadspb.Priority {
 		return beadspb.Priority_PRIORITY_P3
 	case "P4":
 		return beadspb.Priority_PRIORITY_P4
+	case "P9":
+		return beadspb.Priority_PRIORITY_P9
 	default:
 		return beadspb.Priority_PRIORITY_UNSPECIFIED
 	}

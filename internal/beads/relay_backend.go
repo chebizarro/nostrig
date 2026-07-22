@@ -240,8 +240,9 @@ func (b *RelayBackend) now() time.Time {
 
 func ExportFromTaskStateEvents(events []*gonostr.Event) (*pb.Export, error) {
 	type stateRecord struct {
-		issue *pb.Issue
-		event *gonostr.Event
+		issue   *pb.Issue
+		event   *gonostr.Event
+		version nip34.TaskStateSchemaVersion
 	}
 	states := map[string]stateRecord{}
 	tombstones := map[string]*gonostr.Event{}
@@ -261,7 +262,7 @@ func ExportFromTaskStateEvents(events []*gonostr.Event) (*pb.Export, error) {
 			}
 			continue
 		}
-		issue, err := nip34.ParseTaskStateEvent(ev)
+		issue, version, err := nip34.ParseTaskStateEventVersioned(ev)
 		if err != nil {
 			continue
 		}
@@ -282,8 +283,8 @@ func ExportFromTaskStateEvents(events []*gonostr.Event) (*pb.Export, error) {
 			issue.Created = timestamppb.New(createdAt)
 		}
 		key := author + "|" + id
-		if previous, ok := states[key]; !ok || eventAfter(previous.event, ev) {
-			states[key] = stateRecord{issue: issue, event: ev}
+		if previous, ok := states[key]; !ok || version > previous.version || (version == previous.version && eventAfter(previous.event, ev)) {
+			states[key] = stateRecord{issue: issue, event: ev, version: version}
 		}
 	}
 	latest := map[string]stateRecord{}

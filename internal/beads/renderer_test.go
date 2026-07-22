@@ -32,7 +32,7 @@ func TestRenderer_RenderExport_WritesJSONL(t *testing.T) {
 				Updated:     timestamppb.New(now.Add(5 * time.Minute)),
 				Metadata: &pb.Metadata{
 					Custom: map[string]string{
-						"nostr.id":     "repoev",
+						"nostr.id":      "repoev",
 						"nip34.repo_id": "my-repo",
 					},
 				},
@@ -137,5 +137,40 @@ func TestRenderer_RenderExport_WritesJSONL(t *testing.T) {
 		if err := sc.Err(); err != nil {
 			t.Fatalf("scanner error reading epics.jsonl: %v", err)
 		}
+	}
+}
+
+func TestRendererWritesCurrentBeadsShapeWithoutDroppingFields(t *testing.T) {
+	tmpDir := t.TempDir()
+	count := int32(1)
+	issue := &pb.Issue{
+		Id: "task-1", Title: "complete", Status: pb.Status_STATUS_IN_PROGRESS,
+		Priority: pb.Priority_PRIORITY_P9, IssueType: "feature", Owner: "Stew", CreatedBy: "Gus",
+		Created: timestamppb.New(time.Unix(10, 0)), Updated: timestamppb.New(time.Unix(20, 0)),
+		Dependencies:    []*pb.Dependency{{IssueId: "task-1", DependsOnId: "task-0", Type: "discovered-from"}},
+		Comments:        []*pb.Comment{{Id: "c1", IssueId: "task-1", Author: "Gus", Text: "note"}},
+		DependencyCount: &count, CommentCount: &count,
+		Project: "nostrig", Queue: "p0", Repository: "30617:owner:repo",
+	}
+	if err := NewRenderer(tmpDir).RenderExport(&pb.Export{Issues: []*pb.Issue{issue}}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(tmpDir, ".beads", "issues.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["_type"] != "issue" || got["priority"] != float64(9) || got["created_at"] == nil || got["updated_at"] == nil {
+		t.Fatalf("wrong Beads scalar shape: %s", raw)
+	}
+	deps, ok := got["dependencies"].([]any)
+	if !ok || len(deps) != 1 || deps[0].(map[string]any)["type"] != "discovered-from" {
+		t.Fatalf("typed dependencies missing: %s", raw)
+	}
+	if got["owner"] != "Stew" || got["issue_type"] != "feature" || got["project"] != "nostrig" {
+		t.Fatalf("complete fields missing: %s", raw)
 	}
 }

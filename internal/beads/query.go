@@ -221,7 +221,17 @@ func (p *TaskStateProjection) Apply(ev *gonostr.Event) (taskID string, visibleCh
 	if int(ev.Kind) == 5 {
 		target = p.tombstones
 	}
-	if previous := target[key]; previous == nil || eventAfter(previous, ev) {
+	replace := false
+	if previous := target[key]; previous == nil {
+		replace = true
+	} else if int(ev.Kind) == nip34.KindCanonicalState {
+		_, previousVersion, previousErr := nip34.ParseTaskStateEventVersioned(previous)
+		_, candidateVersion, candidateErr := nip34.ParseTaskStateEventVersioned(ev)
+		replace = previousErr != nil || (candidateErr == nil && (candidateVersion > previousVersion || (candidateVersion == previousVersion && eventAfter(previous, ev))))
+	} else {
+		replace = eventAfter(previous, ev)
+	}
+	if replace {
 		copyEvent := *ev
 		target[key] = &copyEvent
 	}

@@ -6,7 +6,8 @@ option go_package = "github.com/chebizarro/nostrig/gen/beads";
 
 import "google/protobuf/timestamp.proto";
 
-// Issue represents a beads issue stored as YAML in .beads/issues/
+// Issue represents a Beads issue and the task-fabric extensions required by the fleet.
+// Fields 1-12 are retained for wire compatibility with the original nostrig model.
 message Issue {
   string id = 1;
   string title = 2;
@@ -16,22 +17,59 @@ message Issue {
   string epic = 6;
   string assignee = 7;
   repeated string labels = 8;
-  repeated string depends_on = 9;
+  repeated string depends_on = 9; // Legacy projection of dependency target IDs.
   google.protobuf.Timestamp created = 10;
   google.protobuf.Timestamp updated = 11;
   Metadata metadata = 12;
+
+  string issue_type = 13;
+  string owner = 14;
+  string created_by = 15;
+  google.protobuf.Timestamp started_at = 16;
+  string close_reason = 17;
+  google.protobuf.Timestamp closed_at = 18;
+  string acceptance_criteria = 19;
+  string notes = 20;
+  repeated Dependency dependencies = 21;
+  repeated Comment comments = 22;
+  optional int32 dependency_count = 23;
+  optional int32 dependent_count = 24;
+  optional int32 comment_count = 25;
+
+  google.protobuf.Timestamp claimed_at = 26;
+  google.protobuf.Timestamp blocked_at = 27;
+  google.protobuf.Timestamp reviewed_at = 28;
+  string blocker_description = 29;
+  repeated Checkpoint checkpoints = 30;
+
+  string branch = 31;
+  repeated string commits = 32;
+  repeated ArtifactReference patches = 33;
+  repeated string pull_requests = 34;
+  repeated ArtifactReference evidence = 35;
+
+  Review review = 36;
+  QualityGate quality_gate = 37;
+  string project = 38;
+  string queue = 39;
+  string repository = 40;
+  repeated ExecutionAttempt execution_attempts = 41;
+  repeated AgentSessionReference agent_sessions = 42;
+  string status_reason = 43;
 }
 
-// Status represents the status of a beads issue
+// Status represents the status of a beads issue.
 enum Status {
   STATUS_UNSPECIFIED = 0;
   STATUS_OPEN = 1;
   STATUS_IN_PROGRESS = 2;
   STATUS_BLOCKED = 3;
   STATUS_CLOSED = 4;
+  STATUS_DEFERRED = 5;
 }
 
-// Priority represents the priority level of a beads issue
+// Priority represents the numeric Beads priority. P9 is the fleet convention
+// for intentionally unscheduled or parking-lot work.
 enum Priority {
   PRIORITY_UNSPECIFIED = 0;
   PRIORITY_P0 = 1;  // Critical
@@ -39,9 +77,95 @@ enum Priority {
   PRIORITY_P2 = 3;  // Medium
   PRIORITY_P3 = 4;  // Low
   PRIORITY_P4 = 5;  // Very Low
+  PRIORITY_P9 = 6;  // Fleet parking-lot convention
 }
 
-// Metadata stores additional information about the issue
+// Dependency is the lossless Beads JSONL dependency record.
+message Dependency {
+  string issue_id = 1;
+  string depends_on_id = 2;
+  string type = 3;
+  google.protobuf.Timestamp created_at = 4;
+  string created_by = 5;
+  string metadata = 6;
+}
+
+// Comment is the lossless Beads JSONL comment record.
+message Comment {
+  string id = 1;
+  string issue_id = 2;
+  string author = 3;
+  string text = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+// ArtifactReference points to content without embedding it. Patch bodies,
+// evidence bundles, logs, and transcripts use content-addressed Blossom URLs.
+message ArtifactReference {
+  string kind = 1;
+  string url = 2;
+  string sha256 = 3;
+  string media_type = 4;
+  uint64 size_bytes = 5;
+  string name = 6;
+  string reference = 7; // Lightweight event, commit, URL, or external evidence ID.
+}
+
+// Checkpoint is a durable progress or handoff record.
+message Checkpoint {
+  string id = 1;
+  string actor = 2;
+  string status = 3;
+  string summary = 4;
+  google.protobuf.Timestamp created_at = 5;
+  repeated ArtifactReference evidence = 6;
+}
+
+// Review records review policy and its current disposition.
+message Review {
+  bool required = 1;
+  repeated string requirements = 2;
+  string reviewer = 3;
+  string state = 4;
+}
+
+// QualityGate records the task's authoritative quality-gate state.
+message QualityGate {
+  bool required = 1;
+  string state = 2;
+  string source = 3;
+  string reason = 4;
+  google.protobuf.Timestamp checked_at = 5;
+  repeated ArtifactReference evidence = 6;
+}
+
+// ExecutionAttempt links a task to an execution lifecycle.
+message ExecutionAttempt {
+  string id = 1;
+  string agent = 2;
+  string agent_session = 3;
+  string status = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp ended_at = 6;
+  string branch = 7;
+  repeated string commits = 8;
+  repeated ArtifactReference patches = 9;
+  repeated string pull_requests = 10;
+  repeated ArtifactReference evidence = 11;
+  string status_reason = 12;
+}
+
+// AgentSessionReference links an external agent session without embedding logs.
+message AgentSessionReference {
+  string id = 1;
+  string agent = 2;
+  string status = 3;
+  google.protobuf.Timestamp started_at = 4;
+  google.protobuf.Timestamp ended_at = 5;
+  ArtifactReference transcript = 6;
+}
+
+// Metadata stores additional information about the issue.
 message Metadata {
   string jira_key = 1;
   string jira_id = 2;
@@ -50,7 +174,7 @@ message Metadata {
   repeated string repositories = 5;  // Git repository URLs or names for polyrepo support
 }
 
-// Epic represents a beads epic
+// Epic represents a beads epic.
 message Epic {
   string id = 1;
   string name = 2;
@@ -61,7 +185,7 @@ message Epic {
   Metadata metadata = 7;
 }
 
-// Export represents a collection of beads issues and epics for export
+// Export represents a collection of beads issues and epics for export.
 message Export {
   repeated Issue issues = 1;
   repeated Epic epics = 2;

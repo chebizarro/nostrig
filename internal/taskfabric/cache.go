@@ -2,21 +2,17 @@ package taskfabric
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
-	nip34 "github.com/chebizarro/nostrig/internal/nostr"
-	"google.golang.org/protobuf/types/known/timestamppb"
+	"github.com/chebizarro/nostrig/internal/taskmodel"
 )
 
 const (
@@ -29,19 +25,21 @@ const (
 	ResolutionConflict   = "conflict"
 )
 
-type TaskSnapshot struct {
-	ID          string            `json:"id"`
-	Title       string            `json:"title"`
-	Description string            `json:"description,omitempty"`
-	Status      string            `json:"status"`
-	Priority    string            `json:"priority,omitempty"`
-	Epic        string            `json:"epic,omitempty"`
-	Assignee    string            `json:"assignee,omitempty"`
-	Labels      []string          `json:"labels,omitempty"`
-	DependsOn   []string          `json:"depends_on,omitempty"`
-	Created     string            `json:"created,omitempty"`
-	Updated     string            `json:"updated,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
+type TaskSnapshot taskmodel.IssueDocument
+
+func (s TaskSnapshot) MarshalJSON() ([]byte, error) {
+	doc := taskmodel.IssueDocument(s)
+	return json.Marshal(doc)
+}
+
+func (s *TaskSnapshot) UnmarshalJSON(data []byte) error {
+	doc, err := taskmodel.DecodeBeads(data)
+	if err != nil {
+		return err
+	}
+	doc.RecordType = ""
+	*s = TaskSnapshot(*doc)
+	return nil
 }
 
 type ConflictMetadata struct {
@@ -52,6 +50,7 @@ type ConflictMetadata struct {
 }
 
 type CacheRecord struct {
+	SchemaVersion int               `json:"schema_version"`
 	Type          string            `json:"_type"`
 	ID            string            `json:"id"`
 	Resolved      *TaskSnapshot     `json:"resolved,omitempty"`
@@ -114,6 +113,10 @@ func LoadCache(path string) ([]*CacheRecord, error) {
 		if rec.ID == "" {
 			continue
 		}
+		rec.SchemaVersion = 2
+		rec.Resolved = normalizeSnapshot(rec.Resolved)
+		rec.Local = normalizeSnapshot(rec.Local)
+		rec.Relay = normalizeSnapshot(rec.Relay)
 		out = append(out, &rec)
 	}
 	if err := s.Err(); err != nil {
@@ -142,6 +145,7 @@ func WriteCache(path string, records []*CacheRecord) error {
 		if rec == nil {
 			continue
 		}
+		rec.SchemaVersion = 2
 		if rec.Type == "" {
 			rec.Type = "nostrig_task_cache"
 		}
@@ -177,11 +181,19 @@ func LoadLocalIssues(outDir string) ([]*TaskSnapshot, error) {
 		if typ := rawString(raw, "_type"); typ != "" && typ != "issue" {
 			continue
 		}
-		snap := snapshotFromRaw(raw)
-		if strings.TrimSpace(snap.ID) == "" {
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			return nil, fmt.Errorf("encode local issue %s: %w", path, err)
+		}
+		doc, err := taskmodel.DecodeBeads(encoded)
+		if err != nil {
+			return nil, fmt.Errorf("decode local issue %s: %w", path, err)
+		}
+		if strings.TrimSpace(doc.ID) == "" {
 			continue
 		}
-		out = append(out, snap)
+		snap := TaskSnapshot(*doc)
+		out = append(out, &snap)
 	}
 	if err := s.Err(); err != nil {
 		return nil, err
@@ -282,7 +294,7 @@ func MergeTaskStateWithOptions(relayExport *beadspb.Export, local []*TaskSnapsho
 			resolved = localSnap
 		}
 
-		rec := &CacheRecord{Type: "nostrig_task_cache", ID: id, Resolved: normalizeSnapshot(resolved), Local: normalizeSnapshot(localSnap), Relay: normalizeSnapshot(relaySnap), LocalRevision: localRev, RelayEventID: relayEventID, LocalUpdated: snapshotUpdated(localSnap), RelayUpdated: snapshotUpdated(relaySnap), Resolution: resolution, Conflict: conflict}
+		rec := &CacheRecord{SchemaVersion: 2, Type: "nostrig_task_cache", ID: id, Resolved: normalizeSnapshot(resolved), Local: normalizeSnapshot(localSnap), Relay: normalizeSnapshot(relaySnap), LocalRevision: localRev, RelayEventID: relayEventID, LocalUpdated: snapshotUpdated(localSnap), RelayUpdated: snapshotUpdated(relaySnap), Resolution: resolution, Conflict: conflict}
 		records = append(records, rec)
 		if conflict != nil {
 			conflicts = append(conflicts, rec)
@@ -307,41 +319,20 @@ func MergeTaskStateWithOptions(relayExport *beadspb.Export, local []*TaskSnapsho
 }
 
 func SnapshotFromIssue(issue *beadspb.Issue) *TaskSnapshot {
-	if issue == nil {
+	doc, err := taskmodel.FromProto(issue)
+	if err != nil {
 		return nil
 	}
-	snap := &TaskSnapshot{ID: issue.Id, Title: issue.Title, Description: issue.Description, Status: nip34.StatusString(issue.Status), Priority: nip34.PriorityString(issue.Priority), Epic: issue.Epic, Assignee: issue.Assignee, Labels: append([]string(nil), issue.Labels...), DependsOn: append([]string(nil), issue.DependsOn...), Metadata: map[string]string{}}
-	if issue.Created != nil {
-		snap.Created = issue.Created.AsTime().UTC().Format(time.RFC3339)
-	}
-	if issue.Updated != nil {
-		snap.Updated = issue.Updated.AsTime().UTC().Format(time.RFC3339)
-	}
-	if issue.Metadata != nil {
-		for k, v := range issue.Metadata.Custom {
-			snap.Metadata[k] = v
-		}
-		if issue.Metadata.JiraKey != "" {
-			snap.Metadata["jiraKey"] = issue.Metadata.JiraKey
-		}
-	}
-	return normalizeSnapshot(snap)
+	snap := TaskSnapshot(*doc)
+	return &snap
 }
 
 func (s *TaskSnapshot) ToIssue() *beadspb.Issue {
 	if s == nil {
 		return nil
 	}
-	issue := &beadspb.Issue{Id: s.ID, Title: s.Title, Description: s.Description, Status: nip34.ParseStatus(s.Status), Priority: nip34.ParsePriority(s.Priority), Epic: s.Epic, Assignee: s.Assignee, Labels: append([]string(nil), s.Labels...), DependsOn: append([]string(nil), s.DependsOn...), Metadata: &beadspb.Metadata{Custom: map[string]string{}}}
-	if created, err := parseTime(s.Created); err == nil && !created.IsZero() {
-		issue.Created = timestamppb.New(created)
-	}
-	if updated, err := parseTime(s.Updated); err == nil && !updated.IsZero() {
-		issue.Updated = timestamppb.New(updated)
-	}
-	for k, v := range s.Metadata {
-		issue.Metadata.Custom[k] = v
-	}
+	doc := taskmodel.IssueDocument(*s)
+	issue, _ := taskmodel.ToProto(&doc)
 	return issue
 }
 
@@ -361,86 +352,37 @@ func SnapshotRevision(s *TaskSnapshot) string {
 	if s == nil {
 		return ""
 	}
-	canonical, _ := json.Marshal(normalizeSnapshot(s))
-	sum := sha256.Sum256(canonical)
-	return hex.EncodeToString(sum[:])
-}
-
-func snapshotFromRaw(raw map[string]json.RawMessage) *TaskSnapshot {
-	meta := map[string]string{}
-	if m := rawMap(raw, "metadata"); len(m) > 0 {
-		for k, v := range m {
-			meta[k] = fmt.Sprint(v)
-		}
-	}
-	status := rawString(raw, "status")
-	if status == "" {
-		status = "open"
-	}
-	priority := rawString(raw, "priority")
-	if priority == "" {
-		priority = priorityFromNumber(raw, "priority")
-	}
-	return normalizeSnapshot(&TaskSnapshot{ID: rawString(raw, "id"), Title: rawString(raw, "title"), Description: firstRawString(raw, "description", "body"), Status: status, Priority: priority, Epic: rawString(raw, "epic"), Assignee: rawString(raw, "assignee"), Labels: rawStrings(raw, "labels"), DependsOn: firstRawStrings(raw, "depends_on", "dependsOn"), Created: firstRawString(raw, "created", "created_at"), Updated: firstRawString(raw, "updated", "updated_at"), Metadata: meta})
+	doc := taskmodel.IssueDocument(*s)
+	return taskmodel.MaterialRevision(&doc)
 }
 
 func normalizeSnapshot(s *TaskSnapshot) *TaskSnapshot {
 	if s == nil {
 		return nil
 	}
-	out := *s
-	out.ID = strings.TrimSpace(out.ID)
-	out.Title = strings.TrimSpace(out.Title)
-	out.Status = strings.TrimSpace(strings.ToLower(out.Status))
-	if out.Status == "" {
-		out.Status = "open"
+	doc := taskmodel.IssueDocument(*s)
+	normalized, err := taskmodel.Normalize(&doc)
+	if err != nil {
+		return nil
 	}
-	out.Priority = strings.ToUpper(strings.TrimSpace(out.Priority))
-	if out.Priority != "" && !strings.HasPrefix(out.Priority, "P") {
-		out.Priority = "P" + out.Priority
-	}
-	out.Labels = cleanStrings(out.Labels)
-	out.DependsOn = cleanStrings(out.DependsOn)
-	out.Metadata = copyStringMap(out.Metadata)
+	out := TaskSnapshot(*normalized)
 	return &out
 }
 
 func snapshotsEqual(a, b *TaskSnapshot) bool {
-	return reflect.DeepEqual(snapshotComparable(a), snapshotComparable(b))
-}
-
-func snapshotComparable(s *TaskSnapshot) TaskSnapshot {
-	if s == nil {
-		return TaskSnapshot{}
+	if a == nil || b == nil {
+		return a == b
 	}
-	n := normalizeSnapshot(s)
-	n.Metadata = nil
-	return *n
+	aa, bb := taskmodel.IssueDocument(*a), taskmodel.IssueDocument(*b)
+	return taskmodel.MaterialEqual(&aa, &bb)
 }
 
 func materialChangedFields(a, b *TaskSnapshot) []string {
-	av := snapshotComparable(a)
-	bv := snapshotComparable(b)
-	fields := []struct {
-		name string
-		eq   bool
-	}{
-		{"title", av.Title == bv.Title},
-		{"description", av.Description == bv.Description},
-		{"status", av.Status == bv.Status},
-		{"priority", av.Priority == bv.Priority},
-		{"epic", av.Epic == bv.Epic},
-		{"assignee", av.Assignee == bv.Assignee},
-		{"labels", reflect.DeepEqual(av.Labels, bv.Labels)},
-		{"depends_on", reflect.DeepEqual(av.DependsOn, bv.DependsOn)},
+	if a == nil || b == nil {
+		return []string{"task"}
 	}
-	var out []string
-	for _, f := range fields {
-		if !f.eq {
-			out = append(out, f.name)
-		}
-	}
-	return out
+	aa, bb := taskmodel.IssueDocument(*a), taskmodel.IssueDocument(*b)
+	return taskmodel.MaterialChangedFields(&aa, &bb)
 }
 
 func compatibleAutoMerge(local, relay *TaskSnapshot, changed []string) bool {

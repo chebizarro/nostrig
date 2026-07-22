@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	pb "github.com/chebizarro/nostrig/gen/beads"
+	"github.com/chebizarro/nostrig/internal/taskmodel"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -52,21 +53,8 @@ func (r *Renderer) ensureDirectory() error {
 	return os.MkdirAll(beadsDir, 0755)
 }
 
-// BeadsIssue represents a beads issue in JSON format (jira-beads-sync compatible).
-type BeadsIssue struct {
-	ID          string            `json:"id"`
-	Title       string            `json:"title"`
-	Description string            `json:"description,omitempty"`
-	Status      string            `json:"status"`
-	Priority    string            `json:"priority,omitempty"`
-	Epic        string            `json:"epic,omitempty"`
-	Assignee    string            `json:"assignee,omitempty"`
-	Labels      []string          `json:"labels,omitempty"`
-	DependsOn   []string          `json:"dependsOn,omitempty"`
-	Created     string            `json:"created,omitempty"`
-	Updated     string            `json:"updated,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-}
+// BeadsIssue is the complete Beads v1.0.3 issue document.
+type BeadsIssue = taskmodel.IssueDocument
 
 // BeadsEpic represents a beads epic in JSON format (jira-beads-sync compatible).
 type BeadsEpic struct {
@@ -95,7 +83,10 @@ func (r *Renderer) renderIssuesToJSONL(filename string, issues []*pb.Issue) (err
 		if issue == nil {
 			continue
 		}
-		jsonIssue := r.issueToJSON(issue)
+		jsonIssue, err := r.issueToJSON(issue)
+		if err != nil {
+			return fmt.Errorf("failed to convert issue %s: %w", issue.Id, err)
+		}
 		if err := encoder.Encode(jsonIssue); err != nil {
 			return fmt.Errorf("failed to encode issue %s: %w", issue.Id, err)
 		}
@@ -129,48 +120,15 @@ func (r *Renderer) renderEpicsToJSONL(filename string, epics []*pb.Epic) (err er
 	return nil
 }
 
-func (r *Renderer) issueToJSON(issue *pb.Issue) *BeadsIssue {
-	jsonIssue := &BeadsIssue{
-		ID:          issue.Id,
-		Title:       issue.Title,
-		Description: issue.Description,
-		Status:      r.statusToString(issue.Status),
-		Priority:    r.priorityToString(issue.Priority),
-		Epic:        issue.Epic,
-		Assignee:    issue.Assignee,
-		Labels:      issue.Labels,
-		DependsOn:   issue.DependsOn,
+func (r *Renderer) issueToJSON(issue *pb.Issue) (*BeadsIssue, error) {
+	doc, err := taskmodel.FromProto(issue)
+	if err != nil {
+		return nil, err
 	}
-
-	if issue.Created != nil {
-		jsonIssue.Created = r.timestampToString(issue.Created)
-	}
-	if issue.Updated != nil {
-		jsonIssue.Updated = r.timestampToString(issue.Updated)
-	}
-
-	if issue.Metadata != nil {
-		jsonIssue.Metadata = make(map[string]string)
-
-		// Keep parity with jira-beads-sync flattening approach:
-		// 1) include fixed fields if present
-		// 2) include custom map entries
-		if issue.Metadata.JiraKey != "" {
-			jsonIssue.Metadata["jiraKey"] = issue.Metadata.JiraKey
-		}
-		if issue.Metadata.JiraId != "" {
-			jsonIssue.Metadata["jiraId"] = issue.Metadata.JiraId
-		}
-		if issue.Metadata.JiraIssueType != "" {
-			jsonIssue.Metadata["jiraIssueType"] = issue.Metadata.JiraIssueType
-		}
-
-		for k, v := range issue.Metadata.Custom {
-			jsonIssue.Metadata[k] = v
-		}
-	}
-
-	return jsonIssue
+	doc.SchemaVersion = ""
+	doc.RecordType = "issue"
+	doc.DependsOn = nil
+	return doc, nil
 }
 
 func (r *Renderer) epicToJSON(epic *pb.Epic) *BeadsEpic {
@@ -219,6 +177,8 @@ func (r *Renderer) statusToString(status pb.Status) string {
 		return "blocked"
 	case pb.Status_STATUS_CLOSED:
 		return "closed"
+	case pb.Status_STATUS_DEFERRED:
+		return "deferred"
 	default:
 		return "open"
 	}
@@ -236,6 +196,8 @@ func (r *Renderer) priorityToString(priority pb.Priority) string {
 		return "p3"
 	case pb.Priority_PRIORITY_P4:
 		return "p4"
+	case pb.Priority_PRIORITY_P9:
+		return "p9"
 	default:
 		return ""
 	}

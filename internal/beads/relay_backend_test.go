@@ -3,7 +3,6 @@ package beads
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -132,6 +131,28 @@ func TestExportEqualTimestampUsesEventIDTieBreak(t *testing.T) {
 	}
 	if len(export.Issues) != 1 || export.Issues[0].Title != "second" {
 		t.Fatalf("equal timestamp selection was input-order dependent: %#v", export.Issues)
+	}
+}
+
+func TestExportPrefersV2OverNewerV1ForSameCoordinate(t *testing.T) {
+	author := backendTestPubKey(1).Hex()
+	repo := "30617:owner:repo"
+	v2, err := nip34.BuildTaskStateEvent(&pb.Issue{Id: "task-1", Title: "v2", Owner: "Stew", Status: pb.Status_STATUS_OPEN, Repository: repo}, author, time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1, err := nip34.BuildTaskStateEventV1(&pb.Issue{Id: "task-1", Title: "newer but lossy", Status: pb.Status_STATUS_OPEN, Metadata: &pb.Metadata{Custom: map[string]string{"nip34.repo_addr": repo}}}, author, time.Unix(20, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2.ID, v2.PubKey = backendTestID(1), backendTestPubKey(1)
+	v1.ID, v1.PubKey = backendTestID(2), backendTestPubKey(1)
+	export, err := ExportFromTaskStateEvents([]*gonostr.Event{v1, v2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(export.Issues) != 1 || export.Issues[0].Title != "v2" || export.Issues[0].Owner != "Stew" {
+		t.Fatalf("v1 downgraded v2 state: %#v", export.Issues)
 	}
 }
 
@@ -318,11 +339,11 @@ func TestRelayBackendPutIssuePublishesAppendOnlyTaskState(t *testing.T) {
 	if got, _ := nip34.TagFirst(ev, "d"); got != "task:task-2" {
 		t.Fatalf("d tag=%q", got)
 	}
-	var body nip34.TaskState
-	if err := json.Unmarshal([]byte(ev.Content), &body); err != nil {
+	body, err := nip34.ParseTaskStateEvent(ev)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if body.ID != "task-2" || body.Metadata["nip34.repo_addr"] != "30617:owner:repo" || body.Updated != now.Format(time.RFC3339) {
+	if body.Id != "task-2" || body.Metadata.Custom["nip34.repo_addr"] != "30617:owner:repo" || body.Updated.AsTime() != now {
 		t.Fatalf("unexpected task state: %#v", body)
 	}
 	if issue.Metadata != nil {
