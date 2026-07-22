@@ -19,6 +19,13 @@ Store only these deployment values:
 
 Never provision `NOSTR_PRIVATE_KEY` in production. `NOSTRIG_ENV=production` rejects it.
 
+Create a fail-closed caller ACL before starting the service. The file is required
+in every environment; there is no permissive production default. Start from
+`config/nostrig-acl.example.json`, replace every placeholder pubkey and repository
+address, and validate that each worker, dispatcher, maintainer, and reviewer has
+only the methods and repositories it needs. Do not grant a wildcard administrator
+role to an agent identity.
+
 Quality projection is fail-closed. Configure the PSTF/Harbormaster signer
 pubkeys with `NOSTRIG_QUALITY_AUTHORS` (comma-separated) or repeatable
 `--quality-author` flags and bind them to one project with
@@ -40,6 +47,7 @@ NOSTRIG_QUALITY_AUTHORS=<pstf-signer-pubkey-hex>
 NOSTRIG_QUALITY_PROJECT=<pstf-project>
 NOSTRIG_SIGNER_BUNKER_URL=bunker://<signer-pubkey>?relay=wss://relay.sharegap.net
 NOSTRIG_SIGNER_CLIENT_SECRET_FILE=./secrets/nostrig_signer_client_secret_key
+NOSTRIG_ACL_FILE=./config/nostrig-acl.json
 EOF
 
 install -d -m 0700 secrets
@@ -47,6 +55,8 @@ umask 077
 printf '%s\n' '<nip46-client-secret-hex>' > secrets/nostrig_signer_client_secret_key
 sudo chown 65532:65532 secrets/nostrig_signer_client_secret_key
 sudo chmod 0400 secrets/nostrig_signer_client_secret_key
+install -d -m 0700 config
+install -m 0440 /path/to/reviewed/nostrig-acl.json config/nostrig-acl.json
 
 docker compose config
 docker compose up -d --build
@@ -80,11 +90,17 @@ NOSTRIG_SIGNER_BUNKER_URL=bunker://<signer-pubkey>?relay=wss://relay.sharegap.ne
 EOF
 sudo chmod 0600 /etc/nostrig/fleet.env
 sudo install -m 0600 /path/from/signet/nostrig-client-secret /etc/nostrig/fleet.signer-client-secret
+sudo install -m 0600 /path/to/reviewed/nostrig-acl.json /etc/nostrig/fleet.acl.json
 sudo systemctl daemon-reload
 sudo systemctl enable --now nostrig-serve@fleet
 ```
 
-The unit defaults `NOSTR_RELAY` to the fleet relay, loads the client key with systemd credentials, restarts on failure, persists the signed-event outbox in `/var/lib/nostrig-fleet/outbox.json`, and waits for authoritative readiness at `http://127.0.0.1:8080/readyz` before startup completes.
+The unit defaults `NOSTR_RELAY` to the fleet relay, loads both the reviewed ACL
+and client key through systemd credentials from their root-only files under
+`/etc/nostrig`,
+restarts on failure, persists the signed-event outbox in
+`/var/lib/nostrig-fleet/outbox.json`, and waits for authoritative readiness at
+`http://127.0.0.1:8080/readyz` before startup completes.
 
 ```bash
 systemctl status nostrig-serve@fleet

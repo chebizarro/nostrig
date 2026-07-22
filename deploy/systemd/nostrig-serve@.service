@@ -8,8 +8,10 @@ Type=simple
 DynamicUser=yes
 Environment=NOSTRIG_ENV=production
 Environment=NOSTR_RELAY=wss://relay.sharegap.net
+Environment=NOSTRIG_ACL_FILE=%d/nostrig_acl
 Environment=NOSTRIG_SIGNER_CLIENT_SECRET_KEY_FILE=%d/nostrig_signer_client_secret_key
 EnvironmentFile=/etc/nostrig/%i.env
+LoadCredential=nostrig_acl:/etc/nostrig/%i.acl.json
 LoadCredential=nostrig_signer_client_secret_key:/etc/nostrig/%i.signer-client-secret
 RuntimeDirectory=nostrig-%i
 RuntimeDirectoryMode=0700

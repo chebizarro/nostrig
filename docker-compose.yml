@@ -10,8 +10,15 @@ services:
       NOSTRIG_REPO_ADDRS: ${NOSTRIG_REPO_ADDRS:?set one or more canonical 30617 repo addresses}
       NOSTRIG_QUALITY_AUTHORS: ${NOSTRIG_QUALITY_AUTHORS:-}
       NOSTRIG_QUALITY_PROJECT: ${NOSTRIG_QUALITY_PROJECT:-}
+      NOSTRIG_ACL_FILE: /run/configs/nostrig_acl.json
       NOSTRIG_SIGNER_BUNKER_URL: ${NOSTRIG_SIGNER_BUNKER_URL:?set the Signet/NIP-46 bunker URL}
       NOSTRIG_SIGNER_CLIENT_SECRET_KEY_FILE: /run/secrets/nostrig_signer_client_secret_key
+    configs:
+      - source: nostrig_acl
+        target: /run/configs/nostrig_acl.json
+        uid: "65532"
+        gid: "65532"
+        mode: 0440
     secrets:
       - source: nostrig_signer_client_secret_key
         target: nostrig_signer_client_secret_key
@@ -39,6 +46,10 @@ services:
 secrets:
   nostrig_signer_client_secret_key:
     file: ${NOSTRIG_SIGNER_CLIENT_SECRET_FILE:-./secrets/nostrig_signer_client_secret_key}
+
+configs:
+  nostrig_acl:
+    file: ${NOSTRIG_ACL_FILE:-./config/nostrig-acl.json}
 
 volumes:
   nostrig-state:

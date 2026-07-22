@@ -4,7 +4,7 @@
   "method": "service/create",
   "params": {
     "name": "nostrig",
-    "repo_url": "https://github.com/chebizarro/nostrig",
+    "repo_url": "https://git.sharegap.net/cascadia/nostrig",
     "artifact_repo": "ghcr.io/chebizarro/nostrig",
     "default_branch": "master",
     "runtime_type": "compose"

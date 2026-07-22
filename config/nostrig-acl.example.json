@@ -1,0 +1,16 @@
+{
+  "callers": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+      "roles": [
+        "dispatcher"
+      ],
+      "repositories": [
+        "30617:<owner-pubkey>:<repo-id>"
+      ]
+    }
+  },
+  "close_policy": {
+    "require_quality": true,
+    "require_reviewer": true
+  }
+}
