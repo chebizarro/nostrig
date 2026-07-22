@@ -28,7 +28,7 @@ services:
       SIGNET_LOG_LEVEL: info
       SIGNET_PROVISIONER_PUBKEYS: ${SIGNET_PROVISIONER_PUBKEYS:-}
     depends_on: [relay-1, relay-2, relay-3]
-    ports: ["18080:8080"]
+    ports: ["${SIGNET_HEALTH_HOST_PORT:-18080}:8080"]
     volumes:
       - signet-data:/data
       - ./signet.conf:/etc/signet/signet.conf:ro

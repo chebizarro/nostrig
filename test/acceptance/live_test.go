@@ -63,7 +63,9 @@ func TestLiveDisposableRelaysAndSignetAcceptance(t *testing.T) {
 		t.Run(fmt.Sprintf("%d-relay", count), func(t *testing.T) {
 			publisher := liveReliablePublisher(t, cfg.relays[:count], count)
 			event := &gonostr.Event{Kind: 30900, CreatedAt: gonostr.Timestamp(time.Now().Unix()), Content: fmt.Sprintf("nostrig-live-%d", count)}
-			reports, err := publisher.PublishWithReport(context.Background(), signer, []*gonostr.Event{event})
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			reports, err := publisher.PublishWithReport(ctx, signer, []*gonostr.Event{event})
+			cancel()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -78,7 +80,9 @@ func TestLiveDisposableRelaysAndSignetAcceptance(t *testing.T) {
 		relays = append(relays, "ws://127.0.0.1:1")
 		publisher := liveReliablePublisher(t, relays, 2)
 		event := &gonostr.Event{Kind: 30900, CreatedAt: gonostr.Timestamp(time.Now().Unix()), Content: "nostrig-live-partial"}
-		reports, err := publisher.PublishWithReport(context.Background(), signer, []*gonostr.Event{event})
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		reports, err := publisher.PublishWithReport(ctx, signer, []*gonostr.Event{event})
+		cancel()
 		if err != nil {
 			t.Fatal(err)
 		}

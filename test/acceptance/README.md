@@ -21,6 +21,8 @@ Generate throwaway secrets; never reuse production custody material:
 export SIGNET_DB_KEY="$(openssl rand -hex 32)"
 export SIGNET_BUNKER_NSEC="<throwaway nsec>"
 export SIGNET_PROVISIONER_PUBKEYS="<throwaway provisioner hex pubkey>"
+# Override when another local acceptance service already owns port 18080.
+export SIGNET_HEALTH_HOST_PORT=18081
 docker compose -f test/acceptance/compose.yaml up -d --build
 ```
 

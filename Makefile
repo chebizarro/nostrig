@@ -19,7 +19,7 @@ IMAGE_METADATA ?= $(BUILD_DIR)/image-metadata.json
 IMAGE_DIGEST ?= $(BUILD_DIR)/image-digest.txt
 SBOM_GENERATOR ?= docker/buildkit-syft-scanner:stable-1@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
 
-.PHONY: proto build install test vet race fuzz-smoke acceptance-contract acceptance-smoke acceptance-live acceptance-three-agent deployment-check test-full check image release-image sbom clean
+.PHONY: proto build install test vet race fuzz-smoke acceptance-contract acceptance-smoke acceptance-live acceptance-signet-disposable acceptance-three-agent deployment-check test-full check image release-image sbom clean
 
 proto:
 	$(GO_CMD) generate ./...
@@ -59,6 +59,9 @@ acceptance-live:
 	@test -n "$$NOSTRIG_ACCEPTANCE_BUNKER_URL" || (echo "NOSTRIG_ACCEPTANCE_BUNKER_URL is required" >&2; exit 2)
 	@test -n "$$NOSTRIG_ACCEPTANCE_CLIENT_SECRET" || (echo "NOSTRIG_ACCEPTANCE_CLIENT_SECRET is required" >&2; exit 2)
 	$(GO_CMD) test -mod=readonly -tags=nostrig_acceptance -run='^TestLive' -v ./test/acceptance
+
+acceptance-signet-disposable:
+	./scripts/run-disposable-signet-acceptance.sh
 
 deployment-check:
 	./scripts/validate-deployment.sh
