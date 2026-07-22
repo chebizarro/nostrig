@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	gonostr "fiatjaf.com/nostr"
+	casnostr "git.sharegap.net/cascadia/cascadia-go/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	"github.com/chebizarro/nostrig/internal/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
@@ -122,8 +123,12 @@ func (p *Pipeline) Export(ctx context.Context, opts FetchOptions) (*FetchResult,
 		return nil, err
 	}
 
-	// Phase C: fetch statuses targeting the root IDs
-	statusByRoot, err := p.fetchStatuses(ctx, relays, roots)
+	// Phase C: only repository-owner/maintainer status events may affect state.
+	trustedMaintainers, err := nip34.TrustedMaintainers(repo)
+	if err != nil {
+		return nil, err
+	}
+	statusByRoot, err := p.fetchStatuses(ctx, relays, roots, trustedMaintainers)
 	if err != nil {
 		return nil, err
 	}
@@ -181,6 +186,9 @@ func (p *Pipeline) findRepoAnnouncement(ctx context.Context, relays []string, re
 	// Parse all candidates and pick latest by created_at
 	candidates := make([]*nip34.RepoAnnouncement, 0, len(events))
 	for _, ev := range events {
+		if !casnostr.VerifyEvent((*casnostr.Event)(ev)) {
+			continue
+		}
 		ra, err := nip34.ParseRepoAnnouncement(ev)
 		if err != nil {
 			continue
@@ -192,6 +200,9 @@ func (p *Pipeline) findRepoAnnouncement(ctx context.Context, relays []string, re
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].CreatedAt.Equal(candidates[j].CreatedAt) {
+			return candidates[i].EventID < candidates[j].EventID
+		}
 		return candidates[i].CreatedAt.Before(candidates[j].CreatedAt)
 	})
 
@@ -267,7 +278,7 @@ func (p *Pipeline) fetchRepoData(ctx context.Context, relays []string, repoID st
 	return state, roots, nil
 }
 
-func (p *Pipeline) fetchStatuses(ctx context.Context, relays []string, roots []*nip34.RootItem) (map[string]*nip34.StatusEvent, error) {
+func (p *Pipeline) fetchStatuses(ctx context.Context, relays []string, roots []*nip34.RootItem, trustedAuthors []string) (map[string]*nip34.StatusEvent, error) {
 	rootIDs := make([]string, 0, len(roots))
 	for _, r := range roots {
 		if r == nil {
@@ -284,6 +295,17 @@ func (p *Pipeline) fetchStatuses(ctx context.Context, relays []string, roots []*
 	if len(rootIDs) == 0 {
 		return out, nil
 	}
+	authors := make([]gonostr.PubKey, 0, len(trustedAuthors))
+	for _, value := range trustedAuthors {
+		key, err := gonostr.PubKeyFromHex(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted maintainer %q", value)
+		}
+		authors = append(authors, key)
+	}
+	if len(authors) == 0 {
+		return nil, fmt.Errorf("at least one trusted repository maintainer is required")
+	}
 
 	const chunkSize = 200
 	chunks := chunkStrings(rootIDs, chunkSize)
@@ -297,7 +319,8 @@ func (p *Pipeline) fetchStatuses(ctx context.Context, relays []string, roots []*
 				gonostr.Kind(nip34.KindStatusClosed),
 				gonostr.Kind(nip34.KindStatusDraft),
 			},
-			Tags: gonostr.TagMap{"e": ch},
+			Authors: authors,
+			Tags:    gonostr.TagMap{"e": ch},
 		})
 	}
 
@@ -310,23 +333,8 @@ func (p *Pipeline) fetchStatuses(ctx context.Context, relays []string, roots []*
 		return nil, fmt.Errorf("failed fetching statuses: %w", err)
 	}
 
-	for _, ev := range events {
-		st, err := nip34.ParseStatusEvent(ev)
-		if err != nil {
-			continue
-		}
-
-		prev, ok := out[st.RootEventID]
-		if !ok {
-			out[st.RootEventID] = st
-			continue
-		}
-		if st.CreatedAt.After(prev.CreatedAt) {
-			out[st.RootEventID] = st
-		}
-	}
-
-	return out, nil
+	resolved := nip34.ResolveStatuses(events, rootIDs, trustedAuthors)
+	return resolved.Trusted, nil
 }
 
 func defaultRelays() []string {

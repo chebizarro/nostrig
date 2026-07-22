@@ -114,6 +114,17 @@ By default, the durable projection cache is written to `./.nostrig/task-cache.js
 
 You can also derive the repo address from `--repo-id` and `--owner`, or sync exact tasks with repeated `--task-id`. To avoid broad relay scans, `sync` requires either `--repo-addr` (or `--repo-id` + `--owner`) or at least one `--task-id`. `--relay` falls back to `NOSTR_RELAY`/`NOSTR_RELAYS` for `sync`, `claim`, and `update`. The Gastown projection/dispatch contract is documented in [docs/gastown-integration.md](./docs/gastown-integration.md).
 
+### Reconcile NIP-34 and Gitea state
+
+`nostrig nip34 reconcile` reports drift among canonical tasks, trusted NIP-34
+status, and explicitly linked Gitea issues. Add `--repair` to apply the documented
+field-authority policy. Stable links use
+`--gitea-repo owner/repo --link task-id=issue-number`; the command never
+fuzzy-matches or creates issues.
+
+See [docs/nip34-reconciliation.md](./docs/nip34-reconciliation.md) for the trust,
+revision, echo-suppression, repair, and field-authority contracts.
+
 ### Claim a task
 
 `claim` publishes a ContextVM intent event (`kind 25910`, method `task/claim`) to dispatch a claim request to a worker or fleet agent:
@@ -226,7 +237,9 @@ NIP-34 status events are mapped as:
 - `1632` (Closed) → beads `closed`
 - `1633` (Draft) → beads `open` + add label `draft`
 
-`nostrig` uses **latest status wins** semantics (no maintainer enforcement yet).
+`nostrig` uses deterministic latest-status semantics among events signed by the
+repository owner or an announced maintainer. Non-maintainer and invalidly signed
+status events never affect task state.
 
 ## Development
 

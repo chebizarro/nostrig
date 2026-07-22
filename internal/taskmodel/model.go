@@ -21,6 +21,74 @@ import (
 
 const CurrentSchema = "cascadia.task-state.v2"
 
+const (
+	MetadataGiteaBaseURL     = "gitea.base_url"
+	MetadataGiteaOwner       = "gitea.owner"
+	MetadataGiteaRepo        = "gitea.repo"
+	MetadataGiteaIssueNumber = "gitea.issue_number"
+	MetadataGiteaIssueURL    = "gitea.issue_url"
+)
+
+type GiteaLink struct {
+	BaseURL     string
+	Owner       string
+	Repo        string
+	IssueNumber int64
+	IssueURL    string
+}
+
+// ParseGiteaLink validates the all-or-none stable task-to-Gitea issue identity.
+func ParseGiteaLink(metadata map[string]string) (GiteaLink, bool, error) {
+	keys := []string{MetadataGiteaBaseURL, MetadataGiteaOwner, MetadataGiteaRepo, MetadataGiteaIssueNumber, MetadataGiteaIssueURL}
+	present := 0
+	for _, key := range keys {
+		if strings.TrimSpace(metadata[key]) != "" {
+			present++
+		}
+	}
+	if present == 0 {
+		return GiteaLink{}, false, nil
+	}
+	if present != len(keys) {
+		return GiteaLink{}, false, fmt.Errorf("Gitea issue link metadata must be set together")
+	}
+	base := strings.TrimRight(strings.TrimSpace(metadata[MetadataGiteaBaseURL]), "/")
+	parsed, err := url.Parse(base)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return GiteaLink{}, false, fmt.Errorf("invalid Gitea base URL")
+	}
+	owner, repo := strings.TrimSpace(metadata[MetadataGiteaOwner]), strings.TrimSpace(metadata[MetadataGiteaRepo])
+	if owner == "" || repo == "" || strings.ContainsAny(owner+repo, "/\\") ||
+		url.PathEscape(owner) != owner || url.PathEscape(repo) != repo {
+		return GiteaLink{}, false, fmt.Errorf("invalid Gitea repository identity")
+	}
+	number, err := strconv.ParseInt(strings.TrimSpace(metadata[MetadataGiteaIssueNumber]), 10, 64)
+	if err != nil || number <= 0 {
+		return GiteaLink{}, false, fmt.Errorf("invalid Gitea issue number")
+	}
+	issueURL := fmt.Sprintf("%s/%s/%s/issues/%d", base, owner, repo, number)
+	if strings.TrimRight(strings.TrimSpace(metadata[MetadataGiteaIssueURL]), "/") != issueURL {
+		return GiteaLink{}, false, fmt.Errorf("Gitea issue URL does not match link identity")
+	}
+	return GiteaLink{BaseURL: base, Owner: owner, Repo: repo, IssueNumber: number, IssueURL: issueURL}, true, nil
+}
+
+// SetGiteaLink writes a complete, derived stable issue identity.
+func SetGiteaLink(metadata map[string]string, link GiteaLink) error {
+	if metadata == nil {
+		return fmt.Errorf("metadata map is required")
+	}
+	base := strings.TrimRight(strings.TrimSpace(link.BaseURL), "/")
+	metadata[MetadataGiteaBaseURL] = base
+	metadata[MetadataGiteaOwner] = strings.TrimSpace(link.Owner)
+	metadata[MetadataGiteaRepo] = strings.TrimSpace(link.Repo)
+	metadata[MetadataGiteaIssueNumber] = strconv.FormatInt(link.IssueNumber, 10)
+	metadata[MetadataGiteaIssueURL] = fmt.Sprintf("%s/%s/%s/issues/%d", base, link.Owner, link.Repo, link.IssueNumber)
+	_, _, err := ParseGiteaLink(metadata)
+	return err
+}
+
 type IssueDocument struct {
 	SchemaVersion      string                 `json:"schema_version,omitempty"`
 	RecordType         string                 `json:"_type,omitempty"`
@@ -830,6 +898,17 @@ func ParsePriority(s string) pb.Priority {
 	}
 }
 
+// StableRevision hashes JSON-compatible source/projection data for sync
+// checkpoints. encoding/json provides deterministic map key ordering.
+func StableRevision(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
 func MaterialRevision(doc *IssueDocument) string {
 	n, err := materialDocument(doc)
 	if err != nil {
@@ -885,7 +964,7 @@ func materialDocument(doc *IssueDocument) (*IssueDocument, error) {
 	n.SchemaVersion, n.RecordType = "", ""
 	if n.Metadata != nil {
 		for key := range n.Metadata {
-			if strings.HasPrefix(key, "nostr.") || strings.HasPrefix(key, "nostrig.") {
+			if strings.HasPrefix(key, "nostr.") || strings.HasPrefix(key, "nostrig.") || strings.HasPrefix(key, "sync.") {
 				delete(n.Metadata, key)
 			}
 		}

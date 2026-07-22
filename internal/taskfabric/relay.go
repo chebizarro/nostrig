@@ -17,13 +17,16 @@ import (
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
 )
 
+type RepositoryAnnouncementResolver func(context.Context, *nip34.Client, []string, string) (*nip34.RepoAnnouncement, error)
+
 type RelayLedger struct {
-	Relays          []string
-	Signer          nip34.Signer
-	Client          *nip34.Client
-	Publisher       EventPublisher
-	CanonicalAuthor string
-	SyncNIP34Status bool
+	Relays                  []string
+	Signer                  nip34.Signer
+	Client                  *nip34.Client
+	Publisher               EventPublisher
+	CanonicalAuthor         string
+	SyncNIP34Status         bool
+	ResolveRepoAnnouncement RepositoryAnnouncementResolver
 }
 
 var relayMutationLocks sync.Map
@@ -129,6 +132,9 @@ func (l *RelayLedger) MutateTask(ctx context.Context, id string, mutate TaskMuta
 	}
 	eventsToPublish := []*gonostr.Event{state}
 	if l.SyncNIP34Status {
+		if err := l.authorizeNIP34Writeback(ctx, decision.Issue); err != nil {
+			return nil, err
+		}
 		if status := nip34.BuildNIP34IssueStatusEvent(decision.Issue, now); status != nil {
 			eventsToPublish = append(eventsToPublish, status)
 		}
@@ -138,6 +144,28 @@ func (l *RelayLedger) MutateTask(ctx context.Context, id string, mutate TaskMuta
 		return nil, err
 	}
 	return &TaskRecord{Issue: cloneIssue(decision.Issue), EventID: eventID(ev), CreatedAt: now, event: ev}, nil
+}
+
+func (l *RelayLedger) authorizeNIP34Writeback(ctx context.Context, issue *beadspb.Issue) error {
+	if l == nil || issue == nil {
+		return fmt.Errorf("relay ledger and task are required")
+	}
+	repoAddr := strings.TrimSpace(issue.GetMetadata().GetCustom()["nip34.repo_addr"])
+	if repoAddr == "" || strings.TrimSpace(issue.GetMetadata().GetCustom()["nostr.id"]) == "" {
+		return nil
+	}
+	resolve := l.ResolveRepoAnnouncement
+	if resolve == nil {
+		resolve = nip34.ResolveRepositoryAnnouncement
+	}
+	repo, err := resolve(ctx, l.client(), cleanStrings(l.Relays), repoAddr)
+	if err != nil {
+		return err
+	}
+	if !nip34.IsTrustedMaintainer(repo, l.CanonicalAuthor) {
+		return fmt.Errorf("canonical author %s is not a trusted maintainer for %s", l.CanonicalAuthor, repoAddr)
+	}
+	return nil
 }
 
 func (l *RelayLedger) GetQueue(ctx context.Context, repoAddr, queue string) (*QueueRecord, error) {

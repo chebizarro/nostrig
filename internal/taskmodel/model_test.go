@@ -115,3 +115,24 @@ func TestCanonicalRejectsUnknownStringPriorityAndNonBlossomArtifact(t *testing.T
 		}
 	}
 }
+
+func TestGiteaLinkStableAndSyncMetadataNonMaterial(t *testing.T) {
+	issue := &pb.Issue{Id: "task-1", Title: "task", Status: pb.Status_STATUS_OPEN, Metadata: &pb.Metadata{Custom: map[string]string{}}}
+	if err := SetGiteaLink(issue.Metadata.Custom, GiteaLink{BaseURL: "https://gitea.example/", Owner: "acme", Repo: "repo", IssueNumber: 42}); err != nil {
+		t.Fatal(err)
+	}
+	link, linked, err := ParseGiteaLink(issue.Metadata.Custom)
+	if err != nil || !linked || link.IssueURL != "https://gitea.example/acme/repo/issues/42" {
+		t.Fatalf("link = %#v,%v,%v", link, linked, err)
+	}
+	doc, err := FromProto(issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := MaterialRevision(doc)
+	doc.Metadata["sync.origin"] = "gitea"
+	doc.Metadata["sync.gitea.source_revision"] = StableRevision(map[string]string{"state": "open"})
+	if after := MaterialRevision(doc); after != before {
+		t.Fatalf("sync metadata changed material revision: %s != %s", after, before)
+	}
+}

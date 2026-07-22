@@ -45,6 +45,22 @@ The reader also accepts historical Nostrig aliases (`created`, `updated`,
 `dependsOn`, and string `P<n>` priorities), but the renderer emits only the
 current snake_case Beads shape.
 
+## NIP-34/Gitea synchronization metadata
+
+The original NIP-34 root identity is the canonical tuple `nostr.id`,
+`nostr.kind`, `nostr.pubkey`, and `nip34.repo_addr`. A Gitea issue link is
+an all-or-none `gitea.base_url`, `gitea.owner`, `gitea.repo`,
+`gitea.issue_number`, and derived `gitea.issue_url` tuple. New task events
+index the latter with a marked `r`/`gitea-issue` tag; the parser rejects
+content/tag disagreement.
+
+`sync.<side>.source_revision` and `sync.<side>.last_sync_revision` record
+the last reconciled Nostrig, NIP-34, and Gitea semantic revisions.
+`sync.origin` and `sync.origin_revision` record the last material import.
+All `sync.*` keys are excluded from material task revision calculation to
+prevent checkpoint-only update loops. See
+[the reconciliation contract](./nip34-reconciliation.md).
+
 ## Artifact references
 
 Patch bodies, transcripts, logs, and other large payloads are never embedded.

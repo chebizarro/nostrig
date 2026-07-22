@@ -40,7 +40,7 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 
-	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newMigrateCmd(), newImportCmd(), newTaskCmd(), newCreateCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newDeleteCmd(), newQueueCmd(), newServeCmd(), newOutboxCmd())
+	cmd.AddCommand(newFetchCmd(), newPublishCmd(), newSyncCmd(), newMigrateCmd(), newImportCmd(), newNIP34Cmd(), newTaskCmd(), newCreateCmd(), newClaimCmd(), newAssignCmd(), newUpdateCmd(), newCloseCmd(), newDeleteCmd(), newQueueCmd(), newServeCmd(), newOutboxCmd())
 	return cmd
 }
 

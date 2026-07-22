@@ -197,7 +197,22 @@ func BuildNIP34IssueLinkEvent(issue *beadspb.Issue, now time.Time) *gonostr.Even
 }
 
 func BuildNIP34IssueStatusEvent(issue *beadspb.Issue, now time.Time) *gonostr.Event {
+	kind := KindStatusOpen
+	if issue != nil && issue.Status == beadspb.Status_STATUS_CLOSED {
+		kind = KindStatusClosed
+	}
+	return BuildNIP34IssueStatusEventForKind(issue, kind, "", now)
+}
+
+// BuildNIP34IssueStatusEventForKind builds a status projection with optional
+// origin revision tags used for echo suppression and reconciliation auditing.
+func BuildNIP34IssueStatusEventForKind(issue *beadspb.Issue, kind int, taskRevision string, now time.Time) *gonostr.Event {
 	if issue == nil || issue.Metadata == nil || issue.Metadata.Custom == nil {
+		return nil
+	}
+	switch kind {
+	case KindStatusOpen, KindStatusApplied, KindStatusClosed, KindStatusDraft:
+	default:
 		return nil
 	}
 	repoAddr := strings.TrimSpace(issue.Metadata.Custom["nip34.repo_addr"])
@@ -205,14 +220,13 @@ func BuildNIP34IssueStatusEvent(issue *beadspb.Issue, now time.Time) *gonostr.Ev
 	if repoAddr == "" || rootID == "" {
 		return nil
 	}
-	kind := KindStatusOpen
-	switch issue.Status {
-	case beadspb.Status_STATUS_CLOSED:
-		kind = KindStatusClosed
-	default:
-		kind = KindStatusOpen
+	if now.IsZero() {
+		now = time.Now().UTC()
 	}
 	tags := gonostr.Tags{{"a", repoAddr}, {"e", rootID, "", "root"}, {"task", issue.Id}}
+	if taskRevision = strings.TrimSpace(taskRevision); taskRevision != "" {
+		tags = append(tags, gonostr.Tag{"origin", "nostrig"}, gonostr.Tag{"task-revision", taskRevision})
+	}
 	return &gonostr.Event{Kind: gonostr.Kind(kind), CreatedAt: gonostr.Timestamp(now.Unix()), Tags: tags}
 }
 

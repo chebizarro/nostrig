@@ -8,6 +8,7 @@ import (
 
 	gonostr "fiatjaf.com/nostr"
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
+	"github.com/chebizarro/nostrig/internal/taskmodel"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -333,5 +334,35 @@ func TestBuildContextVMCommand(t *testing.T) {
 	}
 	if method, _ := TagFirst(ev, "method"); method != "task/assign" {
 		t.Fatalf("assign method=%q", method)
+	}
+}
+
+func TestTaskStateIndexesStableGiteaLinkAndStatusOrigin(t *testing.T) {
+	issue := &beadspb.Issue{Id: "task-1", Title: "task", Status: beadspb.Status_STATUS_CLOSED, Metadata: &beadspb.Metadata{Custom: map[string]string{
+		"nostr.id":        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"nostr.kind":      "1621",
+		"nip34.repo_addr": "30617:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:repo",
+	}}}
+	if err := taskmodel.SetGiteaLink(issue.Metadata.Custom, taskmodel.GiteaLink{BaseURL: "https://gitea.example", Owner: "acme", Repo: "repo", IssueNumber: 42}); err != nil {
+		t.Fatal(err)
+	}
+	author := fmt.Sprintf("%064x", 1)
+	state, err := BuildTaskStateEvent(issue, author, time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if markedTag(state, "r", "gitea-issue") != "https://gitea.example/acme/repo/issues/42" {
+		t.Fatalf("missing Gitea link tag: %#v", state.Tags)
+	}
+	state.ID, state.PubKey = testID(55), testPubKey(1)
+	if _, err := ParseTaskStateEvent(state); err != nil {
+		t.Fatalf("Gitea-linked task did not round trip: %v", err)
+	}
+	status := BuildNIP34IssueStatusEventForKind(issue, KindStatusClosed, "revision-1", time.Unix(11, 0))
+	if origin, _ := TagFirst(status, "origin"); origin != "nostrig" {
+		t.Fatalf("origin tag missing: %#v", status.Tags)
+	}
+	if revision, _ := TagFirst(status, "task-revision"); revision != "revision-1" {
+		t.Fatalf("task revision tag missing: %#v", status.Tags)
 	}
 }

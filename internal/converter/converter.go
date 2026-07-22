@@ -8,6 +8,7 @@ import (
 
 	beadspb "github.com/chebizarro/nostrig/gen/beads"
 	nip34 "github.com/chebizarro/nostrig/internal/nostr"
+	"github.com/chebizarro/nostrig/internal/taskmodel"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -252,6 +253,25 @@ func (c *Converter) convertRootItem(root *nip34.RootItem, status *nip34.StatusEv
 			Custom: custom,
 		},
 	}
+	statusKind := "missing"
+	if status != nil {
+		statusKind = strconv.Itoa(status.Kind)
+	}
+	nipRevision := taskmodel.StableRevision(map[string]string{
+		"root_id": root.EventID, "root_kind": strconv.Itoa(root.Kind), "repo_addr": repoAddr,
+		"subject": root.Subject, "content": root.Content, "status_kind": statusKind,
+	})
+	doc, err := taskmodel.FromProto(issue)
+	if err != nil {
+		return nil, err
+	}
+	taskRevision := taskmodel.MaterialRevision(doc)
+	custom["sync.origin"] = "nip34"
+	custom["sync.origin_revision"] = nipRevision
+	custom["sync.nip34.source_revision"] = nipRevision
+	custom["sync.nip34.last_sync_revision"] = nipRevision
+	custom["sync.nostrig.source_revision"] = taskRevision
+	custom["sync.nostrig.last_sync_revision"] = taskRevision
 
 	return issue, nil
 }

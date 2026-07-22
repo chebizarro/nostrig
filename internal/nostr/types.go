@@ -36,6 +36,22 @@ func TagAll(ev *gonostr.Event, name string) []string {
 	return out
 }
 
+// tagValues returns every value after the tag name. NIP-34 repository
+// announcements permit maintainers to be expressed in repeated or multi-value
+// tags, unlike indexable one-value tags.
+func tagValues(ev *gonostr.Event, name string) []string {
+	if ev == nil {
+		return nil
+	}
+	var out []string
+	for _, tag := range ev.Tags {
+		if len(tag) >= 2 && tag[0] == name {
+			out = append(out, tag[1:]...)
+		}
+	}
+	return out
+}
+
 // TagsWithNamePrefix returns all tags whose name begins with prefix (e.g. "refs/").
 func TagsWithNamePrefix(ev *gonostr.Event, prefix string) gonostr.Tags {
 	if ev == nil {
@@ -168,7 +184,7 @@ func ParseRepoAnnouncement(ev *gonostr.Event) (*RepoAnnouncement, error) {
 		Web:         TagAll(ev, "web"),
 		Clone:       TagAll(ev, "clone"),
 		Relays:      TagAll(ev, "relays"),
-		Maintainers: TagAll(ev, "maintainers"),
+		Maintainers: tagValues(ev, "maintainers"),
 		Topics:      TagAll(ev, "t"),
 		CreatedAt:   EventTime(ev),
 		Raw:         ev,

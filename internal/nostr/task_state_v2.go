@@ -78,6 +78,11 @@ func BuildTaskStateEvent(issue *beadspb.Issue, canonicalAuthor string, now time.
 	} else if linked {
 		tags = append(tags, gonostr.Tag{"e", value, "", "nip34-root"}, gonostr.Tag{"issue", value})
 	}
+	if link, linked, err := taskmodel.ParseGiteaLink(doc.Metadata); err != nil {
+		return nil, err
+	} else if linked {
+		tags = append(tags, gonostr.Tag{"r", link.IssueURL, "", "gitea-issue"})
+	}
 	if doc.Repository != "" {
 		tags = append(tags, gonostr.Tag{"a", doc.Repository, "", "nip34-repo"})
 	}
@@ -231,6 +236,18 @@ func parseTaskStateEventV2(ev *gonostr.Event) (*beadspb.Issue, error) {
 		}
 	} else if len(issueTags) > 0 || rootTag != "" {
 		return nil, fmt.Errorf("NIP-34 tags require a supported root reference")
+	}
+	giteaTag := markedTag(ev, "r", "gitea-issue")
+	giteaLink, giteaLinked, err := taskmodel.ParseGiteaLink(doc.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	if giteaLinked {
+		if giteaTag != giteaLink.IssueURL {
+			return nil, fmt.Errorf("Gitea issue tag does not match content")
+		}
+	} else if giteaTag != "" {
+		return nil, fmt.Errorf("Gitea issue tag requires complete link metadata")
 	}
 	return taskmodel.ToProto(doc)
 }
