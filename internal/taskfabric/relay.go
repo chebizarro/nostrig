@@ -107,7 +107,7 @@ func (l *RelayLedger) MutateTask(ctx context.Context, id string, mutate TaskMuta
 	if decision.Unchanged {
 		return cloneTaskRecord(current), nil
 	}
-	now := time.Now().UTC()
+	now := nextTaskReplaceableTime(time.Now().UTC(), current)
 	if decision.Delete {
 		if current == nil || current.event == nil {
 			return nil, nil
@@ -254,7 +254,7 @@ func (l *RelayLedger) MutateQueue(ctx context.Context, repoAddr, queue string, m
 	for _, lease := range decision.Queue.Leases {
 		reservations = append(reservations, nip34.QueueReservation{TaskID: lease.TaskID, Worker: lease.Worker, LeaseID: lease.LeaseID, ExpiresAt: lease.ExpiresAt})
 	}
-	now := time.Now().UTC()
+	now := nextQueueReplaceableTime(time.Now().UTC(), current)
 	ev := nip34.BuildQueueCollectionEventWithReservations(repoAddr, queue, decision.Queue.TaskIDs, reservations, l.CanonicalAuthor, now)
 	published, err := l.publishOne(ctx, ev)
 	if err != nil {
@@ -263,6 +263,22 @@ func (l *RelayLedger) MutateQueue(ctx context.Context, repoAddr, queue string, m
 	out := cloneQueueRecord(decision.Queue)
 	out.EventID, out.CreatedAt = eventID(published), now
 	return out, nil
+}
+
+func nextTaskReplaceableTime(now time.Time, current *TaskRecord) time.Time {
+	now = now.UTC()
+	if current != nil && now.Unix() <= current.CreatedAt.Unix() {
+		return time.Unix(current.CreatedAt.Unix()+1, 0).UTC()
+	}
+	return now
+}
+
+func nextQueueReplaceableTime(now time.Time, current *QueueRecord) time.Time {
+	now = now.UTC()
+	if current != nil && now.Unix() <= current.CreatedAt.Unix() {
+		return time.Unix(current.CreatedAt.Unix()+1, 0).UTC()
+	}
+	return now
 }
 
 func (l *RelayLedger) publishOne(ctx context.Context, ev *gonostr.Event) (*gonostr.Event, error) {
