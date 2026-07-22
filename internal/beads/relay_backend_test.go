@@ -2,7 +2,10 @@ package beads
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -25,6 +28,18 @@ func (f *fakeFetcher) Fetch(ctx context.Context, relays []string, filter gonostr
 		return f.tombstones, nil
 	}
 	f.filter = filter
+	return f.events, nil
+}
+
+type fakePaginatedFetcher struct {
+	fakeFetcher
+	filters    []gonostr.Filter
+	pagination nip34.PaginationOptions
+}
+
+func (f *fakePaginatedFetcher) FetchManyPaginated(ctx context.Context, relays []string, filters []gonostr.Filter, opts nip34.PaginationOptions) ([]*gonostr.Event, error) {
+	f.filters = append([]gonostr.Filter(nil), filters...)
+	f.pagination = opts
 	return f.events, nil
 }
 
@@ -150,7 +165,141 @@ func TestCanonicalTombstoneSuppressesStateUntilLaterRecreation(t *testing.T) {
 	}
 }
 
+func TestRelayBackendLoadExportReturnsMoreThanFiveHundredTasks(t *testing.T) {
+	author := backendTestPubKey(1).Hex()
+	repo := "30617:owner:large-repo"
+	events := make([]*gonostr.Event, 0, 601)
+	for i := 0; i < 601; i++ {
+		at := time.Unix(int64(10_000-i), 0)
+		issue := &pb.Issue{
+			Id: fmt.Sprintf("task-%04d", i), Title: fmt.Sprintf("Task %d", i),
+			Status:   pb.Status_STATUS_OPEN,
+			Metadata: &pb.Metadata{Custom: map[string]string{"nip34.repo_addr": repo}},
+		}
+		ev, err := nip34.BuildTaskStateEvent(issue, author, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ev.ID, ev.PubKey = backendNumberedID(i+1), backendTestPubKey(1)
+		events = append(events, ev)
+	}
+	fetcher := &fakePaginatedFetcher{fakeFetcher: fakeFetcher{events: events}}
+	backend := NewRelayBackend(RelayBackendOptions{
+		Relays: []string{"wss://relay.example"}, RepoAddr: repo, Authors: []string{author},
+		Fetcher: fetcher, Pagination: nip34.PaginationOptions{PageSize: 500, MaxEvents: 1000},
+	})
+	export, err := backend.LoadExport(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(export.Issues) != 601 {
+		t.Fatalf("issues=%d, want 601", len(export.Issues))
+	}
+	if len(fetcher.filters) != 2 {
+		t.Fatalf("filters=%d, want state+tombstone", len(fetcher.filters))
+	}
+	for i, filter := range fetcher.filters {
+		if len(filter.Authors) != 1 || filter.Authors[0].Hex() != author {
+			t.Fatalf("filter %d missing canonical author: %#v", i, filter)
+		}
+		if got := filter.Tags["a"]; len(got) == 0 || got[len(got)-1] != repo {
+			t.Fatalf("filter %d missing repository selector: %#v", i, filter.Tags)
+		}
+	}
+}
+
+func TestCanonicalTaskQueryBuildsEfficientExactSelectors(t *testing.T) {
+	author := backendTestPubKey(1).Hex()
+	repo := "30617:owner:repo"
+	query, err := NewCanonicalTaskQuery(repo, []string{"task-1"}, []string{author}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filters := query.Filters()
+	if len(filters) != 2 {
+		t.Fatalf("filters=%d", len(filters))
+	}
+	state, tombstone := filters[0], filters[1]
+	if got := state.Tags["a"]; len(got) != 1 || got[0] != repo {
+		t.Fatalf("state repo selector=%#v", got)
+	}
+	if got := state.Tags["d"]; len(got) != 1 || got[0] != "task:task-1" {
+		t.Fatalf("state exact selector=%#v", got)
+	}
+	wantCoordinate := nip34.Address(nip34.KindCanonicalState, author, "task:task-1")
+	if got := tombstone.Tags["a"]; len(got) != 1 || got[0] != wantCoordinate {
+		t.Fatalf("tombstone exact selector=%#v want %q", got, wantCoordinate)
+	}
+	for i, filter := range filters {
+		if len(filter.Authors) != 1 || filter.Authors[0].Hex() != author {
+			t.Fatalf("filter %d authors=%#v", i, filter.Authors)
+		}
+	}
+}
+
+func TestRelayBackendLegacyFetcherCannotSilentlySaturateLimit(t *testing.T) {
+	author := backendTestPubKey(1).Hex()
+	repo := "30617:owner:repo"
+	events := make([]*gonostr.Event, 0, 2)
+	for i := 0; i < 2; i++ {
+		ev, err := nip34.BuildTaskStateEvent(&pb.Issue{
+			Id: fmt.Sprintf("task-%d", i), Title: "task", Status: pb.Status_STATUS_OPEN,
+			Metadata: &pb.Metadata{Custom: map[string]string{"nip34.repo_addr": repo}},
+		}, author, time.Unix(int64(i+1), 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ev.ID, ev.PubKey = backendNumberedID(i+1), backendTestPubKey(1)
+		events = append(events, ev)
+	}
+	backend := NewRelayBackend(RelayBackendOptions{
+		Relays: []string{"wss://relay.example"}, RepoAddr: repo, Authors: []string{author},
+		Limit: 2, Fetcher: &fakeFetcher{events: events},
+	})
+	_, err := backend.LoadExport(context.Background())
+	var truncated *nip34.QueryTruncatedError
+	if !errors.As(err, &truncated) || truncated.Reason != nip34.TruncatedByLegacyFetcherLimit {
+		t.Fatalf("expected explicit legacy fetcher truncation, got %v", err)
+	}
+}
+
+func TestTaskStateProjectionAppliesDeleteAndRecreationIncrementally(t *testing.T) {
+	author := backendTestPubKey(1).Hex()
+	repo := "30617:owner:repo"
+	issue := &pb.Issue{Id: "task-1", Title: "first", Status: pb.Status_STATUS_OPEN, Metadata: &pb.Metadata{Custom: map[string]string{"nip34.repo_addr": repo}}}
+	state, _ := nip34.BuildTaskStateEvent(issue, author, time.Unix(10, 0))
+	state.ID, state.PubKey = backendNumberedID(1), backendTestPubKey(1)
+	projection := NewTaskStateProjection()
+	if id, changed, err := projection.Apply(state); err != nil || id != "task-1" || !changed {
+		t.Fatalf("apply state id=%q changed=%v err=%v", id, changed, err)
+	}
+	if _, changed, err := projection.Apply(state); err != nil || changed {
+		t.Fatalf("duplicate state changed=%v err=%v", changed, err)
+	}
+	tombstone, _ := nip34.BuildTaskTombstone(state, repo, author, time.Unix(20, 0))
+	tombstone.ID, tombstone.PubKey = backendNumberedID(2), backendTestPubKey(1)
+	if _, changed, err := projection.Apply(tombstone); err != nil || !changed || projection.Issue("task-1") != nil {
+		t.Fatalf("tombstone changed=%v issue=%#v err=%v", changed, projection.Issue("task-1"), err)
+	}
+	issue.Title = "recreated"
+	recreated, _ := nip34.BuildTaskStateEvent(issue, author, time.Unix(30, 0))
+	recreated.ID, recreated.PubKey = backendNumberedID(3), backendTestPubKey(1)
+	if _, changed, err := projection.Apply(recreated); err != nil || !changed {
+		t.Fatalf("recreate changed=%v err=%v", changed, err)
+	}
+	if got := projection.Issue("task-1"); got == nil || got.Title != "recreated" {
+		t.Fatalf("recreated issue=%#v", got)
+	}
+}
+
+func backendNumberedID(n int) gonostr.ID {
+	var id gonostr.ID
+	binary.BigEndian.PutUint64(id[24:], uint64(n))
+	return id
+}
+
 func TestRelayBackendPutIssuePublishesAppendOnlyTaskState(t *testing.T) {
+
 	pub := &fakePublisher{}
 	now := time.Unix(123, 0).UTC()
 	backend := NewRelayBackend(RelayBackendOptions{Relays: []string{"wss://relay.example"}, RepoAddr: "30617:owner:repo", Authors: []string{backendTestPubKey(1).Hex()}, Signer: noopSigner{}, Publisher: pub, Now: func() time.Time { return now }})

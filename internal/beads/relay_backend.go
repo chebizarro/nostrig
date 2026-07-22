@@ -36,11 +36,16 @@ type EventPublisher interface {
 
 // RelayBackendOptions configure the relay-as-source-of-truth beads store.
 type RelayBackendOptions struct {
-	Relays    []string
-	RepoAddr  string
-	TaskIDs   []string
-	Authors   []string
-	Limit     int
+	Relays   []string
+	RepoAddr string
+	TaskIDs  []string
+	Authors  []string
+
+	// Limit is retained for compatibility and now controls page size rather
+	// than the total result count. Pagination supplies explicit safety bounds.
+	Limit      int
+	Pagination nip34.PaginationOptions
+
 	Signer    nip34.Signer
 	Fetcher   EventFetcher
 	Publisher EventPublisher
@@ -126,97 +131,59 @@ func (b *RelayBackend) fetch(ctx context.Context, taskIDs []string) ([]*gonostr.
 	if len(relays) == 0 {
 		return nil, fmt.Errorf("at least one relay is required")
 	}
-	limit := b.opts.Limit
-	if limit <= 0 {
-		limit = 500
+
+	pagination := b.opts.Pagination
+	if pagination.PageSize == 0 {
+		pagination.PageSize = b.opts.Limit
 	}
-	authors := cleanStrings(b.opts.Authors)
-	if len(authors) == 0 {
-		return nil, fmt.Errorf("at least one canonical author is required")
+	query, err := NewCanonicalTaskQuery(b.opts.RepoAddr, taskIDs, b.opts.Authors, pagination.PageSize)
+	if err != nil {
+		return nil, err
 	}
-	trusted := map[string]struct{}{}
-	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindCanonicalState)}, Limit: limit}
-	for _, author := range authors {
-		pk, err := gonostr.PubKeyFromHex(author)
-		if err != nil {
-			return nil, fmt.Errorf("invalid canonical author %q", author)
-		}
-		filter.Authors = append(filter.Authors, pk)
-		trusted[pk.Hex()] = struct{}{}
-	}
-	tags := gonostr.TagMap{}
-	if repoAddr := strings.TrimSpace(b.opts.RepoAddr); repoAddr != "" {
-		tags["a"] = []string{repoAddr}
-	}
-	if ids := cleanTaskIDs(taskIDs); len(ids) > 0 {
-		ds := make([]string, 0, len(ids))
-		for _, id := range ids {
-			ds = append(ds, "task:"+id)
-		}
-		tags["d"] = ds
-	}
-	if len(tags) > 0 {
-		filter.Tags = tags
-	}
-	if strings.TrimSpace(b.opts.RepoAddr) == "" && len(cleanTaskIDs(taskIDs)) == 0 {
-		return nil, fmt.Errorf("relay backend requires a bounded selector: repo addr or task ids")
-	}
+	pagination.PageSize = query.PageSize()
+
 	fetcher := b.opts.Fetcher
 	if fetcher == nil {
 		fetcher = nip34.NewClient()
 	}
-	events, err := fetcher.Fetch(ctx, relays, filter)
-	if err != nil {
-		return nil, err
-	}
-	tombstoneFilter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(5)}, Authors: append([]gonostr.PubKey(nil), filter.Authors...), Limit: limit}
-	if ids := cleanTaskIDs(taskIDs); len(ids) > 0 {
-		coords := make([]string, 0, len(ids)*len(authors))
-		for _, author := range authors {
-			for _, id := range ids {
-				coords = append(coords, nip34.Address(nip34.KindCanonicalState, strings.ToLower(author), "task:"+id))
-			}
+
+	var events []*gonostr.Event
+	if paginated, ok := fetcher.(PaginatedEventFetcher); ok {
+		events, err = paginated.FetchManyPaginated(ctx, relays, query.Filters(), pagination)
+		if err != nil {
+			return nil, err
 		}
-		tombstoneFilter.Tags = gonostr.TagMap{"a": coords}
 	} else {
-		tombstoneFilter.Tags = gonostr.TagMap{"a": []string{strings.TrimSpace(b.opts.RepoAddr)}}
+		// Keep EventFetcher source-compatible. A legacy fetcher may only claim
+		// completeness when neither selected filter saturates one page.
+		maxEvents := pagination.MaxEvents
+		if maxEvents == 0 {
+			maxEvents = nip34.DefaultQueryMaxEvents
+		}
+		for filterIndex, filter := range query.Filters() {
+			page, fetchErr := fetcher.Fetch(ctx, relays, filter)
+			if fetchErr != nil {
+				return nil, fetchErr
+			}
+			events = append(events, page...)
+			if len(page) >= query.PageSize() {
+				return nil, &nip34.QueryTruncatedError{
+					Reason: nip34.TruncatedByLegacyFetcherLimit, FilterIndex: filterIndex,
+					PageSize: query.PageSize(), Pages: 1, EventCount: len(events),
+				}
+			}
+			if len(events) > maxEvents {
+				return nil, &nip34.QueryTruncatedError{
+					Reason: nip34.TruncatedByEventLimit, FilterIndex: filterIndex,
+					PageSize: query.PageSize(), Pages: 1, EventCount: len(events),
+				}
+			}
+		}
 	}
-	tombstones, err := fetcher.Fetch(ctx, relays, tombstoneFilter)
-	if err != nil {
-		return nil, err
-	}
-	events = append(events, tombstones...)
-	requested := cleanTaskIDs(taskIDs)
+
 	for _, ev := range events {
-		if ev == nil {
-			return nil, fmt.Errorf("relay returned nil canonical state")
-		}
-		if _, ok := trusted[ev.PubKey.Hex()]; !ok {
-			return nil, fmt.Errorf("relay returned state from untrusted author")
-		}
-		var taskID, eventRepo string
-		switch int(ev.Kind) {
-		case nip34.KindCanonicalState:
-			issue, err := nip34.ParseTaskStateEvent(ev)
-			if err != nil {
-				return nil, fmt.Errorf("invalid canonical state %s: %w", ev.ID.Hex(), err)
-			}
-			taskID = issue.Id
-			eventRepo = issue.GetMetadata().GetCustom()["nip34.repo_addr"]
-		case 5:
-			taskID, err = nip34.ValidateTaskTombstone(ev, ev.PubKey.Hex())
-			if err != nil {
-				return nil, fmt.Errorf("invalid canonical tombstone %s: %w", ev.ID.Hex(), err)
-			}
-			eventRepo = nip34.TaskTombstoneRepo(ev)
-		default:
-			return nil, fmt.Errorf("relay returned unexpected canonical event kind")
-		}
-		if repo := strings.TrimSpace(b.opts.RepoAddr); repo != "" && eventRepo != repo {
-			return nil, fmt.Errorf("relay returned state outside repository selector")
-		}
-		if len(requested) > 0 && !stringContains(requested, taskID) {
-			return nil, fmt.Errorf("relay returned state outside task selector")
+		if err := query.ValidateEvent(ev); err != nil {
+			return nil, err
 		}
 	}
 	return events, nil

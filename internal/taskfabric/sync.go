@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	gonostr "fiatjaf.com/nostr"
@@ -18,13 +19,17 @@ type EventPublisher interface {
 }
 
 type SyncOptions struct {
-	Relays              []string
-	RepoAddr            string
-	TaskIDs             []string
-	Authors             []string
-	OutDir              string
-	CachePath           string
-	Limit               int
+	Relays    []string
+	RepoAddr  string
+	TaskIDs   []string
+	Authors   []string
+	OutDir    string
+	CachePath string
+	// Limit is retained for compatibility and is now the query page size,
+	// not a total-result ceiling. Pagination supplies explicit safety bounds.
+	Limit      int
+	Pagination nip34.PaginationOptions
+
 	FailOnConflict      bool
 	Push                bool
 	SyncNIP34Status     bool
@@ -149,7 +154,8 @@ func shouldPublishRecord(rec *CacheRecord) bool {
 	return rec.Resolution == ResolutionLocalOnly || (rec.Local != nil && snapshotsEqual(rec.Resolved, rec.Local) && rec.LocalRevision != "")
 }
 
-// FetchTaskStateEvents queries relays for bounded canonical 30900 task states.
+// FetchTaskStateEvents queries relays to completion for selected canonical
+// task state and tombstones. A successful return is never a partial first page.
 func FetchTaskStateEvents(ctx context.Context, client *nip34.Client, opts SyncOptions) ([]*gonostr.Event, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("context is nil")
@@ -161,94 +167,308 @@ func FetchTaskStateEvents(ctx context.Context, client *nip34.Client, opts SyncOp
 	if len(relays) == 0 {
 		return nil, fmt.Errorf("at least one relay is required")
 	}
-	repoAddr := strings.TrimSpace(opts.RepoAddr)
-	taskIDs := cleanStrings(opts.TaskIDs)
-	if repoAddr == "" && len(taskIDs) == 0 {
-		return nil, fmt.Errorf("sync requires a bounded selector: provide --repo-addr or at least one --task-id")
+	pagination := opts.Pagination
+	if pagination.PageSize == 0 {
+		pagination.PageSize = opts.Limit
 	}
-	limit := opts.Limit
-	if limit <= 0 {
-		limit = 500
+	query, err := beads.NewCanonicalTaskQuery(opts.RepoAddr, opts.TaskIDs, opts.Authors, pagination.PageSize)
+	if err != nil {
+		return nil, err
 	}
-
-	authors := cleanStrings(opts.Authors)
-	if len(authors) == 0 {
-		return nil, fmt.Errorf("at least one canonical author is required")
-	}
-	trusted := map[string]struct{}{}
-	f := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindCanonicalState)}, Limit: limit}
-	for _, author := range authors {
-		pk, err := gonostr.PubKeyFromHex(author)
-		if err != nil {
-			return nil, fmt.Errorf("invalid canonical author %q", author)
-		}
-		f.Authors = append(f.Authors, pk)
-		trusted[pk.Hex()] = struct{}{}
-	}
-	tags := gonostr.TagMap{}
-	if repoAddr != "" {
-		tags["a"] = []string{repoAddr}
-	}
-	if len(taskIDs) > 0 {
-		ds := make([]string, 0, len(taskIDs))
-		for _, id := range taskIDs {
-			ds = append(ds, "task:"+strings.TrimPrefix(id, "task:"))
-		}
-		tags["d"] = ds
-	}
-	if len(tags) > 0 {
-		f.Tags = tags
-	}
-
-	tombstone := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(5)}, Authors: append([]gonostr.PubKey(nil), f.Authors...), Limit: limit}
-	if len(taskIDs) > 0 {
-		coords := make([]string, 0, len(taskIDs)*len(authors))
-		for _, author := range authors {
-			for _, id := range taskIDs {
-				coords = append(coords, nip34.Address(nip34.KindCanonicalState, strings.ToLower(author), "task:"+strings.TrimPrefix(id, "task:")))
-			}
-		}
-		tombstone.Tags = gonostr.TagMap{"a": coords}
-	} else {
-		tombstone.Tags = gonostr.TagMap{"a": []string{repoAddr}}
-	}
-	events, err := client.FetchMany(ctx, relays, []gonostr.Filter{f, tombstone})
+	pagination.PageSize = query.PageSize()
+	events, err := client.FetchManyPaginated(ctx, relays, query.Filters(), pagination)
 	if err != nil {
 		return nil, err
 	}
 	for _, ev := range events {
-		if ev == nil {
-			return nil, fmt.Errorf("relay returned nil canonical state")
-		}
-		if _, ok := trusted[ev.PubKey.Hex()]; !ok {
-			return nil, fmt.Errorf("relay returned state from untrusted author")
-		}
-		var taskID, eventRepo string
-		switch int(ev.Kind) {
-		case nip34.KindCanonicalState:
-			issue, err := nip34.ParseTaskStateEvent(ev)
-			if err != nil {
-				return nil, fmt.Errorf("invalid canonical state %s: %w", ev.ID.Hex(), err)
-			}
-			taskID = issue.Id
-			eventRepo = issue.GetMetadata().GetCustom()["nip34.repo_addr"]
-		case 5:
-			taskID, err = nip34.ValidateTaskTombstone(ev, ev.PubKey.Hex())
-			if err != nil {
-				return nil, fmt.Errorf("invalid canonical tombstone %s: %w", ev.ID.Hex(), err)
-			}
-			eventRepo = nip34.TaskTombstoneRepo(ev)
-		default:
-			return nil, fmt.Errorf("relay returned unexpected canonical event kind")
-		}
-		if repoAddr != "" && eventRepo != repoAddr {
-			return nil, fmt.Errorf("relay returned state outside repository selector")
-		}
-		if len(taskIDs) > 0 && !contains(cleanTaskIDs(taskIDs), taskID) {
-			return nil, fmt.Errorf("relay returned state outside task selector")
+		if err := query.ValidateEvent(ev); err != nil {
+			return nil, err
 		}
 	}
 	return events, nil
+}
+
+// TaskQuerySource is the complete-query capability implemented by nostr.Client.
+type TaskQuerySource interface {
+	FetchManyPaginated(ctx context.Context, relays []string, filters []gonostr.Filter, opts nip34.PaginationOptions) ([]*gonostr.Event, error)
+}
+
+// TaskEventSource extends complete snapshots with live relay updates. It is
+// intentionally independent of command handling and durable cursors.
+type TaskEventSource interface {
+	TaskQuerySource
+	Subscribe(ctx context.Context, relays []string, filter gonostr.Filter) (<-chan gonostr.RelayEvent, error)
+}
+
+type TaskListOptions struct {
+	Relays     []string
+	RepoAddr   string
+	TaskIDs    []string
+	Authors    []string
+	Pagination nip34.PaginationOptions
+}
+
+// ListTaskState returns a proven-complete selected snapshot. Query safety or
+// timestamp ambiguity is returned as an error rather than a partial export.
+func ListTaskState(ctx context.Context, source TaskQuerySource, opts TaskListOptions) (*beadspb.Export, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("context is nil")
+	}
+	if source == nil {
+		source = nip34.NewClient()
+	}
+	relays := cleanStrings(opts.Relays)
+	if len(relays) == 0 {
+		return nil, fmt.Errorf("at least one relay is required")
+	}
+	query, err := beads.NewCanonicalTaskQuery(opts.RepoAddr, opts.TaskIDs, opts.Authors, opts.Pagination.PageSize)
+	if err != nil {
+		return nil, err
+	}
+	pagination := opts.Pagination
+	pagination.PageSize = query.PageSize()
+	events, err := source.FetchManyPaginated(ctx, relays, query.Filters(), pagination)
+	if err != nil {
+		return nil, err
+	}
+	projection := beads.NewTaskStateProjection()
+	for _, ev := range events {
+		if err := query.ValidateEvent(ev); err != nil {
+			return nil, err
+		}
+		if _, _, err := projection.Apply(ev); err != nil {
+			return nil, err
+		}
+	}
+	return projection.Export()
+}
+
+type TaskWatchOptions struct {
+	Relays     []string
+	RepoAddr   string
+	TaskIDs    []string
+	Authors    []string
+	Pagination nip34.PaginationOptions
+
+	// ChangeBuffer bounds in-process delivery buffering. Slow consumers apply
+	// backpressure; changes are never silently dropped.
+	ChangeBuffer int
+}
+
+type TaskChangeKind string
+
+const (
+	TaskChangeUpsert TaskChangeKind = "upsert"
+	TaskChangeDelete TaskChangeKind = "delete"
+)
+
+type TaskChange struct {
+	Kind      TaskChangeKind
+	TaskID    string
+	Issue     *beadspb.Issue
+	EventID   string
+	CreatedAt time.Time
+}
+
+type TaskWatch struct {
+	Snapshot *beadspb.Export
+	Changes  <-chan TaskChange
+	Errors   <-chan error
+
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (w *TaskWatch) Close() {
+	if w == nil {
+		return
+	}
+	w.once.Do(func() {
+		if w.cancel != nil {
+			w.cancel()
+		}
+	})
+}
+
+// WatchTaskState subscribes before fetching the complete initial snapshot,
+// closing the fetch-then-subscribe gap. Duplicate or stale subscription events
+// already represented by Snapshot are absorbed by the incremental projection.
+func WatchTaskState(ctx context.Context, source TaskEventSource, opts TaskWatchOptions) (*TaskWatch, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("context is nil")
+	}
+	if source == nil {
+		source = nip34.NewClient()
+	}
+	relays := cleanStrings(opts.Relays)
+	if len(relays) == 0 {
+		return nil, fmt.Errorf("at least one relay is required")
+	}
+	query, err := beads.NewCanonicalTaskQuery(opts.RepoAddr, opts.TaskIDs, opts.Authors, opts.Pagination.PageSize)
+	if err != nil {
+		return nil, err
+	}
+	pagination := opts.Pagination
+	pagination.PageSize = query.PageSize()
+	buffer := opts.ChangeBuffer
+	if buffer <= 0 {
+		buffer = 256
+	}
+
+	watchCtx, cancel := context.WithCancel(ctx)
+	filters := query.Filters()
+	watchStart := gonostr.Timestamp(time.Now().Add(-time.Second).Unix())
+	subscriptions := make([]<-chan gonostr.RelayEvent, 0, len(filters))
+	for _, filter := range filters {
+		filter.Limit = 0
+		filter.LimitZero = false
+		filter.Since = watchStart
+		ch, err := source.Subscribe(watchCtx, relays, filter)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
+		subscriptions = append(subscriptions, ch)
+	}
+	live, subscriptionClosed := mergeTaskSubscriptions(watchCtx, buffer, subscriptions...)
+
+	snapshotEvents, err := source.FetchManyPaginated(watchCtx, relays, filters, pagination)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	// Reconcile once more after subscriptions have been requested. The
+	// subscription API does not expose an EOSE/readiness barrier, so this
+	// second complete read closes the practical setup window; any overlap is
+	// absorbed by event-ID/order deduplication in the projection.
+	reconciledEvents, err := source.FetchManyPaginated(watchCtx, relays, filters, pagination)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	snapshotEvents = append(snapshotEvents, reconciledEvents...)
+	select {
+	case <-subscriptionClosed:
+		cancel()
+		return nil, fmt.Errorf("task watch subscription closed during initial snapshot")
+	default:
+	}
+
+	projection := beads.NewTaskStateProjection()
+	for _, ev := range snapshotEvents {
+		if err := query.ValidateEvent(ev); err != nil {
+			cancel()
+			return nil, err
+		}
+		if _, _, err := projection.Apply(ev); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+	snapshot, err := projection.Export()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	changes := make(chan TaskChange, buffer)
+	errs := make(chan error, 1)
+	watch := &TaskWatch{Snapshot: snapshot, Changes: changes, Errors: errs, cancel: cancel}
+	go func() {
+		defer close(changes)
+		defer close(errs)
+		defer cancel()
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-subscriptionClosed:
+				select {
+				case errs <- fmt.Errorf("task watch subscription closed"):
+				default:
+				}
+				return
+			case relayEvent, ok := <-live:
+				if !ok {
+					if watchCtx.Err() == nil {
+						select {
+						case errs <- fmt.Errorf("task watch subscription closed"):
+						default:
+						}
+					}
+					return
+				}
+				ev := relayEvent.Event
+				if err := query.ValidateEvent(&ev); err != nil {
+					select {
+					case errs <- err:
+					default:
+					}
+					return
+				}
+				taskID, changed, err := projection.Apply(&ev)
+				if err != nil {
+					select {
+					case errs <- err:
+					default:
+					}
+					return
+				}
+				if !changed {
+					continue
+				}
+				change := TaskChange{
+					Kind: TaskChangeUpsert, TaskID: taskID, Issue: projection.Issue(taskID),
+					EventID: ev.ID.Hex(), CreatedAt: nip34.EventTime(&ev),
+				}
+				if change.Issue == nil {
+					change.Kind = TaskChangeDelete
+				}
+				select {
+				case changes <- change:
+				case <-watchCtx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return watch, nil
+}
+
+func mergeTaskSubscriptions(ctx context.Context, buffer int, inputs ...<-chan gonostr.RelayEvent) (<-chan gonostr.RelayEvent, <-chan struct{}) {
+	out := make(chan gonostr.RelayEvent, buffer)
+	closed := make(chan struct{}, 1)
+	var wg sync.WaitGroup
+	wg.Add(len(inputs))
+	for _, input := range inputs {
+		go func(ch <-chan gonostr.RelayEvent) {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case ev, ok := <-ch:
+					if !ok {
+						select {
+						case closed <- struct{}{}:
+						default:
+						}
+						return
+					}
+					select {
+					case out <- ev:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}(input)
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out, closed
 }
 
 func canonicalAuthor(authors []string) (string, error) {
