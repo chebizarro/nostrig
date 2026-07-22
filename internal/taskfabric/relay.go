@@ -397,6 +397,12 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	logger := newServeLogger()
 	observer := newServiceObserver(requiredRelays, opts.Publication.AckQuorum, opts.OutboxCriticalThreshold)
+	serveCtx, stopServe := context.WithCancel(ctx)
+	ctx = serveCtx
+	defer func() {
+		stopServe()
+		observer.wait()
+	}()
 	observer.startHeartbeat(ctx)
 	observer.setCheck("signer_connected", true, "")
 	stopObservability, err := startObservabilityHTTP(ctx, opts.ObservabilityAddr, observer, logger)

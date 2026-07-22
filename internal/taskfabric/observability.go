@@ -68,6 +68,7 @@ type publisherSnapshotter interface {
 
 type serviceObserver struct {
 	mu sync.RWMutex
+	wg sync.WaitGroup
 
 	startedAt      time.Time
 	heartbeat      time.Time
@@ -278,7 +279,9 @@ func (o *serviceObserver) refresh(ctx context.Context, signer casnostr.Signer, r
 }
 
 func (o *serviceObserver) startHeartbeat(ctx context.Context) {
+	o.wg.Add(1)
 	go func() {
+		defer o.wg.Done()
 		ticker := time.NewTicker(readinessProbeInterval)
 		defer ticker.Stop()
 		for {
@@ -293,7 +296,9 @@ func (o *serviceObserver) startHeartbeat(ctx context.Context) {
 }
 
 func (o *serviceObserver) startMonitor(ctx context.Context, signer casnostr.Signer, relayConnected func(string) bool, durablePaths []string, publisher publisherSnapshotter) {
+	o.wg.Add(1)
 	go func() {
+		defer o.wg.Done()
 		o.refresh(ctx, signer, relayConnected, durablePaths, publisher)
 		ticker := time.NewTicker(readinessProbeInterval)
 		defer ticker.Stop()
@@ -306,6 +311,10 @@ func (o *serviceObserver) startMonitor(ctx context.Context, signer casnostr.Sign
 			}
 		}
 	}()
+}
+
+func (o *serviceObserver) wait() {
+	o.wg.Wait()
 }
 
 type observedPublisher struct {
