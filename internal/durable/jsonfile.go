@@ -10,6 +10,47 @@ import (
 	"path/filepath"
 )
 
+// CheckWritable verifies that the directories containing the durable state paths
+// support the same create, fsync, and cleanup operations used by JSONFile.Store.
+// It never alters the durable documents themselves.
+func CheckWritable(paths ...string) error {
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		path = filepath.Clean(path)
+		if path == "." || path == "" {
+			return fmt.Errorf("durable state path is required")
+		}
+		dir := filepath.Dir(path)
+		if _, ok := seen[dir]; ok {
+			continue
+		}
+		seen[dir] = struct{}{}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create durable state directory: %w", err)
+		}
+		probe, err := os.CreateTemp(dir, ".nostrig-write-probe-*")
+		if err != nil {
+			return fmt.Errorf("create durable state write probe: %w", err)
+		}
+		name := probe.Name()
+		if _, err := probe.Write([]byte("ok\n")); err == nil {
+			err = probe.Sync()
+		}
+		closeErr := probe.Close()
+		removeErr := os.Remove(name)
+		if err != nil {
+			return fmt.Errorf("sync durable state write probe: %w", err)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close durable state write probe: %w", closeErr)
+		}
+		if removeErr != nil {
+			return fmt.Errorf("remove durable state write probe: %w", removeErr)
+		}
+	}
+	return nil
+}
+
 // JSONFile atomically persists a JSON document at Path.
 type JSONFile[T any] struct {
 	Path string

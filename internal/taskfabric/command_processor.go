@@ -35,13 +35,22 @@ type commandProcessor struct {
 	verify         serveVerifier
 	now            func() time.Time
 	phaseHook      func(CommandPhase)
+	responseHook   func(*gonostr.Event)
+	replayHook     func()
+	processHook    func(*gonostr.Event, time.Duration)
 
 	mu sync.Mutex
 }
 
-func (p *commandProcessor) Process(ctx context.Context, source *gonostr.Event) error {
+func (p *commandProcessor) Process(ctx context.Context, source *gonostr.Event) (processErr error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	started := time.Now()
+	defer func() {
+		if processErr == nil && source != nil && p.processHook != nil {
+			p.processHook(source, time.Since(started))
+		}
+	}()
 	if source == nil {
 		return nil
 	}
@@ -100,6 +109,8 @@ func (p *commandProcessor) processCommand(ctx context.Context, source, command *
 	}
 	if created {
 		p.hook(CommandReceived)
+	} else if p.replayHook != nil {
+		p.replayHook()
 	}
 	return p.runRecord(ctx, record)
 }
@@ -122,6 +133,9 @@ func (p *commandProcessor) runRecord(ctx context.Context, record *CommandRecord)
 	if err != nil {
 		p.report("handle_intent", err, &record.Command)
 		return nil
+	}
+	if p.responseHook != nil {
+		p.responseHook(response)
 	}
 	outbound, err := p.prepareResponse(ctx, record.Wrapped, &record.Command, response)
 	if err != nil {

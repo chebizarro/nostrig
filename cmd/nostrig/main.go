@@ -762,7 +762,8 @@ func newServeCmd() *cobra.Command {
 	var pubkey string
 	var syncNIP34Status bool
 	var qualityProject string
-	var healthFile string
+	var observabilityAddr string
+	var outboxCriticalThreshold int
 	var aclFile string
 	var ackQuorum int
 	var publishTimeout time.Duration
@@ -817,8 +818,9 @@ func newServeCmd() *cobra.Command {
 		}
 		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{
 			Relays: relaysWithEnv(relays), RepoAddrs: repoAddrsWithEnv(repoAddrs), Signer: signer, PubKey: pubkey,
-			SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject, HealthFile: healthFile,
-			Authorization: authz, Publication: publication, CommandJournalPath: journalPath, CommandRetention: commandRetention,
+			SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject, ObservabilityAddr: observabilityAddr,
+			OutboxCriticalThreshold: outboxCriticalThreshold, Authorization: authz, Publication: publication,
+			CommandJournalPath: journalPath, CommandRetention: commandRetention,
 		})
 	}}
 	cmd.Flags().StringSliceVar(&relays, "relay", nil, "Relay websocket URL(s) to subscribe/publish to (repeatable); falls back to NOSTR_RELAY/NOSTR_RELAYS")
@@ -828,7 +830,8 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&pubkey, "pubkey", "", "Server recipient pubkey; defaults to signer pubkey when available")
 	cmd.Flags().BoolVar(&syncNIP34Status, "sync-nip34-status", false, "Opt-in: publish NIP-34 issue status events when linked tasks change")
 	cmd.Flags().StringVar(&qualityProject, "quality-project", "", "Optional PSTF project tag used to scope quality status/audit events")
-	cmd.Flags().StringVar(&healthFile, "health-file", "", "Touch this liveness file while serve is running")
+	cmd.Flags().StringVar(&observabilityAddr, "observability-addr", "127.0.0.1:8080", "HTTP address for /livez, /readyz, /metrics, and redacted /diagnostics")
+	cmd.Flags().IntVar(&outboxCriticalThreshold, "outbox-critical-threshold", 1000, "Readiness fails at or above this durable outbox depth")
 	cmd.Flags().StringVar(&aclFile, "acl-file", "", "Caller ACL JSON file; defaults to NOSTRIG_ACL_FILE")
 	cmd.Flags().IntVar(&ackQuorum, "relay-ack-quorum", 0, "Required-relay acknowledgements needed; 0 means all required relays")
 	cmd.Flags().StringVar(&outboxPath, "outbox-path", outboxPath, "Durable outbound spool; defaults to NOSTRIG_OUTBOX_PATH")

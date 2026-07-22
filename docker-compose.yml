@@ -3,7 +3,7 @@ services:
     build:
       context: .
     image: nostrig:local
-    command: ["serve", "--health-file", "/tmp/nostrig/healthy", "--outbox-path", "/var/lib/nostrig/outbox.json", "--instance-lock", "/var/lib/nostrig/instance.lock"]
+    command: ["serve", "--observability-addr", "127.0.0.1:8080", "--outbox-path", "/var/lib/nostrig/outbox.json", "--instance-lock", "/var/lib/nostrig/instance.lock"]
     environment:
       NOSTRIG_ENV: production
       NOSTR_RELAY: ${NOSTR_RELAY:-wss://relay.sharegap.net}
@@ -19,8 +19,6 @@ services:
     volumes:
       - nostrig-state:/var/lib/nostrig
     read_only: true
-    tmpfs:
-      - /tmp/nostrig:uid=65532,gid=65532,mode=0700
     user: "65532:65532"
     cap_drop:
       - ALL
@@ -30,11 +28,11 @@ services:
     stop_grace_period: 30s
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "find /tmp/nostrig/healthy -mmin -2 -type f | grep -q ."]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 60s
 
 secrets:
   nostrig_signer_client_secret_key:

@@ -42,13 +42,15 @@ docker compose up -d --build
 docker compose ps
 ```
 
-`docker-compose.yml` sets `NOSTRIG_ENV=production`, runs as UID/GID 65532 with no capabilities and a read-only root filesystem, mounts the client key mode `0400` as a Compose secret, persists state and the instance lock in the `nostrig-state` volume, and checks the freshness of the tmpfs-backed `/tmp/nostrig/healthy`. Multiple repository addresses may be comma-separated in `NOSTRIG_REPO_ADDRS`.
+`docker-compose.yml` sets `NOSTRIG_ENV=production`, runs as UID/GID 65532 with no capabilities and a read-only root filesystem, mounts the client key mode `0400` as a Compose secret, persists state and the instance lock in the `nostrig-state` volume, and gates container health on the authoritative `/readyz` endpoint. Multiple repository addresses may be comma-separated in `NOSTRIG_REPO_ADDRS`.
 
 Useful checks:
 
 ```bash
 docker compose logs -f nostrig-serve
-docker compose exec nostrig-serve sh -c 'cat /tmp/nostrig/healthy'
+docker compose exec nostrig-serve wget -q -O - http://127.0.0.1:8080/livez
+docker compose exec nostrig-serve wget -q -O - http://127.0.0.1:8080/readyz
+docker compose exec nostrig-serve wget -q -O - http://127.0.0.1:8080/diagnostics
 ```
 
 ## systemd template (bare metal)
@@ -69,13 +71,20 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now nostrig-serve@fleet
 ```
 
-The unit defaults `NOSTR_RELAY` to the fleet relay, loads the client key with systemd credentials, restarts on failure, persists the signed-event outbox in `/var/lib/nostrig-fleet/outbox.json`, and writes liveness to `/run/nostrig-fleet/healthy`.
+The unit defaults `NOSTR_RELAY` to the fleet relay, loads the client key with systemd credentials, restarts on failure, persists the signed-event outbox in `/var/lib/nostrig-fleet/outbox.json`, and waits for authoritative readiness at `http://127.0.0.1:8080/readyz` before startup completes.
 
 ```bash
 systemctl status nostrig-serve@fleet
 journalctl -u nostrig-serve@fleet -f
-find /run/nostrig-fleet/healthy -mmin -2 -type f
+curl --fail http://127.0.0.1:8080/livez
+curl --fail http://127.0.0.1:8080/readyz
 ```
+
+## Health, readiness, metrics, and diagnostics
+
+The loopback observability listener defaults to `127.0.0.1:8080` and can be changed with `--observability-addr`. `/livez` reports only process/runtime event-loop liveness. `/readyz` returns HTTP 503 until Signet responds, the required non-circuit-open relay quorum is connected, initial durable-journal backfill finishes, state directories pass a write probe, and the outbox is below `--outbox-critical-threshold`.
+
+`/metrics` exposes Prometheus text counters and latency histograms for processed and published events, conflicts, authorization denials, retries, dead letters, replays, and outbox depth. `/diagnostics` is JSON and includes readiness checks plus the last successfully processed and published event IDs/timestamps; relay credentials, query strings, and non-root paths are redacted. Keep all four endpoints host-local or behind authenticated operator access.
 
 ## Relay quorum and outbox recovery
 
@@ -116,7 +125,7 @@ cosign verify-attestation --type spdxjson \
 
 ## Graceful shutdown and the single-active guard
 
-The CLI handles `SIGINT` and `SIGTERM` through its root context. Cancellation stops the relay subscription, removes the liveness file, closes relay pools, and leaves any unacknowledged signed event in the durable outbox. Compose and systemd allow 30 seconds before forcing termination. Always use `docker compose stop` or `systemctl stop`; do not send `SIGKILL` during normal operations.
+The CLI handles `SIGINT` and `SIGTERM` through its root context. Cancellation stops the relay subscription, stops the observability listener, closes relay pools, and leaves any unacknowledged signed event in the durable outbox. Compose and systemd allow 30 seconds before forcing termination. Always use `docker compose stop` or `systemctl stop`; do not send `SIGKILL` during normal operations.
 
 Production launchers pass `--instance-lock` inside the persistent state directory. The process takes a non-blocking exclusive lock before connecting to Signet, so a second process sharing that state directory fails closed. This prevents duplicate local instances and accidental Compose/systemd overlap on one host.
 
@@ -196,7 +205,7 @@ Run a controlled edge-01 to max failover and failback quarterly using the proced
 
 Register with Bahia's signer-first ContextVM convention. `deploy/bahia/service-create.json` is the JSON-RPC content template; publish it as kind `25910`, addressed to the Bahia service pubkey, with `method=service/create`, `service=nostrig`, and an idempotent `d=service-create:nostrig` tag. Require relay `OK` and the correlated success result, then verify the service through Bahia's read model.
 
-After creation, record the edge-01 Compose project or `nostrig-serve@fleet` unit as the active runtime and max as the cold recovery target. Runtime metadata must include the immutable image digest, relay/repository selectors, restart/stop commands, state directory, liveness-file check, and Signet credential owner. Bahia may reference `/etc/nostrig/fleet.signer-client-secret` as host-managed metadata but must never ingest or render its value.
+After creation, record the edge-01 Compose project or `nostrig-serve@fleet` unit as the active runtime and max as the cold recovery target. Runtime metadata must include the immutable image digest, relay/repository selectors, restart/stop commands, state directory, liveness/readiness endpoint checks, and Signet credential owner. Bahia may reference `/etc/nostrig/fleet.signer-client-secret` as host-managed metadata but must never ingest or render its value.
 
 ## Local smoke test
 
@@ -210,7 +219,7 @@ export SERVER_PK=$(nak key public "$SERVER_SK")
 
 go build -o ./nostrig ./cmd/nostrig
 NOSTR_RELAY="$RELAY" NOSTR_PRIVATE_KEY="$SERVER_SK" \
-  ./nostrig serve --repo-addr 30617:local-owner:smoke --health-file /tmp/nostrig-smoke.health &
+  ./nostrig serve --repo-addr 30617:local-owner:smoke --observability-addr 127.0.0.1:8080 &
 SERVE_PID=$!
 
 NOSTR_RELAY="$RELAY" NOSTR_PRIVATE_KEY="$CLIENT_SK" ./nostrig create \

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -379,6 +380,38 @@ type ReliablePublisher struct {
 	deliveryMu sync.Mutex
 	circuitMu  sync.Mutex
 	circuits   map[string]circuitState
+
+	retryTotal      atomic.Uint64
+	deadLetterTotal atomic.Uint64
+	publishedTotal  atomic.Uint64
+	publishedMu     sync.RWMutex
+	lastPublished   EventMarker
+}
+
+// EventMarker identifies the most recent event that reached authoritative
+// publication quorum without exposing event content or signer material.
+type EventMarker struct {
+	ID string    `json:"id,omitempty"`
+	At time.Time `json:"at,omitempty"`
+}
+
+// PublisherSnapshot is a redaction-safe view of durable publication health.
+type PublisherSnapshot struct {
+	QueueDepth      int                    `json:"queue_depth"`
+	DeadLetters     int                    `json:"dead_letters"`
+	RetryTotal      uint64                 `json:"retry_total"`
+	DeadLetterTotal uint64                 `json:"dead_letter_total"`
+	PublishedTotal  uint64                 `json:"published_total"`
+	LastPublished   EventMarker            `json:"last_published,omitempty"`
+	Circuits        []RelayCircuitSnapshot `json:"circuits"`
+}
+
+// RelayCircuitSnapshot omits relay errors and reports only breaker state.
+type RelayCircuitSnapshot struct {
+	URL       string    `json:"url"`
+	Required  bool      `json:"required"`
+	Open      bool      `json:"open"`
+	OpenUntil time.Time `json:"open_until,omitempty"`
 }
 
 func NewReliablePublisher(opts ReliablePublisherOptions) (*ReliablePublisher, error) {
@@ -441,6 +474,45 @@ func (p *ReliablePublisher) Close() {
 	if p != nil && p.pool != nil {
 		p.pool.Close("reliable publisher closed")
 	}
+}
+
+// Snapshot reports durable queue, retry, dead-letter, publication, and circuit
+// state for readiness and metrics. It is safe to call while the worker drains.
+func (p *ReliablePublisher) Snapshot() (PublisherSnapshot, error) {
+	if p == nil || p.store == nil {
+		return PublisherSnapshot{}, fmt.Errorf("reliable publisher is not initialized")
+	}
+	entries, err := p.store.List()
+	if err != nil {
+		return PublisherSnapshot{}, err
+	}
+	snapshot := PublisherSnapshot{
+		QueueDepth: len(entries), RetryTotal: p.retryTotal.Load(),
+		DeadLetterTotal: p.deadLetterTotal.Load(), PublishedTotal: p.publishedTotal.Load(),
+	}
+	for _, entry := range entries {
+		if entry.State == OutboxDeadLetter {
+			snapshot.DeadLetters++
+		}
+	}
+	p.publishedMu.RLock()
+	snapshot.LastPublished = p.lastPublished
+	p.publishedMu.RUnlock()
+	now := p.opts.now()
+	required := make(map[string]struct{}, len(p.opts.RequiredRelays))
+	for _, url := range p.opts.RequiredRelays {
+		required[url] = struct{}{}
+	}
+	p.circuitMu.Lock()
+	for url, state := range p.circuits {
+		_, isRequired := required[url]
+		snapshot.Circuits = append(snapshot.Circuits, RelayCircuitSnapshot{
+			URL: url, Required: isRequired, Open: state.openUntil.After(now), OpenUntil: state.openUntil,
+		})
+	}
+	p.circuitMu.Unlock()
+	sort.Slice(snapshot.Circuits, func(i, j int) bool { return snapshot.Circuits[i].URL < snapshot.Circuits[j].URL })
+	return snapshot, nil
 }
 
 // Publish satisfies EventPublisher. Quorum failures are returned while signed
@@ -560,6 +632,7 @@ func (p *ReliablePublisher) Run(ctx context.Context) error {
 
 func (p *ReliablePublisher) deliverEntry(ctx context.Context, entry *OutboxEntry) (PublicationReport, error) {
 	now := p.opts.now()
+	wasQuorumReached := entry.QuorumReached
 	results := make([]RelayResult, 0, len(entry.Deliveries))
 	for i := range entry.Deliveries {
 		delivery := &entry.Deliveries[i]
@@ -575,6 +648,9 @@ func (p *ReliablePublisher) deliverEntry(ctx context.Context, entry *OutboxEntry
 			continue
 		}
 		result.Attempted = true
+		if delivery.Attempts > 0 {
+			p.retryTotal.Add(1)
+		}
 		started := time.Now()
 		err := p.publishWithTimeout(ctx, delivery.URL, entry.Event)
 		result.Duration = time.Since(started)
@@ -592,6 +668,9 @@ func (p *ReliablePublisher) deliverEntry(ctx context.Context, entry *OutboxEntry
 			delivery.LastError = err.Error()
 			result.Error = delivery.LastError
 			if delivery.Attempts >= p.opts.MaxAttempts {
+				if !delivery.DeadLetter {
+					p.deadLetterTotal.Add(1)
+				}
 				delivery.DeadLetter = true
 				result.DeadLetter = true
 			} else {
@@ -606,6 +685,12 @@ func (p *ReliablePublisher) deliverEntry(ctx context.Context, entry *OutboxEntry
 		results = append(results, result)
 	}
 	entry.QuorumReached = requiredAcks(entry) >= entry.Quorum
+	if entry.QuorumReached && !wasQuorumReached {
+		p.publishedTotal.Add(1)
+		p.publishedMu.Lock()
+		p.lastPublished = EventMarker{ID: entry.ID, At: now}
+		p.publishedMu.Unlock()
+	}
 	entry.State = stateFor(entry)
 	entry.UpdatedAt = now
 	allAcked := true

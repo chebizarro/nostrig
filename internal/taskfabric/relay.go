@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -281,18 +280,19 @@ type serveErrorReporter func(stage string, err error, event *gonostr.Event)
 type serveVerifier func(event *gonostr.Event) bool
 
 type ServeOptions struct {
-	Relays             []string
-	RepoAddrs          []string
-	Signer             nip34.Signer
-	PubKey             string
-	SyncNIP34Status    bool
-	QualityProject     string
-	HealthFile         string
-	Authorization      AuthorizationConfig
-	Audit              AuthzAuditSink
-	Publication        nip34.ReliablePublisherOptions
-	CommandJournalPath string
-	CommandRetention   time.Duration
+	Relays                  []string
+	RepoAddrs               []string
+	Signer                  nip34.Signer
+	PubKey                  string
+	SyncNIP34Status         bool
+	QualityProject          string
+	ObservabilityAddr       string
+	OutboxCriticalThreshold int
+	Authorization           AuthorizationConfig
+	Audit                   AuthzAuditSink
+	Publication             nip34.ReliablePublisherOptions
+	CommandJournalPath      string
+	CommandRetention        time.Duration
 
 	subscribe         serveSubscriber
 	backfill          serveBackfill
@@ -305,6 +305,7 @@ type ServeOptions struct {
 	responsePublisher EventPublisher
 	reportError       serveErrorReporter
 	verify            serveVerifier
+	relayConnected    func(string) bool
 }
 
 func Serve(ctx context.Context, opts ServeOptions) error {
@@ -352,13 +353,26 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if err != nil {
 		return err
 	}
+	logger := newServeLogger()
+	observer := newServiceObserver(requiredRelays, opts.Publication.AckQuorum, opts.OutboxCriticalThreshold)
+	observer.startHeartbeat(ctx)
+	observer.setCheck("signer_connected", true, "")
+	stopObservability, err := startObservabilityHTTP(ctx, opts.ObservabilityAddr, observer, logger)
+	if err != nil {
+		return err
+	}
+	defer stopObservability()
 	audit := opts.Audit
 	if audit == nil {
 		audit = NewJSONAuditSink(os.Stderr)
 	}
-	reportError := opts.reportError
-	if reportError == nil {
-		reportError = defaultServeErrorReporter
+	audit = observedAuditSink{next: audit, observer: observer}
+	reportError := observer.errorReporter(logger)
+	if opts.reportError != nil {
+		reportError = func(stage string, err error, event *gonostr.Event) {
+			observer.recordStage(stage)
+			opts.reportError(stage, err, event)
+		}
 	}
 	eventPublisher := EventPublisher(nip34.NewPublisher())
 	var reliablePublisher *nip34.ReliablePublisher
@@ -381,6 +395,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			}
 		}()
 	}
+	eventPublisher = observedPublisher{next: eventPublisher, observer: observer}
 	var ledger Ledger = &RelayLedger{Relays: requiredRelays, Signer: opts.Signer, Publisher: eventPublisher, CanonicalAuthor: strings.ToLower(pubkey), SyncNIP34Status: opts.SyncNIP34Status}
 	if opts.ledger != nil {
 		ledger = opts.ledger
@@ -391,11 +406,18 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	handler := &Handler{Ledger: ledger, Quality: quality, RepoAddrs: repoAddrs, Recipient: pubkey, ACL: opts.Authorization.Callers, ClosePolicy: opts.Authorization.ClosePolicy, Audit: audit}
 	subscribe := opts.subscribe
+	relayConnected := opts.relayConnected
 	if subscribe == nil {
 		pool := gonostr.NewPool()
 		defer pool.Close("nostrig serve complete")
 		subscribe = func(ctx context.Context, relays []string, filter gonostr.Filter) <-chan gonostr.RelayEvent {
 			return pool.SubscribeMany(ctx, relays, filter, gonostr.SubscriptionOptions{})
+		}
+		if relayConnected == nil {
+			relayConnected = func(url string) bool {
+				relay, ok := pool.Relays.Load(url)
+				return ok && relay != nil && relay.IsConnected()
+			}
 		}
 	}
 	unwrap := opts.unwrap
@@ -435,9 +457,22 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			return nil
 		}
 	}
+	basePublishWrapped := publishWrapped
+	publishWrapped = func(ctx context.Context, relayURLs []string, outer *gonostr.Event) error {
+		started := time.Now()
+		err := basePublishWrapped(ctx, relayURLs, outer)
+		if err == nil {
+			observer.recordPublished([]*gonostr.Event{outer}, time.Since(started))
+		} else {
+			observer.observePublishLatency(time.Since(started))
+		}
+		return err
+	}
 	responsePublisher := opts.responsePublisher
 	if responsePublisher == nil {
 		responsePublisher = eventPublisher
+	} else {
+		responsePublisher = observedPublisher{next: responsePublisher, observer: observer}
 	}
 	verify := opts.verify
 	if verify == nil {
@@ -445,7 +480,13 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	publishPlain := func(ctx context.Context, response *gonostr.Event) error {
 		if reliablePublisher != nil {
+			started := time.Now()
 			_, err := reliablePublisher.PublishSigned(ctx, response)
+			if err == nil {
+				observer.recordPublished([]*gonostr.Event{response}, time.Since(started))
+			} else {
+				observer.observePublishLatency(time.Since(started))
+			}
 			return err
 		}
 		return responsePublisher.Publish(ctx, relays, opts.Signer, []*gonostr.Event{response})
@@ -461,6 +502,7 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 		journal: journal, handler: handler, signer: opts.Signer, contextSigner: contextSigner, relays: relays,
 		unwrap: unwrap, wrap: wrap, publishWrapped: publishWrapped, publishPlain: publishPlain,
 		reportError: reportError, verify: verify, now: opts.now,
+		responseHook: observer.observeResponse, replayHook: observer.recordReplay, processHook: observer.recordProcessed,
 	}
 	filter := gonostr.Filter{Kinds: []gonostr.Kind{gonostr.Kind(nip34.KindContextVMIntent), gonostr.Kind(cascadia.NIP59_GIFT_WRAP)}, Tags: gonostr.TagMap{"p": []string{pubkey}}}
 	if journal != nil {
@@ -492,13 +534,14 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			return fmt.Errorf("reload command cursor: %w", err)
 		}
 		filter.Since = cursor.CreatedAt
+		observer.setCheck("initial_backfill_complete", true, "")
+	} else {
+		observer.setCheck("initial_backfill_complete", false, "command_journal_disabled")
 	}
 	ch := subscribe(ctx, relays, filter)
-	stopHealth, err := startHealthFile(ctx, opts.HealthFile)
-	if err != nil {
-		return err
-	}
-	defer stopHealth()
+	durablePaths := cleanStrings([]string{opts.Publication.OutboxPath, opts.CommandJournalPath})
+	observer.startMonitor(ctx, contextSigner, relayConnected, durablePaths, reliablePublisher)
+	logger.Info("nostrig serve started", "required_relay_quorum", observer.requiredQuorum)
 	for {
 		select {
 		case <-ctx.Done():
@@ -521,42 +564,6 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 			}
 		}
 	}
-}
-
-func startHealthFile(ctx context.Context, path string) (func(), error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return func() {}, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create health file directory: %w", err)
-	}
-	_ = os.Remove(path)
-	write := func() error {
-		return os.WriteFile(path, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644)
-	}
-	if err := write(); err != nil {
-		return nil, fmt.Errorf("write health file: %w", err)
-	}
-	stop := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-stop:
-				return
-			case <-ticker.C:
-				_ = write()
-			}
-		}
-	}()
-	return func() {
-		close(stop)
-		_ = os.Remove(path)
-	}, nil
 }
 
 func allowedMethod(ev *gonostr.Event) bool {
@@ -680,17 +687,6 @@ func hasMarkedTag(ev *gonostr.Event, name, value, marker string) bool {
 		}
 	}
 	return false
-}
-
-func defaultServeErrorReporter(stage string, err error, event *gonostr.Event) {
-	if err == nil {
-		return
-	}
-	if event != nil {
-		fmt.Fprintf(os.Stderr, "nostrig serve %s failed for kind %d event %s: %v\n", stage, event.Kind, event.ID.Hex(), err)
-		return
-	}
-	fmt.Fprintf(os.Stderr, "nostrig serve %s failed: %v\n", stage, err)
 }
 
 func contextVMSigner(s nip34.Signer) (casnostr.Signer, error) {

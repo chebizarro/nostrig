@@ -98,6 +98,10 @@ func TestReliablePublisherMirrorFailureDoesNotBlockQuorumAndRecoverySkipsAcknowl
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("failed mirror should remain queued: entries=%#v err=%v", entries, err)
 	}
+	snapshot, err := publisher.Snapshot()
+	if err != nil || snapshot.QueueDepth != 1 || snapshot.PublishedTotal != 1 || snapshot.LastPublished.ID != event.ID.Hex() {
+		t.Fatalf("unexpected publication snapshot: snapshot=%#v err=%v", snapshot, err)
+	}
 
 	transport.setFailure("wss://mirror", nil)
 	now = now.Add(2 * time.Second)
@@ -116,6 +120,10 @@ func TestReliablePublisherMirrorFailureDoesNotBlockQuorumAndRecoverySkipsAcknowl
 	}
 	if got := transport.callCount("wss://mirror"); got != 2 {
 		t.Fatalf("mirror attempts=%d, want 2", got)
+	}
+	snapshot, err = publisher.Snapshot()
+	if err != nil || snapshot.QueueDepth != 0 || snapshot.RetryTotal != 1 {
+		t.Fatalf("unexpected recovery snapshot: snapshot=%#v err=%v", snapshot, err)
 	}
 }
 
@@ -212,6 +220,10 @@ func TestReliablePublisherTimeoutDeadLettersAndOperatorRetryResetsState(t *testi
 	if err != nil || len(dead) != 1 {
 		t.Fatalf("dead-letter list=%#v err=%v", dead, err)
 	}
+	snapshot, err := publisher.Snapshot()
+	if err != nil || snapshot.DeadLetters != 1 || snapshot.DeadLetterTotal != 1 {
+		t.Fatalf("unexpected dead-letter snapshot: snapshot=%#v err=%v", snapshot, err)
+	}
 	count, err := publisher.store.Retry(event.ID.Hex())
 	if err != nil || count != 1 {
 		t.Fatalf("retry count=%d err=%v", count, err)
@@ -246,6 +258,10 @@ func TestReliablePublisherCircuitBreakerSkipsUnhealthyRelayUntilCooldown(t *test
 	defer publisher.Close()
 	if _, err := publisher.PublishWithReport(context.Background(), outboxTestSigner{}, []*gonostr.Event{{Kind: 30900, CreatedAt: 400}}); err == nil {
 		t.Fatal("expected initial quorum failure")
+	}
+	snapshot, err := publisher.Snapshot()
+	if err != nil || len(snapshot.Circuits) != 1 || !snapshot.Circuits[0].Open || !snapshot.Circuits[0].Required {
+		t.Fatalf("unexpected circuit snapshot: snapshot=%#v err=%v", snapshot, err)
 	}
 	now = now.Add(2 * time.Second)
 	reports, err := publisher.DrainOnce(context.Background())
