@@ -271,8 +271,62 @@ make check
 See [docs/build.md](./docs/build.md) for the pinned toolchain, standalone Docker
 build, SBOM, provenance, and immutable image digest workflow.
 
+### Tests
+
+```bash
+make test        # unit + integration tests
+make vet         # static analysis
+make race        # race detector (with checkptr workaround, see below)
+make fuzz-smoke  # short fuzz run over event/ContextVM parsing corpora
+make test-full   # check + fuzz smoke + acceptance contract/smoke suites
+```
+
+The live three-agent acceptance scenario (disposable Docker relays + local
+signer identities) is run separately:
+
+```bash
+make acceptance-three-agent
+```
+
+Evidence from the most recent run is recorded in
+[docs/acceptance/nostrig-crm.md](./docs/acceptance/nostrig-crm.md). The full
+test strategy is documented in [docs/testing.md](./docs/testing.md).
+
+#### Known issue: `-race` and checkptr
+
+The pinned `fiatjaf.com/nostr` dependency ships an optimized `unsafe`-based
+event serializer that is not checkptr-compatible. Because the race detector
+enables checkptr by default, a plain `go test -race ./...` crashes inside that
+serializer with a `checkptr` fatal error — this is an upstream
+pointer-arithmetic pattern, **not** a data race in nostrig.
+
+Run race tests with checkptr disabled (race instrumentation itself stays fully
+enabled), which is what `make race` does:
+
+```bash
+go test -race -gcflags=all=-d=checkptr=0 ./...
+```
+
+This workaround can be removed once the upstream serializer is made
+checkptr-safe or the dependency is replaced. See
+[docs/testing.md](./docs/testing.md) for details.
+
 ### Install to GOPATH/bin
 
 ```bash
 make install
 ```
+
+## Documentation
+
+- [docs/build.md](./docs/build.md) — pinned toolchain, dependency provenance, standalone Docker build, SBOM/provenance, image digests
+- [docs/testing.md](./docs/testing.md) — test strategy, fuzzing, race/checkptr compatibility, acceptance harness
+- [docs/agent-cli.md](./docs/agent-cli.md) — stable agent-facing `task`/`queue` CLI contract (JSON schemas, exit codes, revision preconditions)
+- [docs/deployment.md](./docs/deployment.md) — hardened deployment, health endpoints (`/livez`, `/readyz`, `/metrics`, `/diagnostics`), backup/restore and recovery runbooks
+- [docs/task-state-schema.md](./docs/task-state-schema.md) — canonical kind-`30900` task-state schema v2 and migration rules
+- [docs/gastown-integration.md](./docs/gastown-integration.md) — Gastown projection/dispatch contract
+- [docs/harbormaster-pstf.md](./docs/harbormaster-pstf.md) — Harbormaster exposure and trusted PSTF quality gates
+- [docs/nip34-reconciliation.md](./docs/nip34-reconciliation.md) — NIP-34/Gitea trust, echo suppression, field authority, repair
+- [docs/taskflow-migration.md](./docs/taskflow-migration.md) — one-time TaskFlow import
+- [docs/acceptance/nostrig-crm.md](./docs/acceptance/nostrig-crm.md) — three-agent live acceptance evidence
+- [skills/nostrig-agent/SKILL.md](./skills/nostrig-agent/SKILL.md) — OpenClaw agent workflow skill
