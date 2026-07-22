@@ -57,6 +57,7 @@ sudo chown 65532:65532 secrets/nostrig_signer_client_secret_key
 sudo chmod 0400 secrets/nostrig_signer_client_secret_key
 install -d -m 0700 config
 install -m 0440 /path/to/reviewed/nostrig-acl.json config/nostrig-acl.json
+sudo chown 65532:65532 config/nostrig-acl.json
 
 docker compose config
 docker compose up -d --build
