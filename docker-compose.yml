@@ -18,7 +18,7 @@ services:
         target: /run/configs/nostrig_acl.json
         uid: "65532"
         gid: "65532"
-        mode: 0440
+        mode: 0400
     secrets:
       - source: nostrig_signer_client_secret_key
         target: nostrig_signer_client_secret_key

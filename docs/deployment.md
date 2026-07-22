@@ -63,15 +63,17 @@ printf '%s\n' '<nip46-client-secret-hex>' > secrets/nostrig_signer_client_secret
 sudo chown 65532:65532 secrets/nostrig_signer_client_secret_key
 sudo chmod 0400 secrets/nostrig_signer_client_secret_key
 install -d -m 0700 config
-install -m 0440 /path/to/reviewed/nostrig-acl.json config/nostrig-acl.json
+install -m 0400 /path/to/reviewed/nostrig-acl.json config/nostrig-acl.json
 sudo chown 65532:65532 config/nostrig-acl.json
 
 docker compose config
+test "$(stat -c '%u:%g %a' config/nostrig-acl.json)" = "65532:65532 400"
+docker compose run --rm --no-deps --entrypoint /bin/sh nostrig-serve -c 'test -r "$NOSTRIG_ACL_FILE"'
 docker compose up -d --build
 docker compose ps
 ```
 
-`docker-compose.yml` sets `NOSTRIG_ENV=production`, runs as UID/GID 65532 with no capabilities and a read-only root filesystem, mounts the client key mode `0400` as a Compose secret, persists state and the instance lock in the `nostrig-state` volume, and gates container health on the authoritative `/readyz` endpoint. Multiple repository addresses may be comma-separated in `NOSTRIG_REPO_ADDRS`.
+`docker-compose.yml` sets `NOSTRIG_ENV=production`, runs as UID/GID 65532 with no capabilities and a read-only root filesystem, mounts the caller ACL and client key mode `0400`, persists state and the instance lock in the `nostrig-state` volume, and gates container health on the authoritative `/readyz` endpoint. Multiple repository addresses may be comma-separated in `NOSTRIG_REPO_ADDRS`.
 
 Useful checks:
 
