@@ -12,6 +12,13 @@ The default relay is `wss://relay.sharegap.net`. Scope each instance to one or m
 
 Use `signetctl` and the Signet operations documentation to provision a dedicated `nostrig-serve` identity, authorize its NIP-46 operations, and obtain its bunker URL. This runbook intentionally does not duplicate the Signet enrollment procedure.
 
+Signet's identity policy must use a persistent, writable policy file on its
+durable data volume (for example `policy_file = /data/policies.ini`). A policy
+installed into an in-memory store authorizes the initial session but disappears
+on restart, after which Signet correctly denies reconnects with
+`policy.identity_missing`. Prove stop/start reconnect and signing before
+declaring the bunker production-ready.
+
 Store only these deployment values:
 
 - `NOSTRIG_SIGNER_BUNKER_URL`: the provisioned `bunker://...` URL.

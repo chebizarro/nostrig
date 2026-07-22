@@ -6,6 +6,7 @@ compose_file="$repo_root/test/acceptance/compose.yaml"
 signet_source=${SIGNET_SOURCE_CONTEXT:?set SIGNET_SOURCE_CONTEXT to a disposable nostrc checkout}
 nak_bin=${NAK:-nak}
 health_port=${SIGNET_HEALTH_HOST_PORT:-18081}
+acceptance_run=${NOSTRIG_ACCEPTANCE_RUN:-^TestLive}
 work_dir=$(mktemp -d)
 
 db_key=$(openssl rand -hex 32)
@@ -102,15 +103,19 @@ umask 077
   printf 'NOSTRIG_ACCEPTANCE_CLIENT_SECRET=%s\n' "$client_secret"
   printf 'NOSTRIG_ACCEPTANCE_COMPOSE_FILE=/src/test/acceptance/compose.yaml\n'
   printf 'NOSTRIG_ACCEPTANCE_CONTROL_SIGNET=1\n'
+  printf 'NOSTRIG_ACCEPTANCE_RUN=%s\n' "$acceptance_run"
 } >"$work_dir/test.env"
 
-docker run --rm --network host \
+if ! docker run --rm --network host \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$repo_root:/src" \
   -v "$signet_source:/nostrc:ro" \
   -w /src \
   --env-file "$work_dir/test.env" \
   golang:1.25.12-alpine3.24 sh -c \
-    'apk add --no-cache docker-cli-compose gcc musl-dev >/dev/null && timeout 5m env GOTOOLCHAIN=local go test -mod=readonly -count=1 -tags=nostrig_acceptance -run="^TestLive" -v ./test/acceptance'
+    'apk add --no-cache docker-cli-compose gcc musl-dev >/dev/null && timeout 5m env GOTOOLCHAIN=local go test -mod=readonly -count=1 -tags=nostrig_acceptance -run="$NOSTRIG_ACCEPTANCE_RUN" -v ./test/acceptance'; then
+  docker compose -f "$compose_file" logs --no-color signetd | tail -100
+  exit 1
+fi
 
 printf '%s\n' 'disposable Signet acceptance: PASS'

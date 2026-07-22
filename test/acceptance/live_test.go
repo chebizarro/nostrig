@@ -45,8 +45,11 @@ func loadLiveAcceptanceConfig(t *testing.T) liveAcceptanceConfig {
 
 func connectLiveSigner(t *testing.T, cfg liveAcceptanceConfig) *nostrigNostr.NIP46Signer {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+	// The context passed to ConnectBunker owns the client's long-lived response
+	// subscription. Keep it alive for the test instead of canceling it as soon
+	// as the initial connect RPC returns.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	t.Cleanup(cancel)
 	signer, err := nostrigNostr.ConnectNIP46Signer(ctx, cfg.bunkerURL, cfg.clientSecret)
 	if err != nil {
 		t.Fatalf("connect Signet: %v", err)
@@ -99,7 +102,10 @@ func TestLiveSignetDisconnectReconnect(t *testing.T) {
 	}
 	signer := connectLiveSigner(t, cfg)
 	before := &gonostr.Event{Kind: 1, CreatedAt: gonostr.Timestamp(time.Now().Unix()), Content: "before restart"}
-	if err := signer.SignEvent(context.Background(), before); err != nil {
+	beforeCtx, beforeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := signer.SignEvent(beforeCtx, before)
+	beforeCancel()
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,7 +117,7 @@ func TestLiveSignetDisconnectReconnect(t *testing.T) {
 		}
 	}()
 	outageCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	err := signer.SignEvent(outageCtx, &gonostr.Event{Kind: 1, CreatedAt: gonostr.Timestamp(time.Now().Unix()), Content: "during outage"})
+	err = signer.SignEvent(outageCtx, &gonostr.Event{Kind: 1, CreatedAt: gonostr.Timestamp(time.Now().Unix()), Content: "during outage"})
 	cancel()
 	if err == nil {
 		t.Fatal("signing unexpectedly succeeded while Signet was stopped")
@@ -121,17 +127,19 @@ func TestLiveSignetDisconnectReconnect(t *testing.T) {
 	restarted = true
 	deadline := time.Now().Add(45 * time.Second)
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// The connection context also owns the response listener; keep it alive
+		// through the post-restart signing probe.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		reconnected, connectErr := nostrigNostr.ConnectNIP46Signer(ctx, cfg.bunkerURL, cfg.clientSecret)
-		cancel()
 		if connectErr == nil {
 			event := &gonostr.Event{Kind: 1, CreatedAt: gonostr.Timestamp(time.Now().Unix()), Content: "after restart"}
-			ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 			signErr := reconnected.SignEvent(ctx, event)
 			cancel()
 			if signErr == nil {
 				return
 			}
+		} else {
+			cancel()
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("Signet did not reconnect before deadline: %v", connectErr)
