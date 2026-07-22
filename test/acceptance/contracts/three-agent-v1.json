@@ -1,0 +1,132 @@
+{
+  "version": "nostrig-three-agent/v1",
+  "actors": [
+    "stew",
+    "netward",
+    "gus"
+  ],
+  "steps": [
+    {
+      "id": 1,
+      "actor": "stew",
+      "operation": "create_and_assign",
+      "expected": "task is open and assigned to Netward",
+      "evidence": [
+        "canonical task event",
+        "assignment event id"
+      ]
+    },
+    {
+      "id": 2,
+      "actor": "netward",
+      "operation": "receive_and_ack",
+      "expected": "Netward observes and acknowledges dispatch",
+      "evidence": [
+        "dispatch receipt",
+        "ack event id"
+      ]
+    },
+    {
+      "id": 3,
+      "actor": "netward",
+      "operation": "atomic_claim",
+      "expected": "claim succeeds and task becomes in_progress",
+      "evidence": [
+        "winning revision",
+        "lease or claim event id"
+      ]
+    },
+    {
+      "id": 4,
+      "actor": "gus",
+      "operation": "competing_claim",
+      "expected": "competing claim is rejected with structured conflict",
+      "evidence": [
+        "conflict code",
+        "winning assignee and revision"
+      ]
+    },
+    {
+      "id": 5,
+      "actor": "netward",
+      "operation": "block_with_evidence",
+      "expected": "checkpoints are recorded and task becomes blocked",
+      "evidence": [
+        "checkpoint ids",
+        "blocker evidence id"
+      ]
+    },
+    {
+      "id": 6,
+      "actor": "stew",
+      "operation": "resolve_reassign_or_unblock",
+      "expected": "authorized resolution returns task to actionable state",
+      "evidence": [
+        "resolution event id",
+        "new assignee or status"
+      ]
+    },
+    {
+      "id": 7,
+      "actor": "netward",
+      "operation": "complete_and_request_review",
+      "expected": "implementation is complete and review is requested",
+      "evidence": [
+        "completion checkpoint",
+        "review request id"
+      ]
+    },
+    {
+      "id": 8,
+      "actor": "gus",
+      "operation": "record_review_and_quality",
+      "expected": "review evidence and passing PSTF quality state are recorded",
+      "evidence": [
+        "review evidence id",
+        "trusted PSTF quality event id"
+      ]
+    },
+    {
+      "id": 9,
+      "actor": "netward",
+      "operation": "unauthorized_close",
+      "expected": "close is rejected by authorization or close policy",
+      "evidence": [
+        "authorization denial",
+        "unchanged canonical revision"
+      ]
+    },
+    {
+      "id": 10,
+      "actor": "stew",
+      "operation": "authorized_close",
+      "expected": "authorized close succeeds after all gates pass",
+      "evidence": [
+        "closed task revision",
+        "acceptance evidence ids"
+      ]
+    },
+    {
+      "id": 11,
+      "actor": "gus",
+      "operation": "independent_state_convergence",
+      "expected": "all three independent readers list identical canonical state",
+      "evidence": [
+        "Stew state digest",
+        "Netward state digest",
+        "Gus state digest"
+      ]
+    },
+    {
+      "id": 12,
+      "actor": "stew",
+      "operation": "restart_service_and_relay",
+      "expected": "service and one relay restart mid-flow without duplicate mutation or divergence",
+      "evidence": [
+        "pre/post event ids",
+        "replay journal state",
+        "relay recovery report"
+      ]
+    }
+  ]
+}

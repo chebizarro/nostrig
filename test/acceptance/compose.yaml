@@ -1,0 +1,46 @@
+name: nostrig-acceptance
+
+services:
+  relay-1:
+    image: scsibug/nostr-rs-relay:0.9.0
+    ports: ["17001:8080"]
+    volumes: [relay-1-data:/usr/src/app/db]
+
+  relay-2:
+    image: scsibug/nostr-rs-relay:0.9.0
+    ports: ["17002:8080"]
+    volumes: [relay-2-data:/usr/src/app/db]
+
+  relay-3:
+    image: scsibug/nostr-rs-relay:0.9.0
+    ports: ["17003:8080"]
+    volumes: [relay-3-data:/usr/src/app/db]
+
+  signetd:
+    build:
+      context: ${SIGNET_SOURCE_CONTEXT:-../../../nostrc}
+      dockerfile: signet/Dockerfile
+    command: ["-c", "/etc/signet/signet.conf"]
+    environment:
+      SIGNET_DB_KEY: ${SIGNET_DB_KEY:?set a disposable 64-character hex database key}
+      SIGNET_BUNKER_NSEC: ${SIGNET_BUNKER_NSEC:?set a disposable bunker nsec}
+      SIGNET_RELAYS: ws://relay-1:8080,ws://relay-2:8080,ws://relay-3:8080
+      SIGNET_LOG_LEVEL: info
+      SIGNET_PROVISIONER_PUBKEYS: ${SIGNET_PROVISIONER_PUBKEYS:-}
+    depends_on: [relay-1, relay-2, relay-3]
+    ports: ["18080:8080"]
+    volumes:
+      - signet-data:/data
+      - ./signet.conf:/etc/signet/signet.conf:ro
+    cap_add: [IPC_LOCK]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp:size=10M]
+    ulimits:
+      memlock: {soft: -1, hard: -1}
+
+volumes:
+  relay-1-data:
+  relay-2-data:
+  relay-3-data:
+  signet-data:

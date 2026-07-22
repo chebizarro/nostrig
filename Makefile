@@ -10,6 +10,7 @@ PROTOC ?= protoc
 GO ?= go
 GO_TOOLCHAIN ?= go1.25.12
 GO_CMD := GOTOOLCHAIN=$(GO_TOOLCHAIN) $(GO)
+FUZZ_SMOKE_COUNT ?= 100x
 
 IMAGE_NAME ?= nostrig:local
 OCI_PLATFORM ?= linux/amd64
@@ -18,7 +19,7 @@ IMAGE_METADATA ?= $(BUILD_DIR)/image-metadata.json
 IMAGE_DIGEST ?= $(BUILD_DIR)/image-digest.txt
 SBOM_GENERATOR ?= docker/buildkit-syft-scanner:stable-1@sha256:79e7b013cbec16bbb436f312819a49a4a57752b2270c1a9332ae1a10fcc82a68
 
-.PHONY: proto build install test vet race check image release-image sbom clean
+.PHONY: proto build install test vet race fuzz-smoke acceptance-contract acceptance-smoke acceptance-live test-full check image release-image sbom clean
 
 proto:
 	$(GO_CMD) generate ./...
@@ -37,9 +38,31 @@ vet:
 	$(GO_CMD) vet -mod=readonly ./...
 
 race:
-	$(GO_CMD) test -mod=readonly -race ./...
+	# fiatjaf.com/nostr's pinned optimized serializer trips checkptr under -race.
+	# Keep race instrumentation enabled while disabling only that incompatible check.
+	$(GO_CMD) test -mod=readonly -race -gcflags=all=-d=checkptr=0 ./...
+
+fuzz-smoke:
+	$(GO_CMD) test -mod=readonly -run='^$$' -fuzz='^FuzzContextVMIntentEventJSON$$' -fuzztime=$(FUZZ_SMOKE_COUNT) -parallel=1 ./internal/taskfabric
+	$(GO_CMD) test -mod=readonly -run='^$$' -fuzz='^FuzzContextVMResponseEventJSON$$' -fuzztime=$(FUZZ_SMOKE_COUNT) -parallel=1 ./internal/taskfabric
+
+acceptance-contract:
+	$(GO_CMD) test -mod=readonly -run='^TestThreeAgentAcceptanceContract$$' ./test/acceptance
+
+# Compile and execute the tagged package; live tests skip unless their explicit
+# environment is present. This is not a live acceptance result.
+acceptance-smoke:
+	$(GO_CMD) test -mod=readonly -tags=nostrig_acceptance -run='^TestLive' ./test/acceptance
+
+acceptance-live:
+	@test -n "$$NOSTRIG_ACCEPTANCE_RELAYS" || (echo "NOSTRIG_ACCEPTANCE_RELAYS is required" >&2; exit 2)
+	@test -n "$$NOSTRIG_ACCEPTANCE_BUNKER_URL" || (echo "NOSTRIG_ACCEPTANCE_BUNKER_URL is required" >&2; exit 2)
+	@test -n "$$NOSTRIG_ACCEPTANCE_CLIENT_SECRET" || (echo "NOSTRIG_ACCEPTANCE_CLIENT_SECRET is required" >&2; exit 2)
+	$(GO_CMD) test -mod=readonly -tags=nostrig_acceptance -run='^TestLive' -v ./test/acceptance
 
 check: test vet race
+
+test-full: check fuzz-smoke acceptance-contract acceptance-smoke
 
 image:
 	docker build --pull --tag $(IMAGE_NAME) .
