@@ -55,28 +55,68 @@ func TestFetchTaskStateEventsRequiresBoundedSelector(t *testing.T) {
 	}
 }
 
-func TestPublishWriteBackPublishesNIP34StatusForLinkedClosedTask(t *testing.T) {
-	pub := &statusCapturePublisher{}
-	issue := &beadspb.Issue{Id: "repo-task1", Title: "Close me", Status: beadspb.Status_STATUS_CLOSED, Metadata: &beadspb.Metadata{Custom: map[string]string{"nostr.id": "root-event", "nip34.repo_addr": "30617:owner:repo"}}}
-	result := &MergeResult{Records: []*CacheRecord{{Resolved: SnapshotFromIssue(issue), Local: SnapshotFromIssue(issue), LocalRevision: "rev1", Resolution: ResolutionClean}}}
-	count, err := publishWriteBack(context.Background(), SyncOptions{Push: true, SyncNIP34Status: true, Relays: []string{"wss://relay.example"}, Authors: []string{testPubKey(20).Hex()}, Signer: noopSigner{}, Publisher: pub}, result)
+func TestRelayAuthoritativeMergeReportsDriftButRendersRelayAndDeletesLocalOnly(t *testing.T) {
+	relayIssue := &beadspb.Issue{
+		Id: "repo-task1", Title: "relay", Status: beadspb.Status_STATUS_IN_PROGRESS,
+		ExecutionAttempts: []*beadspb.ExecutionAttempt{{Id: "attempt-1", Agent: "worker", Status: "running"}},
+		Metadata:          &beadspb.Metadata{Custom: map[string]string{"nostr.id": "relay-event"}},
+	}
+	local := []*TaskSnapshot{
+		{ID: "repo-task1", Title: "local edit", Status: "open"},
+		{ID: "local-only", Title: "must disappear", Status: "open"},
+	}
+	merged, err := MergeTaskStateWithOptions(&beadspb.Export{Issues: []*beadspb.Issue{relayIssue}}, local, nil, MergeOptions{RelayAuthoritative: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 {
-		t.Fatalf("published count=%d, want 2", count)
+	if len(merged.Conflicts) != 1 || merged.Conflicts[0].Conflict.Reason != "local_projection_drift" {
+		t.Fatalf("unexpected conflicts: %#v", merged.Conflicts)
 	}
-	if len(pub.events) != 2 {
-		t.Fatalf("events=%d, want 2", len(pub.events))
+	if len(merged.Export.Issues) != 1 || merged.Export.Issues[0].Title != "relay" || len(merged.Export.Issues[0].ExecutionAttempts) != 1 {
+		t.Fatalf("relay projection was not authoritative/full-fidelity: %#v", merged.Export.Issues)
 	}
-	if pub.events[1].Kind != nip34.KindStatusClosed {
-		t.Fatalf("status kind=%d, want %d", pub.events[1].Kind, nip34.KindStatusClosed)
+	for _, issue := range merged.Export.Issues {
+		if issue.Id == "local-only" {
+			t.Fatal("local-only task leaked into authoritative projection")
+		}
 	}
-	if got, _ := nip34.TagFirst(pub.events[1], "a"); got != "30617:owner:repo" {
-		t.Fatalf("status repo tag=%q", got)
+}
+
+func TestRelayAuthoritativeExactTaskMergeRejectsUnknownOutOfScopeLocalState(t *testing.T) {
+	selectedIssue := &beadspb.Issue{Id: "task-1", Title: "selected", Status: beadspb.Status_STATUS_OPEN}
+	_, err := MergeTaskStateWithOptions(
+		&beadspb.Export{Issues: []*beadspb.Issue{selectedIssue}},
+		[]*TaskSnapshot{{ID: "unqueried", Title: "unknown local state", Status: "open"}},
+		nil,
+		MergeOptions{RelayAuthoritative: true, AuthoritativeTaskIDs: []string{"task-1"}},
+	)
+	if err == nil {
+		t.Fatal("exact-task merge rewrote an unqueried local record without prior relay provenance")
 	}
-	if got, _ := nip34.TagFirst(pub.events[1], "e"); got != "root-event" {
-		t.Fatalf("status root tag=%q", got)
+}
+
+func TestRelayAuthoritativeExactTaskMergeRetainsOnlyPreviouslyObservedOutOfScopeRelayState(t *testing.T) {
+	cachedIssue := &beadspb.Issue{
+		Id: "task-2", Title: "cached relay task", Status: beadspb.Status_STATUS_OPEN,
+		Metadata: &beadspb.Metadata{Custom: map[string]string{"nostr.id": "relay-task-2"}},
+	}
+	cached := SnapshotFromIssue(cachedIssue)
+	previous := []*CacheRecord{{
+		ID: "task-2", Resolved: cached, Local: cached, Relay: cached,
+		LocalRevision: SnapshotRevision(cached), RelayEventID: "relay-task-2", Resolution: ResolutionClean,
+	}}
+	selectedIssue := &beadspb.Issue{Id: "task-1", Title: "selected", Status: beadspb.Status_STATUS_OPEN}
+	merged, err := MergeTaskStateWithOptions(
+		&beadspb.Export{Issues: []*beadspb.Issue{selectedIssue}},
+		[]*TaskSnapshot{cached},
+		previous,
+		MergeOptions{RelayAuthoritative: true, AuthoritativeTaskIDs: []string{"task-1"}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged.Export.Issues) != 2 {
+		t.Fatalf("partial sync discarded out-of-scope relay projection: %#v", merged.Export.Issues)
 	}
 }
 

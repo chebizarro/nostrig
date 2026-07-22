@@ -2,20 +2,25 @@ package nostr
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	gonostr "fiatjaf.com/nostr"
+	beadspb "github.com/chebizarro/nostrig/gen/beads"
 )
 
 type outboxTestSigner struct{}
 
 func (outboxTestSigner) SignEvent(_ context.Context, event *gonostr.Event) error {
-	event.ID = event.GetID()
+	// Avoid the dependency's unsafe optimized serializer in race/checkptr tests.
+	digest := sha256.Sum256([]byte(strconv.Itoa(int(event.Kind)) + "|" + strconv.FormatInt(int64(event.CreatedAt), 10) + "|" + event.Content))
+	event.ID = gonostr.ID(digest)
 	return nil
 }
 
@@ -152,7 +157,10 @@ func TestReliablePublisherRestartDrainsOnlyMissingRelay(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "outbox.json")
 	firstTransport := &outboxTestTransport{failures: map[string]error{"wss://ledger-2": errors.New("down")}}
 	first := newTestReliablePublisher(t, path, &now, firstTransport, []string{"wss://ledger-1", "wss://ledger-2"}, nil, 2)
-	event := &gonostr.Event{Kind: 30900, CreatedAt: 300, Content: "restart"}
+	event, err := BuildTaskStateEvent(&beadspb.Issue{Id: "task-restart", Title: "survive relay failure", Status: beadspb.Status_STATUS_OPEN}, strings.Repeat("0", 63)+"1", now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := first.PublishWithReport(context.Background(), outboxTestSigner{}, []*gonostr.Event{event}); err == nil {
 		t.Fatal("expected initial sub-quorum error")
 	}

@@ -19,9 +19,7 @@ import (
 // the canonical, append-only store and leaves local .beads files as projections.
 type Store interface {
 	LoadExport(ctx context.Context) (*pb.Export, error)
-	SaveExport(ctx context.Context, export *pb.Export) error
 	GetIssue(ctx context.Context, id string) (*pb.Issue, error)
-	PutIssue(ctx context.Context, issue *pb.Issue) (*gonostr.Event, error)
 }
 
 // EventFetcher is satisfied by internal/nostr.Client and by tests.
@@ -70,23 +68,10 @@ func (b *RelayBackend) LoadExport(ctx context.Context) (*pb.Export, error) {
 	return ExportFromTaskStateEvents(events)
 }
 
-// SaveExport publishes one new 30900 task:* state event for each issue in export.
-func (b *RelayBackend) SaveExport(ctx context.Context, export *pb.Export) error {
-	if export == nil {
-		return fmt.Errorf("export is nil")
-	}
-	events := make([]*gonostr.Event, 0, len(export.Issues))
-	for _, issue := range export.Issues {
-		if issue == nil {
-			continue
-		}
-		ev, err := b.buildEvent(issue)
-		if err != nil {
-			return err
-		}
-		events = append(events, ev)
-	}
-	return b.publish(ctx, events)
+// SaveExport is retained as a source-compatible hard failure for old callers.
+// Canonical writes are accepted only through the ContextVM task API.
+func (b *RelayBackend) SaveExport(context.Context, *pb.Export) error {
+	return fmt.Errorf("direct relay mutations are disabled; use the ContextVM task API")
 }
 
 // GetIssue loads the latest state for one task id.
@@ -111,16 +96,10 @@ func (b *RelayBackend) GetIssue(ctx context.Context, id string) (*pb.Issue, erro
 	return nil, fmt.Errorf("issue %s not found", id)
 }
 
-// PutIssue publishes a new canonical 30900 task:* state event for issue.
-func (b *RelayBackend) PutIssue(ctx context.Context, issue *pb.Issue) (*gonostr.Event, error) {
-	ev, err := b.buildEvent(issue)
-	if err != nil {
-		return nil, err
-	}
-	if err := b.publish(ctx, []*gonostr.Event{ev}); err != nil {
-		return nil, err
-	}
-	return ev, nil
+// PutIssue is retained as a source-compatible hard failure for old callers.
+// Canonical writes are accepted only through the ContextVM task API.
+func (b *RelayBackend) PutIssue(context.Context, *pb.Issue) (*gonostr.Event, error) {
+	return nil, fmt.Errorf("direct relay mutations are disabled; use the ContextVM task API")
 }
 
 func (b *RelayBackend) fetch(ctx context.Context, taskIDs []string) ([]*gonostr.Event, error) {
@@ -226,7 +205,7 @@ func (b *RelayBackend) publish(ctx context.Context, events []*gonostr.Event) err
 	}
 	publisher := b.opts.Publisher
 	if publisher == nil {
-		publisher = nip34.NewPublisher()
+		return fmt.Errorf("direct relay writes require an explicit publisher; use the ContextVM task API for production mutations")
 	}
 	return publisher.Publish(ctx, relays, b.opts.Signer, events)
 }

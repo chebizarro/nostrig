@@ -162,6 +162,9 @@ func newSyncCmd() *cobra.Command {
 		Use:   "sync",
 		Short: "Pull canonical task-state events into the durable task cache and render .beads JSONL",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if push || syncNIP34Status {
+				return fmt.Errorf("sync write-back is deprecated: local .beads files are projections; mutate tasks through ContextVM")
+			}
 			ownerHex, err := resolveOwner(owner)
 			if err != nil {
 				return fmt.Errorf("invalid owner: %w", err)
@@ -193,8 +196,8 @@ func newSyncCmd() *cobra.Command {
 	syncCmd.Flags().StringVar(&outDir, "out", ".", "Output directory (writes <out>/.beads/issues.jsonl)")
 	syncCmd.Flags().StringVar(&cachePath, "cache", "", "Durable nostrig task cache path (default: <out>/.nostrig/task-cache.jsonl)")
 	syncCmd.Flags().BoolVar(&failOnConflict, "fail-on-conflict", false, "Exit non-zero when local and relay changes conflict")
-	syncCmd.Flags().BoolVar(&push, "push", false, "Publish local .beads changes back to relay after relay-source-of-truth reconciliation")
-	syncCmd.Flags().BoolVar(&syncNIP34Status, "sync-nip34-status", false, "Opt-in: with --push, publish NIP-34 issue status events for linked tasks")
+	syncCmd.Flags().BoolVar(&push, "push", false, "Deprecated: local .beads is projection-only; use ContextVM task commands")
+	syncCmd.Flags().BoolVar(&syncNIP34Status, "sync-nip34-status", false, "Deprecated with sync write-back; NIP-34 is import/linkage only")
 	syncCmd.Flags().IntVar(&limit, "limit", 500, "Maximum task-state events to request")
 	addSigningFlags(syncCmd, &signing)
 	return syncCmd

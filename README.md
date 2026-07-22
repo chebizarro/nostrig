@@ -1,6 +1,6 @@
 # nostrig
 
-`nostrig` bridges NIP-34 (git-related) Nostr events and a relay-backed task-fabric view for a single repository. It can fetch/render **beads-compatible JSONL artifacts**, publish canonical task-state events, sync those events back into `.beads`, and dispatch task claim commands.
+`nostrig` bridges NIP-34 (git-related) Nostr events and an authoritative relay-backed task ledger for a single repository. It renders **beads-compatible JSONL projections**, publishes canonical task-state events, syncs relay state into `.beads`, and dispatches task commands through ContextVM.
 
 It gives you a unified local view of work items for a repo:
 - Repositories (NIP-34 kind `30617`) → **beads Epics**
@@ -81,7 +81,7 @@ If no `--relay` flags are provided, `nostrig` uses a small default set and merge
 
 ### Publish canonical task fabric events
 
-`publish` reuses the fetch/conversion pipeline, then publishes canonical task-fabric events to the relays selected from `--relay` and the repository announcement. Production deployments should use Signet/NIP-46 signing:
+`publish` is an explicit bootstrap/import command: it reuses the NIP-34 fetch/conversion pipeline, then publishes initial canonical task-fabric events to the selected relays. It is not a worker mutation path; ongoing changes must use ContextVM task commands. Production deployments should use Signet/NIP-46 signing:
 
 ```bash
 NOSTRIG_ENV=production nostrig publish \
@@ -110,9 +110,9 @@ nostrig sync \
   --out .
 ```
 
-By default, the durable source-of-truth cache is written to `./.nostrig/task-cache.jsonl` (override with `--cache`). The resolver tracks local revisions and relay event IDs per task. Relay-only changes update the local projection, local-only changes are preserved in the cache for later publishing, compatible timestamp-ordered status/assignee changes use latest-wins semantics, and material local+relay divergence is recorded as conflict metadata without discarding either side. Use `--fail-on-conflict` when automation should stop on conflicts.
+By default, the durable projection cache is written to `./.nostrig/task-cache.jsonl` (override with `--cache`). The relay ledger is the sole source of truth: sync always renders relay state, removes local-only tasks from the rendered projection, and records local divergence as `local_projection_drift` metadata for diagnosis. Local `.beads` edits are never published; the deprecated `sync --push` path returns an error. Use ContextVM task commands for mutations and `migrate` only for an explicit one-time import. Use `--fail-on-conflict` when automation should stop on detected projection drift.
 
-You can also derive the repo address from `--repo-id` and `--owner`, or sync exact tasks with repeated `--task-id`. To avoid broad relay scans, `sync` requires either `--repo-addr` (or `--repo-id` + `--owner`) or at least one `--task-id`. `--relay` falls back to `NOSTR_RELAY`/`NOSTR_RELAYS` for `sync`, `claim`, and `update`.
+You can also derive the repo address from `--repo-id` and `--owner`, or sync exact tasks with repeated `--task-id`. To avoid broad relay scans, `sync` requires either `--repo-addr` (or `--repo-id` + `--owner`) or at least one `--task-id`. `--relay` falls back to `NOSTR_RELAY`/`NOSTR_RELAYS` for `sync`, `claim`, and `update`. The Gastown projection/dispatch contract is documented in [docs/gastown-integration.md](./docs/gastown-integration.md).
 
 ### Claim a task
 

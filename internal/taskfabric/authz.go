@@ -239,10 +239,24 @@ func (h *Handler) authorize(ctx context.Context, ev *gonostr.Event, method strin
 		return deny(reason)
 	}
 	if method == "task/close" {
-		if h.ClosePolicy.RequireReviewer && role != RoleReviewer && role != RoleAdmin && role != RoleOperator {
+		reviewRequired := h.ClosePolicy.RequireReviewer || (issue != nil && issue.ReviewRequired)
+		if reviewRequired && role != RoleReviewer && role != RoleAdmin && role != RoleOperator {
 			return deny("reviewer_required")
 		}
-		if h.ClosePolicy.RequireQuality {
+		if issue != nil && issue.ReviewRequired {
+			reviewerIdentity := strings.TrimSpace(policy.WorkerID)
+			if reviewerIdentity == "" {
+				reviewerIdentity = caller
+			}
+			if issue.Reviewer != "" && issue.Reviewer != caller && issue.Reviewer != reviewerIdentity && role != RoleAdmin && role != RoleOperator {
+				return deny("designated_reviewer_required")
+			}
+			if len(cleanStrings(paramList(p, "acceptance_evidence_ids"))) == 0 {
+				return deny("acceptance_evidence_required")
+			}
+		}
+		qualityRequired := h.ClosePolicy.RequireQuality || (issue != nil && issue.QualityRequired)
+		if qualityRequired {
 			if h.Quality == nil || issue == nil {
 				return deny("quality_required")
 			}
@@ -330,13 +344,19 @@ func authzIssue(issue *beadspb.Issue) *beadIssue {
 	if issue == nil {
 		return nil
 	}
-	return &beadIssue{Id: issue.Id, Assignee: issue.Assignee, RepoAddr: issue.GetMetadata().GetCustom()["nip34.repo_addr"]}
+	return &beadIssue{
+		Id: issue.Id, Assignee: issue.Assignee, RepoAddr: issue.GetMetadata().GetCustom()["nip34.repo_addr"],
+		ReviewRequired: issue.GetReview().GetRequired(), Reviewer: issue.GetReview().GetReviewer(), QualityRequired: issue.GetQualityGate().GetRequired(),
+	}
 }
 
 type beadIssue struct {
-	Id       string
-	Assignee string
-	RepoAddr string
+	Id              string
+	Assignee        string
+	RepoAddr        string
+	ReviewRequired  bool
+	Reviewer        string
+	QualityRequired bool
 }
 
 func allowedRole(roles []Role, method string) (Role, bool) {
@@ -393,7 +413,7 @@ func authorizeFields(role Role, policy CallerPolicy, method string, p map[string
 			if issue == nil || (issue.Assignee != self && issue.Assignee != caller) {
 				return "worker_not_assignee"
 			}
-			for _, field := range []string{"assignee", "priority", "title", "epic", "feature_id", "nip34_event_id", "nip34_kind", "add_dependencies", "remove_dependencies"} {
+			for _, field := range []string{"assignee", "priority", "title", "epic", "feature_id", "nip34_event_id", "nip34_kind", "add_dependencies", "remove_dependencies", "add_typed_dependencies", "remove_typed_dependencies"} {
 				if _, ok := p[field]; ok {
 					return "field_denied"
 				}

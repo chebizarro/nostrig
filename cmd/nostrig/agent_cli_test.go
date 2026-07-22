@@ -88,6 +88,50 @@ func TestTaskBlockDryRunHasStableEnvelopeAndEvidence(t *testing.T) {
 	}
 }
 
+func TestTaskExecutionAndTypedDependencyDryRunUsesContextVMParams(t *testing.T) {
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{
+		"task", "update", "--json", "--task-id", "task-1",
+		"--base-event-id", fmt.Sprintf("%064x", 1),
+		"--execution-attempt-id", "attempt-1", "--attempt-status", "completed",
+		"--attempt-commit", "abc123", "--attempt-pr", "https://example.test/pr/1",
+		"--attempt-evidence-id", "event:evidence",
+		"--add-typed-dep", "parent-child:task-0",
+		"--recipient", fmt.Sprintf("%064x", 2), "--dry-run",
+	})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var envelope mutationEnvelope
+	if err := json.Unmarshal(out.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode envelope: %v\n%s", err, out.String())
+	}
+	var request struct {
+		Method string         `json:"method"`
+		Params map[string]any `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(envelope.Event.Content), &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Method != "task/update" || request.Params["execution_attempt_id"] != "attempt-1" || request.Params["attempt_status"] != "completed" {
+		t.Fatalf("request=%#v", request)
+	}
+	if values, ok := request.Params["attempt_commits"].([]any); !ok || len(values) != 1 || values[0] != "abc123" {
+		t.Fatalf("attempt commits=%#v", request.Params["attempt_commits"])
+	}
+	deps, ok := request.Params["add_typed_dependencies"].([]any)
+	if !ok || len(deps) != 1 {
+		t.Fatalf("typed dependencies=%#v", request.Params["add_typed_dependencies"])
+	}
+	dep, ok := deps[0].(map[string]any)
+	if !ok || dep["type"] != "parent-child" || dep["task_id"] != "task-0" {
+		t.Fatalf("typed dependency=%#v", deps[0])
+	}
+}
+
 func TestQueueClaimNextDryRunUsesRevisionAndLease(t *testing.T) {
 	cmd := newRootCmd()
 	queueRevision := fmt.Sprintf("%064x", 3)

@@ -66,6 +66,12 @@ type CacheRecord struct {
 
 type MergeOptions struct {
 	RelayWinsOnConflict bool
+	// RelayAuthoritative treats local Beads JSONL as a projection only. Local
+	// drift is reported but never selected as resolved canonical state.
+	RelayAuthoritative bool
+	// AuthoritativeTaskIDs narrows an authoritative merge. Cached relay state
+	// outside this exact selector is retained because it was not refetched.
+	AuthoritativeTaskIDs []string
 }
 
 type MergeResult struct {
@@ -206,6 +212,10 @@ func MergeTaskState(relayExport *beadspb.Export, local []*TaskSnapshot, previous
 }
 
 func MergeTaskStateWithOptions(relayExport *beadspb.Export, local []*TaskSnapshot, previous []*CacheRecord, opts MergeOptions) (*MergeResult, error) {
+	authoritativeScope := map[string]struct{}{}
+	for _, id := range cleanTaskIDs(opts.AuthoritativeTaskIDs) {
+		authoritativeScope[id] = struct{}{}
+	}
 	prevByID := map[string]*CacheRecord{}
 	for _, rec := range previous {
 		if rec != nil && strings.TrimSpace(rec.ID) != "" {
@@ -245,6 +255,16 @@ func MergeTaskStateWithOptions(relayExport *beadspb.Export, local []*TaskSnapsho
 		prev := prevByID[id]
 		localSnap := localByID[id]
 		relaySnap := relayByID[id]
+		if opts.RelayAuthoritative && relaySnap == nil && len(authoritativeScope) > 0 {
+			if _, selected := authoritativeScope[id]; !selected {
+				if prev == nil || prev.Relay == nil {
+					return nil, fmt.Errorf("exact-task sync cannot safely rewrite unqueried task %s without a prior relay projection", id)
+				}
+				// This task was outside the exact relay query. Preserve only its
+				// previously observed relay state, never an unverified local value.
+				relaySnap = prev.Relay
+			}
+		}
 		localRev := SnapshotRevision(localSnap)
 		relayEventID := metadataValue(relaySnap, "nostr.id")
 		localChanged := localSnap != nil && (prev == nil || prev.LocalRevision != localRev)
@@ -254,44 +274,68 @@ func MergeTaskStateWithOptions(relayExport *beadspb.Export, local []*TaskSnapsho
 		resolution := ResolutionClean
 		var conflict *ConflictMetadata
 
-		switch {
-		case localSnap == nil && relaySnap != nil:
-			resolved = relaySnap
-			resolution = ResolutionRelayOnly
-		case relaySnap == nil && localSnap != nil:
-			resolved = localSnap
-			resolution = ResolutionLocalOnly
-		case localSnap != nil && relaySnap != nil && snapshotsEqual(localSnap, relaySnap):
-			resolved = latestSnapshot(localSnap, relaySnap)
-			if localChanged || relayChanged {
-				resolution = ResolutionLatestWins
-			}
-		case localSnap != nil && relaySnap != nil && localChanged && relayChanged:
-			changed := materialChangedFields(localSnap, relaySnap)
-			if compatibleAutoMerge(localSnap, relaySnap, changed) {
-				resolved = latestSnapshot(localSnap, relaySnap)
-				resolution = ResolutionLatestWins
-			} else {
-				if opts.RelayWinsOnConflict {
-					resolved = relaySnap
-				} else {
-					resolved = previousResolved(prev, latestSnapshot(localSnap, relaySnap))
+		if opts.RelayAuthoritative {
+			switch {
+			case relaySnap == nil:
+				// Absence from the authoritative relay projection means deletion.
+				// Retain local/previous state only in the cache for diagnostics.
+				resolution = ResolutionLocalOnly
+			case localSnap == nil:
+				resolved = relaySnap
+				resolution = ResolutionRelayOnly
+			case snapshotsEqual(localSnap, relaySnap):
+				resolved = relaySnap
+				if localChanged || relayChanged {
+					resolution = ResolutionLatestWins
 				}
+			default:
+				resolved = relaySnap
 				resolution = ResolutionConflict
-				conflict = &ConflictMetadata{Reason: "local_and_relay_changed", ChangedFields: changed, LocalRevision: localRev, RelayEventID: relayEventID}
+				conflict = &ConflictMetadata{
+					Reason: "local_projection_drift", ChangedFields: materialChangedFields(localSnap, relaySnap),
+					LocalRevision: localRev, RelayEventID: relayEventID,
+				}
 			}
-		case localSnap != nil && relaySnap != nil && relayChanged:
-			resolved = relaySnap
-			resolution = ResolutionRelayOnly
-		case localSnap != nil && relaySnap != nil && localChanged:
-			resolved = localSnap
-			resolution = ResolutionLocalOnly
-		case prev != nil && prev.Resolved != nil:
-			resolved = prev.Resolved
-		case relaySnap != nil:
-			resolved = relaySnap
-		default:
-			resolved = localSnap
+		} else {
+			switch {
+			case localSnap == nil && relaySnap != nil:
+				resolved = relaySnap
+				resolution = ResolutionRelayOnly
+			case relaySnap == nil && localSnap != nil:
+				resolved = localSnap
+				resolution = ResolutionLocalOnly
+			case localSnap != nil && relaySnap != nil && snapshotsEqual(localSnap, relaySnap):
+				resolved = latestSnapshot(localSnap, relaySnap)
+				if localChanged || relayChanged {
+					resolution = ResolutionLatestWins
+				}
+			case localSnap != nil && relaySnap != nil && localChanged && relayChanged:
+				changed := materialChangedFields(localSnap, relaySnap)
+				if compatibleAutoMerge(localSnap, relaySnap, changed) {
+					resolved = latestSnapshot(localSnap, relaySnap)
+					resolution = ResolutionLatestWins
+				} else {
+					if opts.RelayWinsOnConflict {
+						resolved = relaySnap
+					} else {
+						resolved = previousResolved(prev, latestSnapshot(localSnap, relaySnap))
+					}
+					resolution = ResolutionConflict
+					conflict = &ConflictMetadata{Reason: "local_and_relay_changed", ChangedFields: changed, LocalRevision: localRev, RelayEventID: relayEventID}
+				}
+			case localSnap != nil && relaySnap != nil && relayChanged:
+				resolved = relaySnap
+				resolution = ResolutionRelayOnly
+			case localSnap != nil && relaySnap != nil && localChanged:
+				resolved = localSnap
+				resolution = ResolutionLocalOnly
+			case prev != nil && prev.Resolved != nil:
+				resolved = prev.Resolved
+			case relaySnap != nil:
+				resolved = relaySnap
+			default:
+				resolved = localSnap
+			}
 		}
 
 		rec := &CacheRecord{SchemaVersion: 2, Type: "nostrig_task_cache", ID: id, Resolved: normalizeSnapshot(resolved), Local: normalizeSnapshot(localSnap), Relay: normalizeSnapshot(relaySnap), LocalRevision: localRev, RelayEventID: relayEventID, LocalUpdated: snapshotUpdated(localSnap), RelayUpdated: snapshotUpdated(relaySnap), Resolution: resolution, Conflict: conflict}

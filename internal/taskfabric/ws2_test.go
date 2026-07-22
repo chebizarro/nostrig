@@ -24,24 +24,13 @@ type noopSigner struct{}
 
 func (noopSigner) SignEvent(ctx context.Context, ev *gonostr.Event) error { return nil }
 
-func TestWriteBackPublishesChangedLocalTaskCanonicalState(t *testing.T) {
+func TestSyncWriteBackRejectsLocalProjectionAsMutationSource(t *testing.T) {
 	local := &TaskSnapshot{ID: "task-1", Title: "local", Status: "open", Updated: "2026-01-02T00:00:00Z"}
 	merged := &MergeResult{Records: []*CacheRecord{{ID: "task-1", Resolved: local, Local: local, Resolution: ResolutionLocalOnly, LocalRevision: SnapshotRevision(local)}}}
 	pub := &capturePublisher{}
 	count, err := publishWriteBack(context.Background(), SyncOptions{Push: true, Authors: []string{testPubKey(1).Hex()}, Signer: noopSigner{}, Publisher: pub, Relays: []string{"wss://relay.example"}}, merged)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if count != 1 || len(pub.events) != 1 {
-		t.Fatalf("published count=%d events=%d", count, len(pub.events))
-	}
-	pub.events[0].PubKey = testPubKey(1)
-	issue, err := nip34.ParseTaskStateEvent(pub.events[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if issue.Id != "task-1" || issue.Title != "local" {
-		t.Fatalf("unexpected published issue: %#v", issue)
+	if err == nil || count != 0 || len(pub.events) != 0 {
+		t.Fatalf("local projection write-back was not rejected: count=%d events=%d err=%v", count, len(pub.events), err)
 	}
 }
 

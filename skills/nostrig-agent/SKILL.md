@@ -58,7 +58,9 @@ Claim selected ready work using the exact revision returned by `get`, `list`,
 
 ```bash
 nostrig task claim --json --task-id "$TASK_ID" \
-  --base-event-id "$TASK_REVISION"
+  --base-event-id "$TASK_REVISION" \
+  --execution-attempt-id "$ATTEMPT_ID" \
+  --agent-session-id "$CONTEXTVM_SESSION_ID" --branch "$BRANCH"
 ```
 
 The command waits for a correlated authoritative ACK by default. A conflict is
@@ -71,7 +73,9 @@ nostrig queue claim-next --json --queue backlog \
   --base-event-id "$QUEUE_REVISION"
 nostrig task get --json "$TASK_ID"
 nostrig task claim --json --task-id "$TASK_ID" \
-  --base-event-id "$TASK_REVISION"
+  --base-event-id "$TASK_REVISION" \
+  --execution-attempt-id "$ATTEMPT_ID" \
+  --agent-session-id "$CONTEXTVM_SESSION_ID" --branch "$BRANCH"
 ```
 
 ### 3. Publish periodic checkpoints
@@ -106,9 +110,19 @@ nostrig task block --json --task-id "$TASK_ID" \
 The block command durably records blocked status, reason, checkpoint, timestamp,
 and evidence. Then notify the NIP-29 room with the task ID and resulting event ID.
 
-### 5. Request validation
+### 5. Complete the execution attempt and request validation
 
-After implementation and quality gates, publish a checkpoint and set review to
+After implementation and quality gates, complete the durable attempt. Completion
+requests review but does not close the task:
+
+```bash
+nostrig task update --json --task-id "$TASK_ID" \
+  --base-event-id "$TASK_REVISION" \
+  --execution-attempt-id "$ATTEMPT_ID" --attempt-status completed \
+  --attempt-commit "$COMMIT_SHA" --attempt-evidence-id "test:$TEST_EVENT_ID"
+```
+
+Reload the returned revision, then publish a checkpoint and set review to
 requested. Do not treat your own test run as acceptance.
 
 ```bash

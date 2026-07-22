@@ -125,31 +125,69 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 		if title == "" {
 			return nil, fmt.Errorf("title is required")
 		}
-		status := nip34.ParseStatus(get("status"))
-		if status == beadspb.Status_STATUS_UNSPECIFIED {
-			status = beadspb.Status_STATUS_OPEN
+		statusValue := strings.ToLower(get("status"))
+		if statusValue == "closed" {
+			return nil, fmt.Errorf("task/create cannot create closed tasks; use task/close after creation")
+		}
+		status := beadspb.Status_STATUS_OPEN
+		if statusValue != "" {
+			var statusErr error
+			status, statusErr = parseTaskStatusParam(statusValue)
+			if statusErr != nil {
+				return nil, statusErr
+			}
+		}
+		priorityValue := get("priority")
+		priority := parsePriorityParam(priorityValue)
+		if priorityValue != "" && priority == beadspb.Priority_PRIORITY_UNSPECIFIED {
+			return nil, fmt.Errorf("invalid task priority %q", priorityValue)
 		}
 		metadata := &beadspb.Metadata{Custom: map[string]string{}}
 		if repoAddr := get("repo_addr"); repoAddr != "" {
 			metadata.Custom["nip34.repo_addr"] = repoAddr
 		}
 		issue := &beadspb.Issue{
-			Id:          id,
-			Title:       title,
-			Description: get("description"),
-			Status:      status,
-			Priority:    parsePriorityParam(get("priority")),
-			Epic:        get("epic"),
-			Assignee:    get("assignee"),
-			Labels:      cleanStrings(paramList(p, "labels")),
-			DependsOn:   cleanTaskIDs(paramList(p, "depends_on")),
-			Created:     timestamppb.New(now),
-			Updated:     timestamppb.New(now),
-			Metadata:    metadata,
+			Id:                 id,
+			Title:              title,
+			Description:        get("description"),
+			Status:             status,
+			Priority:           priority,
+			Epic:               get("epic"),
+			Assignee:           get("assignee"),
+			Labels:             cleanStrings(paramList(p, "labels")),
+			DependsOn:          cleanTaskIDs(paramList(p, "depends_on")),
+			Created:            timestamppb.New(now),
+			Updated:            timestamppb.New(now),
+			Metadata:           metadata,
+			IssueType:          get("issue_type"),
+			Owner:              get("owner"),
+			CreatedBy:          caller,
+			AcceptanceCriteria: get("acceptance_criteria"),
+			Notes:              get("notes"),
+			Project:            get("project"),
+			Queue:              get("queue"),
+			Repository:         get("repo_addr"),
+		}
+		if strings.EqualFold(get("review_required"), "true") || len(paramList(p, "review_requirements")) > 0 {
+			issue.Review = &beadspb.Review{Required: true, Requirements: cleanStrings(paramList(p, "review_requirements"))}
+		}
+		if strings.EqualFold(get("quality_required"), "true") {
+			issue.QualityGate = &beadspb.QualityGate{Required: true, State: "pending"}
 		}
 		if err := applyTaskReferenceParams(issue, p); err != nil {
 			return nil, err
 		}
+		if rawDependencies, ok := p["dependencies"]; ok {
+			p["add_typed_dependencies"] = rawDependencies
+		}
+		if err := applyDependencyMutations(issue, p, caller, now); err != nil {
+			return nil, err
+		}
+		normalizedIssue, err := normalizeTaskIssue(issue)
+		if err != nil {
+			return nil, err
+		}
+		issue = normalizedIssue
 		record, err := h.Ledger.MutateTask(ctx, id, func(current *TaskRecord) (TaskMutationResult, error) {
 			if current != nil {
 				return TaskMutationResult{}, &ConflictError{Resource: "task", Reason: "already_exists", ActualEventID: current.EventID, Assignee: current.Issue.Assignee, Status: statusString(current.Issue)}
@@ -195,7 +233,14 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 			if issue.StartedAt == nil {
 				issue.StartedAt = timestamppb.New(now)
 			}
-			return TaskMutationResult{Issue: issue}, nil
+			if _, _, err := recordDispatch(issue, ev.ID, claimer, "running", p, now); err != nil {
+				return TaskMutationResult{}, err
+			}
+			normalizedIssue, normalizeErr := normalizeTaskIssue(issue)
+			if normalizeErr != nil {
+				return TaskMutationResult{}, normalizeErr
+			}
+			return TaskMutationResult{Issue: normalizedIssue}, nil
 		})
 		if err != nil {
 			return nil, err
@@ -221,7 +266,14 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 			}
 			issue := cloneIssue(current.Issue)
 			issue.Assignee, issue.Updated = assignee, timestamppb.New(now)
-			return TaskMutationResult{Issue: issue}, nil
+			if _, _, err := recordDispatch(issue, ev.ID, assignee, "dispatched", p, now); err != nil {
+				return TaskMutationResult{}, err
+			}
+			normalizedIssue, normalizeErr := normalizeTaskIssue(issue)
+			if normalizeErr != nil {
+				return TaskMutationResult{}, normalizeErr
+			}
+			return TaskMutationResult{Issue: normalizedIssue}, nil
 		})
 		if err != nil {
 			return nil, err
@@ -235,6 +287,28 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 		if err != nil {
 			return nil, err
 		}
+		var updateStatus beadspb.Status
+		if _, ok := p["status"]; ok {
+			statusValue := strings.ToLower(get("status"))
+			if statusValue == "closed" {
+				return nil, fmt.Errorf("task/update cannot close tasks; use task/close so review and quality policy is enforced")
+			}
+			if statusValue == "" {
+				return nil, fmt.Errorf("invalid task status %q", statusValue)
+			}
+			updateStatus, err = parseTaskStatusParam(statusValue)
+			if err != nil {
+				return nil, err
+			}
+		}
+		var updatePriority beadspb.Priority
+		if _, ok := p["priority"]; ok {
+			priorityValue := get("priority")
+			updatePriority = parsePriorityParam(priorityValue)
+			if priorityValue == "" || updatePriority == beadspb.Priority_PRIORITY_UNSPECIFIED {
+				return nil, fmt.Errorf("invalid task priority %q", priorityValue)
+			}
+		}
 		record, err := h.Ledger.MutateTask(ctx, id, func(current *TaskRecord) (TaskMutationResult, error) {
 			if current == nil || current.Issue == nil {
 				return TaskMutationResult{}, fmt.Errorf("task %s not found", id)
@@ -246,8 +320,8 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 			if err := applyTaskReferenceParams(issue, p); err != nil {
 				return TaskMutationResult{}, err
 			}
-			if v := get("status"); v != "" {
-				issue.Status = nip34.ParseStatus(v)
+			if _, ok := p["status"]; ok {
+				issue.Status = updateStatus
 				if issue.Status == beadspb.Status_STATUS_BLOCKED {
 					issue.BlockedAt = timestamppb.New(now)
 				}
@@ -262,7 +336,7 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 				issue.Description = get("description")
 			}
 			if _, ok := p["priority"]; ok {
-				issue.Priority = parsePriorityParam(get("priority"))
+				issue.Priority = updatePriority
 			}
 			if _, ok := p["epic"]; ok {
 				issue.Epic = get("epic")
@@ -272,8 +346,9 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 			}
 			issue.Labels = addStrings(issue.Labels, paramList(p, "add_labels"))
 			issue.Labels = removeStrings(issue.Labels, paramList(p, "remove_labels"))
-			issue.DependsOn = addStrings(issue.DependsOn, cleanTaskIDs(paramList(p, "add_dependencies")))
-			issue.DependsOn = removeStrings(issue.DependsOn, cleanTaskIDs(paramList(p, "remove_dependencies")))
+			if err := applyDependencyMutations(issue, p, caller, now); err != nil {
+				return TaskMutationResult{}, err
+			}
 			if _, ok := p["status_reason"]; ok {
 				issue.StatusReason = get("status_reason")
 			}
@@ -308,8 +383,16 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 				issue.Review.Reviewer = get("reviewer")
 				issue.Review.Requirements = cleanStrings(paramList(p, "review_requirements"))
 			}
+			actor, restricted := h.mutationActor(caller)
+			if err := applyExecutionUpdate(issue, p, actor, restricted, now); err != nil {
+				return TaskMutationResult{}, err
+			}
 			issue.Updated = timestamppb.New(now)
-			return TaskMutationResult{Issue: issue}, nil
+			normalizedIssue, normalizeErr := normalizeTaskIssue(issue)
+			if normalizeErr != nil {
+				return TaskMutationResult{}, normalizeErr
+			}
+			return TaskMutationResult{Issue: normalizedIssue}, nil
 		})
 		if err != nil {
 			return nil, err
@@ -331,7 +414,18 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 				return TaskMutationResult{}, err
 			}
 			issue := cloneIssue(current.Issue)
+			if active := activeExecutionAttempt(issue); active != nil {
+				return TaskMutationResult{}, fmt.Errorf("execution attempt %s is still active", active.Id)
+			}
+			if active := activeAgentSession(issue); active != nil {
+				return TaskMutationResult{}, fmt.Errorf("agent session %s is still active", active.Id)
+			}
 			issue.Status, issue.Updated, issue.ClosedAt = beadspb.Status_STATUS_CLOSED, timestamppb.New(now), timestamppb.New(now)
+			if issue.Review != nil && issue.Review.Required {
+				issue.Review.State = "approved"
+				issue.Review.Reviewer = caller
+				issue.ReviewedAt = timestamppb.New(now)
+			}
 			if _, ok := p["close_reason"]; ok {
 				issue.CloseReason = get("close_reason")
 			}
@@ -703,6 +797,24 @@ func (h *Handler) authorizeRepo(ctx context.Context, method, taskID, repoAddr st
 		return fmt.Errorf("task is not served by this instance")
 	}
 	return nil
+}
+
+func parseTaskStatusParam(value string) (beadspb.Status, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "open":
+		return beadspb.Status_STATUS_OPEN, nil
+	case "in_progress", "in-progress":
+		return beadspb.Status_STATUS_IN_PROGRESS, nil
+	case "blocked":
+		return beadspb.Status_STATUS_BLOCKED, nil
+	case "closed":
+		return beadspb.Status_STATUS_CLOSED, nil
+	case "deferred":
+		return beadspb.Status_STATUS_DEFERRED, nil
+	default:
+		return beadspb.Status_STATUS_UNSPECIFIED, fmt.Errorf("invalid task status %q", value)
+	}
 }
 
 func parsePriorityParam(value string) beadspb.Priority {

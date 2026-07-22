@@ -46,12 +46,15 @@ type SyncResult struct {
 	PublishedCount int
 }
 
-// Sync fetches canonical task-state events, merges them with the durable local
-// cache and current local beads projection, then renders the resolved view back
-// to .beads JSONL.
+// Sync fetches canonical task-state events and renders their authoritative
+// state into the durable cache and local .beads projection. Local edits are
+// retained only as drift diagnostics and never become canonical relay state.
 func Sync(ctx context.Context, client *nip34.Client, opts SyncOptions) (*SyncResult, error) {
 	if strings.TrimSpace(opts.OutDir) == "" {
 		return nil, fmt.Errorf("out dir is required")
+	}
+	if opts.Push {
+		return nil, fmt.Errorf("sync --push is deprecated: local .beads files are projections; mutate tasks through ContextVM or use migrate for one-time import")
 	}
 	events, err := FetchTaskStateEvents(ctx, client, opts)
 	if err != nil {
@@ -73,14 +76,11 @@ func Sync(ctx context.Context, client *nip34.Client, opts SyncOptions) (*SyncRes
 	if err != nil {
 		return nil, fmt.Errorf("load local beads issues: %w", err)
 	}
-	merged, err := MergeTaskStateWithOptions(relayExport, local, previous, MergeOptions{RelayWinsOnConflict: opts.RelayWinsOnConflict || opts.Push})
+	merged, err := MergeTaskStateWithOptions(relayExport, local, previous, MergeOptions{RelayAuthoritative: true, AuthoritativeTaskIDs: opts.TaskIDs})
 	if err != nil {
 		return nil, err
 	}
-	published, err := publishWriteBack(ctx, opts, merged)
-	if err != nil {
-		return nil, err
-	}
+	published := 0
 	if err := WriteCache(cachePath, merged.Records); err != nil {
 		return nil, fmt.Errorf("write cache: %w", err)
 	}
@@ -93,65 +93,14 @@ func Sync(ctx context.Context, client *nip34.Client, opts SyncOptions) (*SyncRes
 	return &SyncResult{Export: merged.Export, EventCount: len(events), CachePath: cachePath, ConflictCount: len(merged.Conflicts), PublishedCount: published}, nil
 }
 
-func publishWriteBack(ctx context.Context, opts SyncOptions, merged *MergeResult) (int, error) {
+// publishWriteBack remains only to return an explicit error to older callers.
+// Canonical mutations must traverse the ContextVM command ledger and durable
+// publisher; local Beads JSONL is never a write source.
+func publishWriteBack(_ context.Context, opts SyncOptions, _ *MergeResult) (int, error) {
 	if !opts.Push {
 		return 0, nil
 	}
-	if opts.Signer == nil {
-		return 0, fmt.Errorf("push requires signer")
-	}
-	publisher := opts.Publisher
-	if publisher == nil {
-		publisher = nip34.NewPublisher()
-	}
-	relays := cleanStrings(opts.Relays)
-	if len(relays) == 0 {
-		return 0, fmt.Errorf("push requires at least one relay")
-	}
-	var events []*gonostr.Event
-	for _, rec := range merged.Records {
-		if shouldPublishRecord(rec) {
-			issue := rec.Resolved.ToIssue()
-			now := time.Now().UTC()
-			author, err := canonicalAuthor(opts.Authors)
-			if err != nil {
-				return 0, err
-			}
-			if provider, ok := opts.Signer.(nip34.PublicKeyProvider); ok {
-				signerAuthor, err := provider.PublicKey(ctx)
-				if err != nil {
-					return 0, err
-				}
-				if strings.ToLower(strings.TrimSpace(signerAuthor)) != author {
-					return 0, fmt.Errorf("canonical author does not match signer pubkey")
-				}
-			}
-			ev, err := nip34.BuildTaskStateEvent(issue, author, now)
-			if err != nil {
-				return 0, err
-			}
-			events = append(events, ev)
-			if opts.SyncNIP34Status {
-				if status := nip34.BuildNIP34IssueStatusEvent(issue, now); status != nil {
-					events = append(events, status)
-				}
-			}
-		}
-	}
-	if len(events) == 0 {
-		return 0, nil
-	}
-	if err := publisher.Publish(ctx, relays, opts.Signer, events); err != nil {
-		return 0, err
-	}
-	return len(events), nil
-}
-
-func shouldPublishRecord(rec *CacheRecord) bool {
-	if rec == nil || rec.Resolved == nil || rec.Resolution == ResolutionConflict {
-		return false
-	}
-	return rec.Resolution == ResolutionLocalOnly || (rec.Local != nil && snapshotsEqual(rec.Resolved, rec.Local) && rec.LocalRevision != "")
+	return 0, fmt.Errorf("sync write-back is deprecated: local .beads files are projections; mutate tasks through ContextVM")
 }
 
 // FetchTaskStateEvents queries relays to completion for selected canonical

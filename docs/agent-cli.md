@@ -36,6 +36,28 @@ succeeds but the response times out, the command emits `ambiguous: true` with
 its correlation, inner request, and outer published event IDs. Refetch current
 authoritative state; never blindly republish an ambiguous mutation.
 
+## Dispatch and execution attempts
+
+`task assign` and `task claim` create a durable execution attempt in the same
+CAS mutation as dispatch. Supply `--execution-attempt-id`,
+`--agent-session-id`, and `--branch` when the dispatcher already has those
+ContextVM identifiers; otherwise the service derives the attempt ID from the
+command event.
+
+Workers update attempts with `task update --execution-attempt-id ...` plus
+`--attempt-status`, `--attempt-status-reason`, `--attempt-branch`, repeatable
+`--attempt-commit`, `--attempt-pr`, and `--attempt-evidence-id`, and optional
+`--agent-session-status`. A terminal attempt also terminates its associated
+session. `completed` requests review but never closes the task; only `task close`
+can close. Reassignment and close reject active attempts/sessions. A
+review-required close must come from the designated reviewer (or an
+administrative role), include acceptance evidence, and pass the trusted quality
+gates.
+
+Typed dependency mutations use repeatable `--add-typed-dep TYPE:TASK_ID` and
+`--remove-typed-dep TYPE:TASK_ID`. Legacy `--add-dep`/`--remove-dep` mutate only
+`blocks` relations.
+
 ## Exit codes
 
 | Code | Meaning |

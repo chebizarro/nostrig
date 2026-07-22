@@ -319,34 +319,16 @@ func backendNumberedID(n int) gonostr.ID {
 	return id
 }
 
-func TestRelayBackendPutIssuePublishesAppendOnlyTaskState(t *testing.T) {
-
+func TestRelayBackendDirectMutationsAreDisabled(t *testing.T) {
 	pub := &fakePublisher{}
-	now := time.Unix(123, 0).UTC()
-	backend := NewRelayBackend(RelayBackendOptions{Relays: []string{"wss://relay.example"}, RepoAddr: "30617:owner:repo", Authors: []string{backendTestPubKey(1).Hex()}, Signer: noopSigner{}, Publisher: pub, Now: func() time.Time { return now }})
-	issue := &pb.Issue{Id: "task-2", Title: "write me", Status: pb.Status_STATUS_OPEN}
-
-	ev, err := backend.PutIssue(context.Background(), issue)
-	if err != nil {
-		t.Fatal(err)
+	backend := NewRelayBackend(RelayBackendOptions{Publisher: pub})
+	if event, err := backend.PutIssue(context.Background(), &pb.Issue{Id: "task-2"}); err == nil || event != nil {
+		t.Fatalf("PutIssue remained an authority path: event=%#v err=%v", event, err)
 	}
-	if ev == nil || len(pub.events) != 1 || pub.events[0] != ev {
-		t.Fatalf("publish mismatch event=%#v published=%d", ev, len(pub.events))
+	if err := backend.SaveExport(context.Background(), &pb.Export{}); err == nil {
+		t.Fatal("SaveExport remained an authority path")
 	}
-	if ev.Kind != gonostr.Kind(nip34.KindCanonicalState) {
-		t.Fatalf("kind=%d", ev.Kind)
-	}
-	if got, _ := nip34.TagFirst(ev, "d"); got != "task:task-2" {
-		t.Fatalf("d tag=%q", got)
-	}
-	body, err := nip34.ParseTaskStateEvent(ev)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if body.Id != "task-2" || body.Metadata.Custom["nip34.repo_addr"] != "30617:owner:repo" || body.Updated.AsTime() != now {
-		t.Fatalf("unexpected task state: %#v", body)
-	}
-	if issue.Metadata != nil {
-		t.Fatalf("PutIssue mutated caller issue metadata: %#v", issue.Metadata)
+	if len(pub.events) != 0 {
+		t.Fatalf("disabled direct mutations published %d event(s)", len(pub.events))
 	}
 }

@@ -381,7 +381,7 @@ func newTaskCreateCmd() *cobra.Command {
 }
 
 func newTaskAssignCmd() *cobra.Command {
-	var taskID, assignee, baseEventID string
+	var taskID, assignee, baseEventID, executionAttemptID, agentSessionID, branch string
 	opts := defaultMutationOptions()
 	cmd := &cobra.Command{Use: "assign", Short: "Assign a task at an exact revision", RunE: func(cmd *cobra.Command, args []string) error {
 		if err := requireTaskRevision(cmd, taskID, baseEventID); err != nil {
@@ -390,7 +390,13 @@ func newTaskAssignCmd() *cobra.Command {
 		if strings.TrimSpace(assignee) == "" {
 			return exitError(exitUsage, fmt.Errorf("--assignee is required"))
 		}
-		event, err := buildAgentCommand("task/assign", opts, map[string]any{"task_id": taskID, "assignee": assignee, "base_event_id": baseEventID})
+		params := map[string]any{"task_id": taskID, "assignee": assignee, "base_event_id": baseEventID}
+		for key, value := range map[string]string{"execution_attempt_id": executionAttemptID, "agent_session_id": agentSessionID, "branch": branch} {
+			if strings.TrimSpace(value) != "" {
+				params[key] = strings.TrimSpace(value)
+			}
+		}
+		event, err := buildAgentCommand("task/assign", opts, params)
 		if err != nil {
 			return err
 		}
@@ -398,12 +404,13 @@ func newTaskAssignCmd() *cobra.Command {
 	}}
 	addTaskRevisionFlags(cmd, &taskID, &baseEventID)
 	cmd.Flags().StringVar(&assignee, "assignee", "", "Assignee identity (required)")
+	addDispatchFlags(cmd, &executionAttemptID, &agentSessionID, &branch)
 	addMutationFlags(cmd, &opts)
 	return cmd
 }
 
 func newTaskClaimCmd() *cobra.Command {
-	var taskID, claimer, baseEventID string
+	var taskID, claimer, baseEventID, executionAttemptID, agentSessionID, branch string
 	opts := defaultMutationOptions()
 	cmd := &cobra.Command{Use: "claim", Short: "Atomically claim an unassigned task revision", RunE: func(cmd *cobra.Command, args []string) error {
 		if err := requireTaskRevision(cmd, taskID, baseEventID); err != nil {
@@ -413,6 +420,11 @@ func newTaskClaimCmd() *cobra.Command {
 		if strings.TrimSpace(claimer) != "" {
 			params["claimer"] = strings.TrimSpace(claimer)
 		}
+		for key, value := range map[string]string{"execution_attempt_id": executionAttemptID, "agent_session_id": agentSessionID, "branch": branch} {
+			if strings.TrimSpace(value) != "" {
+				params[key] = strings.TrimSpace(value)
+			}
+		}
 		event, err := buildAgentCommand("task/claim", opts, params)
 		if err != nil {
 			return err
@@ -421,15 +433,21 @@ func newTaskClaimCmd() *cobra.Command {
 	}}
 	addTaskRevisionFlags(cmd, &taskID, &baseEventID)
 	cmd.Flags().StringVar(&claimer, "claimer", "", "Claiming worker ID; server derives the authorized worker when omitted")
+	addDispatchFlags(cmd, &executionAttemptID, &agentSessionID, &branch)
 	addMutationFlags(cmd, &opts)
 	return cmd
 }
 
 type taskUpdateFlags struct {
-	taskID, baseEventID, status, assignee, title, description, priority, epic                string
-	statusReason, notes, checkpoint, checkpointID, checkpointStatus, reviewer                string
-	setLabels, addLabels, removeLabels, addDeps, removeDeps, evidenceIDs, reviewRequirements []string
-	requestValidation, handoff                                                               bool
+	taskID, baseEventID, status, assignee, title, description, priority, epic string
+	statusReason, notes, checkpoint, checkpointID, checkpointStatus, reviewer string
+	executionAttemptID, attemptStatus, attemptStatusReason, attemptBranch     string
+	agentSessionStatus                                                        string
+	setLabels, addLabels, removeLabels, addDeps, removeDeps                   []string
+	addTypedDeps, removeTypedDeps                                             []string
+	evidenceIDs, reviewRequirements                                           []string
+	attemptCommits, attemptPullRequests, attemptEvidenceIDs                   []string
+	requestValidation, handoff                                                bool
 }
 
 func newTaskUpdateCmd() *cobra.Command {
@@ -780,6 +798,12 @@ func addTaskRevisionFlags(cmd *cobra.Command, taskID, baseEventID *string) {
 	cmd.Flags().StringVar(baseEventID, "base-event-id", "", "Exact canonical task event ID precondition (required)")
 }
 
+func addDispatchFlags(cmd *cobra.Command, executionAttemptID, agentSessionID, branch *string) {
+	cmd.Flags().StringVar(executionAttemptID, "execution-attempt-id", "", "Durable execution attempt ID; server derives one when omitted")
+	cmd.Flags().StringVar(agentSessionID, "agent-session-id", "", "ContextVM worker session ID")
+	cmd.Flags().StringVar(branch, "branch", "", "Worker branch associated with this dispatch")
+}
+
 func addTaskUpdateFlags(cmd *cobra.Command, f *taskUpdateFlags) {
 	addTaskRevisionFlags(cmd, &f.taskID, &f.baseEventID)
 	cmd.Flags().StringVar(&f.status, "status", "", "New task status")
@@ -793,8 +817,10 @@ func addTaskUpdateFlags(cmd *cobra.Command, f *taskUpdateFlags) {
 	cmd.Flags().StringSliceVar(&f.setLabels, "set-label", nil, "Replace labels (repeatable)")
 	cmd.Flags().StringSliceVar(&f.addLabels, "add-label", nil, "Add a label (repeatable)")
 	cmd.Flags().StringSliceVar(&f.removeLabels, "remove-label", nil, "Remove a label (repeatable)")
-	cmd.Flags().StringSliceVar(&f.addDeps, "add-dep", nil, "Add dependency task ID (repeatable)")
-	cmd.Flags().StringSliceVar(&f.removeDeps, "remove-dep", nil, "Remove dependency task ID (repeatable)")
+	cmd.Flags().StringSliceVar(&f.addDeps, "add-dep", nil, "Add blocks dependency task ID (repeatable)")
+	cmd.Flags().StringSliceVar(&f.removeDeps, "remove-dep", nil, "Remove blocks dependency task ID (repeatable)")
+	cmd.Flags().StringSliceVar(&f.addTypedDeps, "add-typed-dep", nil, "Add typed dependency as TYPE:TASK_ID (repeatable)")
+	cmd.Flags().StringSliceVar(&f.removeTypedDeps, "remove-typed-dep", nil, "Remove typed dependency as TYPE:TASK_ID (repeatable)")
 	cmd.Flags().StringVar(&f.checkpoint, "checkpoint", "", "Append a durable checkpoint summary")
 	cmd.Flags().StringVar(&f.checkpointID, "checkpoint-id", "", "Checkpoint ID; server derives one from the command event when omitted")
 	cmd.Flags().StringVar(&f.checkpointStatus, "checkpoint-status", "progress", "Checkpoint status")
@@ -803,21 +829,47 @@ func addTaskUpdateFlags(cmd *cobra.Command, f *taskUpdateFlags) {
 	cmd.Flags().BoolVar(&f.requestValidation, "request-validation", false, "Set review state to requested")
 	cmd.Flags().StringVar(&f.reviewer, "reviewer", "", "Requested reviewer identity")
 	cmd.Flags().StringSliceVar(&f.reviewRequirements, "review-requirement", nil, "Validation requirement (repeatable)")
+	cmd.Flags().StringVar(&f.executionAttemptID, "execution-attempt-id", "", "Execution attempt to update; latest owned attempt when omitted")
+	cmd.Flags().StringVar(&f.attemptStatus, "attempt-status", "", "Execution attempt status: running, blocked, completed, failed, or cancelled")
+	cmd.Flags().StringVar(&f.attemptStatusReason, "attempt-status-reason", "", "Durable execution attempt status reason")
+	cmd.Flags().StringVar(&f.attemptBranch, "attempt-branch", "", "Execution attempt branch")
+	cmd.Flags().StringSliceVar(&f.attemptCommits, "attempt-commit", nil, "Commit recorded on the execution attempt (repeatable)")
+	cmd.Flags().StringSliceVar(&f.attemptPullRequests, "attempt-pr", nil, "Pull request recorded on the execution attempt (repeatable)")
+	cmd.Flags().StringSliceVar(&f.attemptEvidenceIDs, "attempt-evidence-id", nil, "Evidence recorded on the execution attempt (repeatable)")
+	cmd.Flags().StringVar(&f.agentSessionStatus, "agent-session-status", "", "Associated ContextVM session status")
 }
 
 func updateParams(cmd *cobra.Command, f taskUpdateFlags) (map[string]any, []string, error) {
 	params := map[string]any{"task_id": f.taskID, "base_event_id": f.baseEventID}
-	for flag, key := range map[string]string{"status": "status", "assignee": "assignee", "title": "title", "description": "description", "priority": "priority", "epic": "epic", "status-reason": "status_reason", "notes": "notes"} {
+	for flag, key := range map[string]string{
+		"status": "status", "assignee": "assignee", "title": "title", "description": "description", "priority": "priority", "epic": "epic",
+		"status-reason": "status_reason", "notes": "notes", "execution-attempt-id": "execution_attempt_id", "attempt-status": "attempt_status",
+		"attempt-status-reason": "attempt_status_reason", "attempt-branch": "attempt_branch", "agent-session-status": "agent_session_status",
+	} {
 		if cmd.Flags().Changed(flag) {
 			value, _ := cmd.Flags().GetString(flag)
 			params[key] = value
 		}
 	}
-	for flag, key := range map[string]string{"set-label": "set_labels", "add-label": "add_labels", "remove-label": "remove_labels", "add-dep": "add_dependencies", "remove-dep": "remove_dependencies"} {
+	for flag, key := range map[string]string{
+		"set-label": "set_labels", "add-label": "add_labels", "remove-label": "remove_labels", "add-dep": "add_dependencies", "remove-dep": "remove_dependencies",
+		"attempt-commit": "attempt_commits", "attempt-pr": "attempt_pull_requests", "attempt-evidence-id": "attempt_evidence_ids",
+	} {
 		if cmd.Flags().Changed(flag) {
 			values, _ := cmd.Flags().GetStringSlice(flag)
 			params[key] = cleanStrings(values)
 		}
+	}
+	for flag, key := range map[string]string{"add-typed-dep": "add_typed_dependencies", "remove-typed-dep": "remove_typed_dependencies"} {
+		if !cmd.Flags().Changed(flag) {
+			continue
+		}
+		values, _ := cmd.Flags().GetStringSlice(flag)
+		deps, err := typedDependencyCLIParams(values)
+		if err != nil {
+			return nil, nil, exitError(exitUsage, err)
+		}
+		params[key] = deps
 	}
 	evidence := cleanStrings(f.evidenceIDs)
 	if len(evidence) > 0 {
@@ -852,6 +904,18 @@ func updateParams(cmd *cobra.Command, f taskUpdateFlags) (map[string]any, []stri
 		return nil, nil, exitError(exitUsage, fmt.Errorf("provide at least one update, checkpoint, evidence, or validation field"))
 	}
 	return params, evidence, nil
+}
+
+func typedDependencyCLIParams(values []string) ([]map[string]any, error) {
+	out := make([]map[string]any, 0, len(values))
+	for _, value := range cleanStrings(values) {
+		parts := strings.SplitN(value, ":", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			return nil, fmt.Errorf("typed dependency %q must use TYPE:TASK_ID", value)
+		}
+		out = append(out, map[string]any{"type": strings.ToLower(strings.TrimSpace(parts[0])), "task_id": strings.TrimPrefix(strings.TrimSpace(parts[1]), "task:")})
+	}
+	return out, nil
 }
 
 func buildAgentCommand(method string, opts mutationOptions, params map[string]any) (*gonostr.Event, error) {
