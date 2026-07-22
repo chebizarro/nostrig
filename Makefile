@@ -51,7 +51,7 @@ acceptance-contract:
 
 # Compile and execute the tagged package; live tests skip unless their explicit
 # environment is present. This is not a live acceptance result.
-acceptance-smoke:
+acceptance-smoke: deployment-check
 	$(GO_CMD) test -mod=readonly -tags=nostrig_acceptance -run='^TestLive' ./test/acceptance
 
 acceptance-live:
