@@ -8,6 +8,8 @@ services:
       NOSTRIG_ENV: production
       NOSTR_RELAY: ${NOSTR_RELAY:-wss://relay.sharegap.net}
       NOSTRIG_REPO_ADDRS: ${NOSTRIG_REPO_ADDRS:?set one or more canonical 30617 repo addresses}
+      NOSTRIG_QUALITY_AUTHORS: ${NOSTRIG_QUALITY_AUTHORS:-}
+      NOSTRIG_QUALITY_PROJECT: ${NOSTRIG_QUALITY_PROJECT:-}
       NOSTRIG_SIGNER_BUNKER_URL: ${NOSTRIG_SIGNER_BUNKER_URL:?set the Signet/NIP-46 bunker URL}
       NOSTRIG_SIGNER_CLIENT_SECRET_KEY_FILE: /run/secrets/nostrig_signer_client_secret_key
     secrets:

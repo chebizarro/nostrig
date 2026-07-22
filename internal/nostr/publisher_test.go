@@ -42,6 +42,36 @@ func TestTaskStateRoundTripLossless(t *testing.T) {
 	}
 }
 
+func TestTaskStateRejectsInvalidLinkedNIP34Reference(t *testing.T) {
+	issue := &beadspb.Issue{
+		Id: "task-linked", Title: "linked", Status: beadspb.Status_STATUS_OPEN,
+		Metadata: &beadspb.Metadata{Custom: map[string]string{
+			"nostr.id": "not-an-event-id", "nostr.kind": fmt.Sprint(KindIssue),
+		}},
+	}
+	if _, err := BuildTaskStateEvent(issue, fmt.Sprintf("%064x", 1), time.Unix(1, 0)); err == nil {
+		t.Fatal("expected invalid NIP-34 root event id rejection")
+	}
+}
+
+func TestTaskStateRejectsNIP34TagWithoutSupportedKind(t *testing.T) {
+	root := fmt.Sprintf("%064x", 44)
+	issue := &beadspb.Issue{
+		Id: "task-provenance", Title: "provenance", Status: beadspb.Status_STATUS_OPEN,
+		Metadata: &beadspb.Metadata{Custom: map[string]string{"nostr.id": root}},
+	}
+	ev, err := BuildTaskStateEvent(issue, fmt.Sprintf("%064x", 1), time.Unix(1, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pk, _ := gonostr.PubKeyFromHex(fmt.Sprintf("%064x", 1))
+	ev.PubKey = pk
+	ev.Tags = append(ev.Tags, gonostr.Tag{"e", root, "", "nip34-root"}, gonostr.Tag{"issue", root})
+	if _, err := ParseTaskStateEvent(ev); err == nil {
+		t.Fatal("expected NIP-34 tag without supported kind rejection")
+	}
+}
+
 func TestCanonicalExportRoundTripIncludesEpicCollection(t *testing.T) {
 	now := time.Unix(1234, 0).UTC()
 	export := &beadspb.Export{

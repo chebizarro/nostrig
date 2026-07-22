@@ -19,6 +19,15 @@ Store only these deployment values:
 
 Never provision `NOSTR_PRIVATE_KEY` in production. `NOSTRIG_ENV=production` rejects it.
 
+Quality projection is fail-closed. Configure the PSTF/Harbormaster signer
+pubkeys with `NOSTRIG_QUALITY_AUTHORS` (comma-separated) or repeatable
+`--quality-author` flags and bind them to one project with
+`NOSTRIG_QUALITY_PROJECT` or `--quality-project`. Only valid
+`pstf.status.gate.v1` kind 30315 and
+`pstf.audit.gate_decision.v1` kind 4903 events signed by those identities are
+accepted. If the ACL sets `close_policy.require_quality`, startup fails without
+at least one trusted quality author. See `docs/harbormaster-pstf.md`.
+
 ## Docker Compose
 
 Create the configuration and client-secret file on edge-01:
@@ -27,6 +36,8 @@ Create the configuration and client-secret file on edge-01:
 cat > .env <<'EOF'
 NOSTR_RELAY=wss://relay.sharegap.net
 NOSTRIG_REPO_ADDRS=30617:<owner-hex>:<repo-id>
+NOSTRIG_QUALITY_AUTHORS=<pstf-signer-pubkey-hex>
+NOSTRIG_QUALITY_PROJECT=<pstf-project>
 NOSTRIG_SIGNER_BUNKER_URL=bunker://<signer-pubkey>?relay=wss://relay.sharegap.net
 NOSTRIG_SIGNER_CLIENT_SECRET_FILE=./secrets/nostrig_signer_client_secret_key
 EOF
@@ -63,6 +74,8 @@ sudo install -m 0644 deploy/systemd/nostrig-serve@.service /etc/systemd/system/n
 sudo install -d -m 0750 /etc/nostrig
 sudo sh -c 'cat > /etc/nostrig/fleet.env' <<'EOF'
 NOSTRIG_REPO_ADDRS=30617:<owner-hex>:<repo-id>
+NOSTRIG_QUALITY_AUTHORS=<pstf-signer-pubkey-hex>
+NOSTRIG_QUALITY_PROJECT=<pstf-project>
 NOSTRIG_SIGNER_BUNKER_URL=bunker://<signer-pubkey>?relay=wss://relay.sharegap.net
 EOF
 sudo chmod 0600 /etc/nostrig/fleet.env

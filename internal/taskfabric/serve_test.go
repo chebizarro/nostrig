@@ -253,6 +253,36 @@ func TestTaskCreateUpdateDeleteIntentRoundTrip(t *testing.T) {
 	}
 }
 
+func TestTaskCreateLinksPSTFFeatureAndNIP34Root(t *testing.T) {
+	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{}, queues: map[string][]string{}}
+	h := testHandler(ledger)
+	nip34Root := testID(44).Hex()
+	create, _ := nip34.BuildContextVMCommand("task/create", "server", map[string]any{
+		"task_id": "task-linked", "title": "linked", "repo_addr": "30617:owner:repo",
+		"feature_id": "PSTF-WS6", "nip34_event_id": nip34Root, "nip34_kind": nip34.KindPullRequest,
+	}, time.Unix(1, 0))
+	create.ID, create.PubKey = testID(45), testPubKey(1)
+	if _, err := h.HandleIntent(context.Background(), create, time.Unix(2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	got := ledger.tasks["task-linked"]
+	if got == nil || got.GetMetadata().GetCustom()["pstf.feature_id"] != "PSTF-WS6" || got.GetMetadata().GetCustom()["nostr.id"] != nip34Root || got.GetMetadata().GetCustom()["nostr.kind"] != fmt.Sprint(nip34.KindPullRequest) {
+		t.Fatalf("task links missing: %#v", got)
+	}
+	if feature, _ := nip34.TagFirst(ledger.lastTaskEvent, "feature"); feature != "PSTF-WS6" {
+		t.Fatalf("feature tag=%q", feature)
+	}
+	if issue, _ := nip34.TagFirst(ledger.lastTaskEvent, "issue"); issue != nip34Root {
+		t.Fatalf("issue tag=%q", issue)
+	}
+	if !hasMarkedTag(ledger.lastTaskEvent, "e", nip34Root, "nip34-root") {
+		t.Fatalf("NIP-34 root tag missing: %#v", ledger.lastTaskEvent.Tags)
+	}
+	if _, err := nip34.ParseTaskStateEvent(ledger.lastTaskEvent); err != nil {
+		t.Fatalf("linked task state did not round trip: %v", err)
+	}
+}
+
 func TestTaskClaimIntentUpdatesTaskStateAndReturnsResult(t *testing.T) {
 	ledger := &memoryLedger{tasks: map[string]*beadspb.Issue{"task-1": {Id: "task-1", Title: "claim me", Status: beadspb.Status_STATUS_OPEN}}, queues: map[string][]string{}}
 	h := testHandler(ledger)
@@ -358,6 +388,28 @@ func TestValidateIntentRejectsSignatureRecipientAndMethodMismatch(t *testing.T) 
 	}
 	if err := validateIntent(ev, recipient, func(*gonostr.Event) bool { return true }); err == nil {
 		t.Fatal("expected method tag mismatch rejection")
+	}
+}
+
+func TestServeQualityClosePolicyRequiresTrustedAuthor(t *testing.T) {
+	authorization := testAuthorization()
+	authorization.ClosePolicy.RequireQuality = true
+	err := Serve(context.Background(), ServeOptions{
+		Relays: []string{"wss://relay.example"}, Signer: testServeSigner{}, PubKey: testPubKey(1).Hex(),
+		Authorization: authorization,
+	})
+	if err == nil || err.Error() != "close policy requires at least one trusted quality author" {
+		t.Fatalf("expected trusted quality author startup guard, got %v", err)
+	}
+}
+
+func TestServeTrustedQualityAuthorRequiresProjectScope(t *testing.T) {
+	err := Serve(context.Background(), ServeOptions{
+		Relays: []string{"wss://relay.example"}, Signer: testServeSigner{}, PubKey: testPubKey(1).Hex(),
+		Authorization: testAuthorization(), QualityAuthors: []string{testPubKey(2).Hex()},
+	})
+	if err == nil || err.Error() != "trusted quality authors require a quality project" {
+		t.Fatalf("expected quality project startup guard, got %v", err)
 	}
 }
 

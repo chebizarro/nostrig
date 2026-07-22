@@ -18,6 +18,8 @@ returns an error instead of a partial success.
 - `nostrig.task-list.v1`: sorted proven-complete task list and count.
 - `nostrig.task-ready.v1`: sorted open/unassigned tasks with all dependencies closed.
 - `nostrig.task-watch.v1`: JSONL snapshot, then `upsert`/`delete` records.
+  The task payload is the complete v2 model, including assignee, queue, blockers,
+  typed dependencies, PSTF feature/NIP-34 references, review, and quality-gate state.
 - `nostrig.mutation.v1`: operation, dry-run/acknowledged/ambiguous state,
   correlation plus inner/outer/response event IDs, submitted and acknowledged
   evidence IDs, and the correlated server result.
@@ -63,6 +65,10 @@ Local development may use `NOSTR_PRIVATE_KEY` outside production. Production
 continues to require NIP-46. Repository, relay, author, and recipient defaults are
 read from `NOSTRIG_REPO_ADDR`, `NOSTR_RELAY(S)`,
 `NOSTRIG_CANONICAL_AUTHORS`, and `NOSTRIG_RECIPIENT`.
+
+Harbormaster/PSTF consumers use these list/watch schemas together with the
+ContextVM `queue/list` and `task/quality-status` results. The linkage and trusted
+quality-author contract is documented in `docs/harbormaster-pstf.md`.
 
 The OpenClaw skill enforcing the lifecycle is at
 `skills/nostrig-agent/SKILL.md`.

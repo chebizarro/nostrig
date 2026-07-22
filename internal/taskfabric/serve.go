@@ -147,6 +147,9 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 			Updated:     timestamppb.New(now),
 			Metadata:    metadata,
 		}
+		if err := applyTaskReferenceParams(issue, p); err != nil {
+			return nil, err
+		}
 		record, err := h.Ledger.MutateTask(ctx, id, func(current *TaskRecord) (TaskMutationResult, error) {
 			if current != nil {
 				return TaskMutationResult{}, &ConflictError{Resource: "task", Reason: "already_exists", ActualEventID: current.EventID, Assignee: current.Issue.Assignee, Status: statusString(current.Issue)}
@@ -240,6 +243,9 @@ func (h *Handler) dispatch(ctx context.Context, ev *gonostr.Event, method string
 				return TaskMutationResult{}, err
 			}
 			issue := cloneIssue(current.Issue)
+			if err := applyTaskReferenceParams(issue, p); err != nil {
+				return TaskMutationResult{}, err
+			}
 			if v := get("status"); v != "" {
 				issue.Status = nip34.ParseStatus(v)
 				if issue.Status == beadspb.Status_STATUS_BLOCKED {
@@ -510,6 +516,57 @@ func taskResult(i *beadspb.Issue, eventID string) map[string]any {
 		r["revision"] = eventID
 	}
 	return r
+}
+
+func applyTaskReferenceParams(issue *beadspb.Issue, params map[string]any) error {
+	if issue == nil {
+		return fmt.Errorf("task is nil")
+	}
+	if issue.Metadata == nil {
+		issue.Metadata = &beadspb.Metadata{}
+	}
+	if issue.Metadata.Custom == nil {
+		issue.Metadata.Custom = map[string]string{}
+	}
+	if _, present := params["feature_id"]; present {
+		if featureID := stringParam(params, "feature_id"); featureID != "" {
+			issue.Metadata.Custom["pstf.feature_id"] = featureID
+		} else {
+			delete(issue.Metadata.Custom, "pstf.feature_id")
+		}
+	}
+	_, eventChanged := params["nip34_event_id"]
+	_, kindChanged := params["nip34_kind"]
+	if !eventChanged && !kindChanged {
+		return nil
+	}
+	if eventChanged {
+		eventID := stringParam(params, "nip34_event_id")
+		if eventID == "" {
+			delete(issue.Metadata.Custom, "nostr.id")
+		} else {
+			if _, err := gonostr.IDFromHex(eventID); err != nil {
+				return fmt.Errorf("nip34_event_id must be a 64-character hex event ID")
+			}
+			issue.Metadata.Custom["nostr.id"] = strings.ToLower(eventID)
+		}
+	}
+	if kindChanged {
+		value := strings.TrimSpace(fmt.Sprint(params["nip34_kind"]))
+		if value == "" {
+			delete(issue.Metadata.Custom, "nostr.kind")
+		} else {
+			kind, err := strconv.Atoi(value)
+			if err != nil || (kind != nip34.KindIssue && kind != nip34.KindPullRequest && kind != nip34.KindPatch) {
+				return fmt.Errorf("nip34_kind must be %d (issue), %d (pull request), or %d (patch)", nip34.KindIssue, nip34.KindPullRequest, nip34.KindPatch)
+			}
+			issue.Metadata.Custom["nostr.kind"] = strconv.Itoa(kind)
+		}
+	}
+	if (strings.TrimSpace(issue.Metadata.Custom["nostr.id"]) == "") != (strings.TrimSpace(issue.Metadata.Custom["nostr.kind"]) == "") {
+		return fmt.Errorf("nip34_event_id and nip34_kind must be set or cleared together")
+	}
+	return nil
 }
 
 func (h *Handler) annotateQuality(ctx context.Context, r map[string]any, ids []string) {

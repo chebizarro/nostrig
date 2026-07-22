@@ -393,7 +393,7 @@ func authorizeFields(role Role, policy CallerPolicy, method string, p map[string
 			if issue == nil || (issue.Assignee != self && issue.Assignee != caller) {
 				return "worker_not_assignee"
 			}
-			for _, field := range []string{"assignee", "priority", "title", "epic", "add_dependencies", "remove_dependencies"} {
+			for _, field := range []string{"assignee", "priority", "title", "epic", "feature_id", "nip34_event_id", "nip34_kind", "add_dependencies", "remove_dependencies"} {
 				if _, ok := p[field]; ok {
 					return "field_denied"
 				}

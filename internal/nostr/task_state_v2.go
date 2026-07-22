@@ -3,6 +3,7 @@ package nostr
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,6 +46,15 @@ func BuildTaskStateEvent(issue *beadspb.Issue, canonicalAuthor string, now time.
 	if doc.Assignee != "" {
 		tags = append(tags, gonostr.Tag{"assignee", doc.Assignee})
 	}
+	if doc.Project != "" {
+		tags = append(tags, gonostr.Tag{"project", doc.Project})
+	}
+	if doc.Queue != "" {
+		tags = append(tags, gonostr.Tag{"queue", doc.Queue})
+	}
+	if featureID := strings.TrimSpace(doc.Metadata["pstf.feature_id"]); featureID != "" {
+		tags = append(tags, gonostr.Tag{"feature", featureID})
+	}
 	if doc.Epic != "" {
 		tags = append(tags,
 			gonostr.Tag{"a", Address(KindNamedList, canonicalAuthor, "epic:"+doc.Epic)},
@@ -56,15 +66,17 @@ func BuildTaskStateEvent(issue *beadspb.Issue, canonicalAuthor string, now time.
 		coordinate := Address(KindCanonicalState, canonicalAuthor, "task:"+dep.DependsOnID)
 		if _, exists := dependencyCoordinates[coordinate]; !exists {
 			dependencyCoordinates[coordinate] = struct{}{}
-			tags = append(tags, gonostr.Tag{"depends-on", coordinate})
+			tags = append(tags, gonostr.Tag{"depends-on", coordinate}, gonostr.Tag{"dep", dep.DependsOnID})
 		}
 		tags = append(tags, gonostr.Tag{"dependency", coordinate, dep.Type})
 	}
 	for _, label := range doc.Labels {
 		tags = append(tags, gonostr.Tag{"t", label})
 	}
-	if value := doc.Metadata["nostr.id"]; value != "" {
-		tags = append(tags, gonostr.Tag{"e", value, "", "nip34-root"})
+	if value, linked, err := nip34TaskReference(doc.Metadata); err != nil {
+		return nil, err
+	} else if linked {
+		tags = append(tags, gonostr.Tag{"e", value, "", "nip34-root"}, gonostr.Tag{"issue", value})
 	}
 	if doc.Repository != "" {
 		tags = append(tags, gonostr.Tag{"a", doc.Repository, "", "nip34-repo"})
@@ -155,6 +167,18 @@ func parseTaskStateEventV2(ev *gonostr.Event) (*beadspb.Issue, error) {
 	if err := requireOptionalTagAgreement(ev, "assignee", doc.Assignee); err != nil {
 		return nil, err
 	}
+	for name, value := range map[string]string{
+		"project": doc.Project,
+		"queue":   doc.Queue,
+		"feature": strings.TrimSpace(doc.Metadata["pstf.feature_id"]),
+		"issue":   strings.TrimSpace(doc.Metadata["nostr.id"]),
+	} {
+		if len(TagAll(ev, name)) > 0 {
+			if err := requireOptionalTagAgreement(ev, name, value); err != nil {
+				return nil, err
+			}
+		}
+	}
 	author := ev.PubKey.Hex()
 	if doc.Epic == "" {
 		if len(TagAll(ev, "epic")) != 0 {
@@ -185,6 +209,9 @@ func parseTaskStateEventV2(ev *gonostr.Event) (*beadspb.Issue, error) {
 	if !sameStrings(TagAll(ev, "depends-on"), expectedCoordinates) {
 		return nil, fmt.Errorf("dependency tags do not match content")
 	}
+	if len(TagAll(ev, "dep")) > 0 && !sameStrings(TagAll(ev, "dep"), doc.DependsOn) {
+		return nil, fmt.Errorf("dependency compatibility tags do not match content")
+	}
 	actualTyped, err := dependencyTags(ev)
 	if err != nil || !sameStrings(actualTyped, expectedTyped) {
 		return nil, fmt.Errorf("typed dependency tags do not match content")
@@ -192,10 +219,33 @@ func parseTaskStateEventV2(ev *gonostr.Event) (*beadspb.Issue, error) {
 	if repoTag := markedTag(ev, "a", "nip34-repo"); repoTag != doc.Repository {
 		return nil, fmt.Errorf("repository tag does not match content")
 	}
-	if rootTag := markedTag(ev, "e", "nip34-root"); rootTag != strings.TrimSpace(doc.Metadata["nostr.id"]) {
-		return nil, fmt.Errorf("NIP-34 root tag does not match content")
+	rootTag := markedTag(ev, "e", "nip34-root")
+	rootID, linked, err := nip34TaskReference(doc.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	issueTags := TagAll(ev, "issue")
+	if linked {
+		if rootTag != rootID || (len(issueTags) > 0 && !sameStrings(issueTags, []string{rootID})) {
+			return nil, fmt.Errorf("NIP-34 root tag does not match content")
+		}
+	} else if len(issueTags) > 0 || rootTag != "" {
+		return nil, fmt.Errorf("NIP-34 tags require a supported root reference")
 	}
 	return taskmodel.ToProto(doc)
+}
+
+func nip34TaskReference(metadata map[string]string) (string, bool, error) {
+	eventID := strings.TrimSpace(metadata["nostr.id"])
+	kindText := strings.TrimSpace(metadata["nostr.kind"])
+	kind, err := strconv.Atoi(kindText)
+	if err != nil || (kind != KindIssue && kind != KindPullRequest && kind != KindPatch) {
+		return "", false, nil
+	}
+	if _, err := gonostr.IDFromHex(eventID); err != nil {
+		return "", false, fmt.Errorf("NIP-34 event id must be 64-character hex")
+	}
+	return strings.ToLower(eventID), true, nil
 }
 
 func dependencyTags(ev *gonostr.Event) ([]string, error) {

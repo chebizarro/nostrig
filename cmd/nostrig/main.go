@@ -766,6 +766,7 @@ func newServeCmd() *cobra.Command {
 	var pubkey string
 	var syncNIP34Status bool
 	var qualityProject string
+	var qualityAuthors []string
 	var observabilityAddr string
 	var outboxCriticalThreshold int
 	var aclFile string
@@ -810,6 +811,14 @@ func newServeCmd() *cobra.Command {
 			required = relaysWithEnv(relays)
 		}
 		mirrors := cleanStrings(append(append([]string(nil), mirrorRelays...), splitEnvList(os.Getenv("NOSTRIG_MIRROR_RELAYS"))...))
+		trustedQualityAuthors := cleanStrings(qualityAuthors)
+		if len(trustedQualityAuthors) == 0 {
+			trustedQualityAuthors = cleanStrings(splitEnvList(os.Getenv("NOSTRIG_QUALITY_AUTHORS")))
+		}
+		resolvedQualityProject := strings.TrimSpace(qualityProject)
+		if resolvedQualityProject == "" {
+			resolvedQualityProject = strings.TrimSpace(os.Getenv("NOSTRIG_QUALITY_PROJECT"))
+		}
 		publication := nip34.ReliablePublisherOptions{
 			RequiredRelays: required, MirrorRelays: mirrors, AckQuorum: ackQuorum, OutboxPath: outboxPath,
 			PublishTimeout: publishTimeout, BaseBackoff: retryBaseBackoff, MaxBackoff: retryMaxBackoff,
@@ -822,7 +831,7 @@ func newServeCmd() *cobra.Command {
 		}
 		return taskfabric.Serve(cmd.Context(), taskfabric.ServeOptions{
 			Relays: relaysWithEnv(relays), RepoAddrs: repoAddrsWithEnv(repoAddrs), Signer: signer, PubKey: pubkey,
-			SyncNIP34Status: syncNIP34Status, QualityProject: qualityProject, ObservabilityAddr: observabilityAddr,
+			SyncNIP34Status: syncNIP34Status, QualityProject: resolvedQualityProject, QualityAuthors: trustedQualityAuthors, ObservabilityAddr: observabilityAddr,
 			OutboxCriticalThreshold: outboxCriticalThreshold, Authorization: authz, Publication: publication,
 			CommandJournalPath: journalPath, CommandRetention: commandRetention,
 		})
@@ -833,7 +842,8 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringSliceVar(&repoAddrs, "repo-addr", nil, "Allowed canonical repository address(es), repeatable; falls back to NOSTRIG_REPO_ADDR/NOSTRIG_REPO_ADDRS")
 	cmd.Flags().StringVar(&pubkey, "pubkey", "", "Server recipient pubkey; defaults to signer pubkey when available")
 	cmd.Flags().BoolVar(&syncNIP34Status, "sync-nip34-status", false, "Opt-in: publish NIP-34 issue status events when linked tasks change")
-	cmd.Flags().StringVar(&qualityProject, "quality-project", "", "Optional PSTF project tag used to scope quality status/audit events")
+	cmd.Flags().StringVar(&qualityProject, "quality-project", "", "PSTF project used to scope quality events; required with trusted authors, defaults to NOSTRIG_QUALITY_PROJECT")
+	cmd.Flags().StringSliceVar(&qualityAuthors, "quality-author", nil, "Trusted PSTF/Harbormaster quality signer pubkey (repeatable; defaults to NOSTRIG_QUALITY_AUTHORS)")
 	cmd.Flags().StringVar(&observabilityAddr, "observability-addr", "127.0.0.1:8080", "HTTP address for /livez, /readyz, /metrics, and redacted /diagnostics")
 	cmd.Flags().IntVar(&outboxCriticalThreshold, "outbox-critical-threshold", 1000, "Readiness fails at or above this durable outbox depth")
 	cmd.Flags().StringVar(&aclFile, "acl-file", "", "Caller ACL JSON file; defaults to NOSTRIG_ACL_FILE")

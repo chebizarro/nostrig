@@ -286,6 +286,7 @@ type ServeOptions struct {
 	PubKey                  string
 	SyncNIP34Status         bool
 	QualityProject          string
+	QualityAuthors          []string
 	ObservabilityAddr       string
 	OutboxCriticalThreshold int
 	Authorization           AuthorizationConfig
@@ -328,6 +329,19 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	}
 	if err := opts.Authorization.Validate(); err != nil {
 		return fmt.Errorf("invalid caller ACL: %w", err)
+	}
+	qualityAuthors := cleanStrings(opts.QualityAuthors)
+	qualityProject := strings.TrimSpace(opts.QualityProject)
+	if len(qualityAuthors) > 0 {
+		if _, _, err := trustedQualityAuthors(qualityAuthors); err != nil {
+			return err
+		}
+		if qualityProject == "" {
+			return fmt.Errorf("trusted quality authors require a quality project")
+		}
+	}
+	if opts.Authorization.ClosePolicy.RequireQuality && len(qualityAuthors) == 0 {
+		return fmt.Errorf("close policy requires at least one trusted quality author")
 	}
 	pubkey := strings.ToLower(strings.TrimSpace(opts.PubKey))
 	if provider, ok := opts.Signer.(nip34.PublicKeyProvider); ok {
@@ -400,7 +414,10 @@ func Serve(ctx context.Context, opts ServeOptions) error {
 	if opts.ledger != nil {
 		ledger = opts.ledger
 	}
-	var quality QualityLookup = &RelayQualitySource{Relays: requiredRelays, Project: opts.QualityProject}
+	var quality QualityLookup
+	if len(qualityAuthors) > 0 {
+		quality = &RelayQualitySource{Relays: requiredRelays, Project: qualityProject, Authors: qualityAuthors}
+	}
 	if opts.quality != nil {
 		quality = opts.quality
 	}
